@@ -1,0 +1,56 @@
+# Binaries
+globalfs
+coordinator
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Coverage
+*.out
+coverage.txt
+coverage.html
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+bin/
+dist/
+build/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Logs
+*.log
+logs/
+
+# Configuration (keep examples)
+config.yaml
+config.yml
+*.local.yaml
+*.local.yml
+
+# Dependencies
+vendor/
+
+# etcd data
+etcd-data/
+
+# Test data
+testdata/
+*.db

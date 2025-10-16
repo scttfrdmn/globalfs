@@ -1,0 +1,102 @@
+# GlobalFS Configuration Example
+# This is a sample configuration for a 2-site HPC cloud bursting setup
+
+# Global settings
+global:
+  cluster_name: "hpc-globalfs"
+  log_level: "INFO"
+  log_file: "/var/log/globalfs/globalfs.log"
+  metrics_enabled: true
+  metrics_port: 9090
+
+# Coordinator settings
+coordinator:
+  listen_addr: ":8080"
+  etcd_endpoints:
+    - "localhost:2379"
+    - "localhost:2380"
+    - "localhost:2381"
+  lease_timeout: 60s
+  health_check_interval: 30s
+
+# Site definitions
+sites:
+  # On-premises primary site
+  - name: onprem
+    role: primary
+    objectfs:
+      mount_point: /mnt/objectfs-onprem
+      s3_bucket: hpc-data-onprem
+      s3_region: us-west-2
+      s3_endpoint: http://minio.local:9000  # MinIO endpoint
+    cargoship:
+      endpoint: http://cargoship-onprem:8081
+      enabled: true
+    network:
+      bandwidth: 10000000000  # 10 Gbps
+      latency: 0s
+
+  # AWS cloud burst site
+  - name: cloud
+    role: burst
+    objectfs:
+      mount_point: /mnt/objectfs-cloud
+      s3_bucket: hpc-data-cloud
+      s3_region: us-west-2
+    cargoship:
+      endpoint: http://cargoship-cloud:8081
+      enabled: true
+    network:
+      bandwidth: 1000000000  # 1 Gbps
+      latency: 50ms
+
+# Replication policies
+policies:
+  # Hot datasets - pre-stage before burst
+  - name: hot_datasets
+    path_pattern: "/datasets/hot/*"
+    primary: onprem
+    replicate_to:
+      - cloud
+    sync_mode: eager
+    priority: 10
+
+  # Input data - lazy fetch on first access
+  - name: input_data
+    path_pattern: "/inputs/**"
+    primary: onprem
+    replicate_to:
+      - cloud
+    sync_mode: lazy
+    priority: 5
+
+  # Output data - write to cloud, async sync back
+  - name: output_data
+    path_pattern: "/results/**"
+    primary: onprem
+    replicate_to: []
+    sync_mode: async
+    priority: 3
+
+  # Scratch space - never replicate (local only)
+  - name: scratch
+    path_pattern: "/scratch/**"
+    primary: ""  # No primary (site-local)
+    replicate_to: []
+    sync_mode: never
+    priority: 0
+
+  # Shared software - replicate to all sites
+  - name: software
+    path_pattern: "/software/**"
+    primary: onprem
+    replicate_to:
+      - cloud
+    sync_mode: eager
+    priority: 8
+
+# Performance tuning
+performance:
+  max_concurrent_transfers: 8
+  transfer_chunk_size: 16777216  # 16MB
+  cache_size: "4GB"
