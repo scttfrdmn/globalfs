@@ -2,18 +2,28 @@ package main
 
 // api.go — REST API handlers mounted under /api/v1/
 //
-// GET    /api/v1/sites         → list all sites with health
-// POST   /api/v1/sites         → register a new site
-// DELETE /api/v1/sites/{name}  → deregister a site
-// POST   /api/v1/replicate     → trigger manual replication
+// GET    /api/v1/sites                → list all sites with health
+// POST   /api/v1/sites                → register a new site
+// DELETE /api/v1/sites/{name}         → deregister a site
+// POST   /api/v1/replicate            → trigger manual replication
+//
+// GET    /api/v1/objects              → list objects (?prefix=&limit=)
+// GET    /api/v1/objects/{key...}     → get object data
+// PUT    /api/v1/objects/{key...}     → store object data
+// DELETE /api/v1/objects/{key...}     → delete object
+// HEAD   /api/v1/objects/{key...}     → object metadata headers
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
+
+	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
 	"github.com/scttfrdmn/globalfs/internal/coordinator"
 	"github.com/scttfrdmn/globalfs/pkg/config"
@@ -204,6 +214,152 @@ func replicateHandler(c *coordinator.Coordinator) http.HandlerFunc {
 	}
 }
 
+// ── Object API ────────────────────────────────────────────────────────────────
+
+// listObjectsResponse is the JSON envelope for GET /api/v1/objects.
+type listObjectsResponse struct {
+	Prefix  string                    `json:"prefix"`
+	Count   int                       `json:"count"`
+	Objects []objectfstypes.ObjectInfo `json:"objects"`
+}
+
+// setObjectHeaders writes standard object metadata headers derived from info.
+func setObjectHeaders(w http.ResponseWriter, info *objectfstypes.ObjectInfo) {
+	ct := info.ContentType
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+	if !info.LastModified.IsZero() {
+		w.Header().Set("Last-Modified", info.LastModified.UTC().Format(http.TimeFormat))
+	}
+	if info.ETag != "" {
+		w.Header().Set("ETag", info.ETag)
+	}
+	if info.Checksum != "" {
+		w.Header().Set("X-GlobalFS-Checksum", info.Checksum)
+	}
+}
+
+// objectListHandler handles GET /api/v1/objects — list objects by prefix.
+func objectListHandler(c *coordinator.Coordinator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		prefix := r.URL.Query().Get("prefix")
+		limit := 0
+		if ls := r.URL.Query().Get("limit"); ls != "" {
+			n, err := strconv.Atoi(ls)
+			if err != nil || n < 0 {
+				writeError(w, http.StatusBadRequest, "limit must be a non-negative integer")
+				return
+			}
+			limit = n
+		}
+
+		objects, err := c.List(r.Context(), prefix, limit)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if objects == nil {
+			objects = []objectfstypes.ObjectInfo{}
+		}
+		writeJSON(w, http.StatusOK, listObjectsResponse{
+			Prefix:  prefix,
+			Count:   len(objects),
+			Objects: objects,
+		})
+	}
+}
+
+// objectGetHandler handles GET /api/v1/objects/{key...} — retrieve object data.
+func objectGetHandler(c *coordinator.Coordinator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.PathValue("key")
+		if key == "" {
+			writeError(w, http.StatusBadRequest, "object key required in path")
+			return
+		}
+
+		data, err := c.Get(r.Context(), key)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	}
+}
+
+// objectPutHandler handles PUT /api/v1/objects/{key...} — store object data.
+func objectPutHandler(c *coordinator.Coordinator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.PathValue("key")
+		if key == "" {
+			writeError(w, http.StatusBadRequest, "object key required in path")
+			return
+		}
+
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "read request body: "+err.Error())
+			return
+		}
+
+		if err := c.Put(r.Context(), key, data); err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+
+		slog.Info("api: object stored", "key", key, "bytes", len(data))
+		w.WriteHeader(http.StatusCreated)
+	}
+}
+
+// objectDeleteHandler handles DELETE /api/v1/objects/{key...} — remove object.
+func objectDeleteHandler(c *coordinator.Coordinator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.PathValue("key")
+		if key == "" {
+			writeError(w, http.StatusBadRequest, "object key required in path")
+			return
+		}
+
+		if err := c.Delete(r.Context(), key); err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+
+		slog.Info("api: object deleted", "key", key)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// objectHeadHandler handles HEAD /api/v1/objects/{key...} — object metadata.
+func objectHeadHandler(c *coordinator.Coordinator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.PathValue("key")
+		if key == "" {
+			// HEAD must not return a body; use a plain 400 status.
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		info, err := c.Head(r.Context(), key)
+		if err != nil {
+			// HEAD must not return a body.
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+
+		setObjectHeaders(w, info)
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
 // registerAPIRoutes registers all /api/v1/* endpoints on mux.
 // daemonCtx is the coordinator's parent context, used for S3 connection setup.
 func registerAPIRoutes(mux *http.ServeMux, daemonCtx context.Context, c *coordinator.Coordinator) {
@@ -211,4 +367,10 @@ func registerAPIRoutes(mux *http.ServeMux, daemonCtx context.Context, c *coordin
 	mux.HandleFunc("POST /api/v1/sites", addSiteHandler(daemonCtx, c))
 	mux.HandleFunc("DELETE /api/v1/sites/{name}", removeSiteHandler(c))
 	mux.HandleFunc("POST /api/v1/replicate", replicateHandler(c))
+
+	mux.HandleFunc("GET /api/v1/objects", objectListHandler(c))
+	mux.HandleFunc("GET /api/v1/objects/{key...}", objectGetHandler(c))
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", objectPutHandler(c))
+	mux.HandleFunc("DELETE /api/v1/objects/{key...}", objectDeleteHandler(c))
+	mux.HandleFunc("HEAD /api/v1/objects/{key...}", objectHeadHandler(c))
 }

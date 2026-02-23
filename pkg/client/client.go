@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -68,6 +69,24 @@ type StatusResponse struct {
 	Healthy bool
 	// Details contains per-site error lines when unhealthy.
 	Details string
+}
+
+// ObjectInfo describes a stored object as returned by the coordinator.
+type ObjectInfo struct {
+	Key          string            `json:"key"`
+	Size         int64             `json:"size"`
+	LastModified time.Time         `json:"last_modified"`
+	ETag         string            `json:"etag,omitempty"`
+	ContentType  string            `json:"content_type,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	Checksum     string            `json:"checksum,omitempty"`
+}
+
+// listObjectsResponse mirrors the coordinator's list envelope.
+type listObjectsResponse struct {
+	Prefix  string       `json:"prefix"`
+	Count   int          `json:"count"`
+	Objects []ObjectInfo `json:"objects"`
 }
 
 // APIError is returned when the coordinator responds with a non-2xx status.
@@ -220,6 +239,106 @@ func (c *Client) Status(ctx context.Context) (StatusResponse, error) {
 	return sr, &APIError{StatusCode: resp.StatusCode, Message: details}
 }
 
+// ── Object methods ────────────────────────────────────────────────────────────
+
+// GetObject retrieves the full content of the object at key.
+func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
+	resp, err := c.doGet(ctx, "/api/v1/objects/"+key)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := checkStatus(resp, http.StatusOK); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// PutObject stores data under key. It returns nil on success.
+func (c *Client) PutObject(ctx context.Context, key string, data []byte) error {
+	resp, err := c.doPut(ctx, "/api/v1/objects/"+key, data)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return checkStatus(resp, http.StatusCreated)
+}
+
+// HeadObject returns metadata for the object at key without fetching its
+// content. The returned ObjectInfo is populated from HTTP response headers.
+func (c *Client) HeadObject(ctx context.Context, key string) (*ObjectInfo, error) {
+	resp, err := c.doHead(ctx, "/api/v1/objects/"+key)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, &APIError{StatusCode: resp.StatusCode, Message: "head request failed"}
+	}
+
+	info := &ObjectInfo{
+		Key:         key,
+		ContentType: resp.Header.Get("Content-Type"),
+		ETag:        resp.Header.Get("ETag"),
+		Checksum:    resp.Header.Get("X-GlobalFS-Checksum"),
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		info.Size, _ = strconv.ParseInt(cl, 10, 64)
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm != "" {
+		info.LastModified, _ = http.ParseTime(lm)
+	}
+	return info, nil
+}
+
+// DeleteObject removes the object at key. It returns nil on success.
+func (c *Client) DeleteObject(ctx context.Context, key string) error {
+	resp, err := c.doDelete(ctx, "/api/v1/objects/"+key)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return checkStatus(resp, http.StatusNoContent)
+}
+
+// ListObjects returns up to limit objects whose keys begin with prefix.
+// Pass prefix="" to list all objects. Pass limit ≤ 0 to retrieve all matches.
+// An empty (never nil) slice is returned when no objects match.
+func (c *Client) ListObjects(ctx context.Context, prefix string, limit int) ([]ObjectInfo, error) {
+	params := url.Values{}
+	if prefix != "" {
+		params.Set("prefix", prefix)
+	}
+	if limit > 0 {
+		params.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/api/v1/objects"
+	if len(params) > 0 {
+		path += "?" + params.Encode()
+	}
+
+	resp, err := c.doGet(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := checkStatus(resp, http.StatusOK); err != nil {
+		return nil, err
+	}
+
+	var envelope listObjectsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if envelope.Objects == nil {
+		envelope.Objects = []ObjectInfo{}
+	}
+	return envelope.Objects, nil
+}
+
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 func (c *Client) doGet(ctx context.Context, path string) (*http.Response, error) {
@@ -247,6 +366,31 @@ func (c *Client) doPost(ctx context.Context, path string, body any) (*http.Respo
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("POST %s: %w", path, err)
+	}
+	return resp, nil
+}
+
+func (c *Client) doPut(ctx context.Context, path string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build PUT %s: %w", path, err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("PUT %s: %w", path, err)
+	}
+	return resp, nil
+}
+
+func (c *Client) doHead(ctx context.Context, path string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.baseURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build HEAD %s: %w", path, err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HEAD %s: %w", path, err)
 	}
 	return resp, nil
 }

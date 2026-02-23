@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -360,5 +361,245 @@ func TestAPIError_ErrorString(t *testing.T) {
 	got := e.Error()
 	if got != "coordinator error (404): not found" {
 		t.Errorf("unexpected error string: %q", got)
+	}
+}
+
+// ── GetObject ─────────────────────────────────────────────────────────────────
+
+func TestGetObject_OK(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ACGTACGT"))
+	})
+	c := newServer(t, mux)
+
+	data, err := c.GetObject(context.Background(), "data/genome.bam")
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	if string(data) != "ACGTACGT" {
+		t.Errorf("got %q, want ACGTACGT", data)
+	}
+}
+
+func TestGetObject_Error(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "site unreachable"})
+	})
+	c := newServer(t, mux)
+
+	_, err := c.GetObject(context.Background(), "missing/key")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T", err)
+	}
+	if apiErr.StatusCode != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d", apiErr.StatusCode)
+	}
+}
+
+// ── PutObject ─────────────────────────────────────────────────────────────────
+
+func TestPutObject_OK(t *testing.T) {
+	var gotKey string
+	var gotBody []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.PathValue("key")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusCreated)
+	})
+	c := newServer(t, mux)
+
+	if err := c.PutObject(context.Background(), "uploads/data.bin", []byte("payload")); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	if gotKey != "uploads/data.bin" {
+		t.Errorf("server got key %q, want uploads/data.bin", gotKey)
+	}
+	if string(gotBody) != "payload" {
+		t.Errorf("server got body %q, want payload", gotBody)
+	}
+}
+
+func TestPutObject_Error(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "disk full"})
+	})
+	c := newServer(t, mux)
+
+	err := c.PutObject(context.Background(), "k", []byte("v"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T", err)
+	}
+	if apiErr.StatusCode != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d", apiErr.StatusCode)
+	}
+}
+
+// ── HeadObject ────────────────────────────────────────────────────────────────
+
+func TestHeadObject_OK(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("HEAD /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", "42")
+		w.Header().Set("ETag", "abc123")
+		w.Header().Set("Last-Modified", "Wed, 15 Jan 2026 12:00:00 GMT")
+		w.Header().Set("X-GlobalFS-Checksum", "sha256-deadbeef")
+		w.WriteHeader(http.StatusOK)
+	})
+	c := newServer(t, mux)
+
+	info, err := c.HeadObject(context.Background(), "archive/data.tar.zst")
+	if err != nil {
+		t.Fatalf("HeadObject: %v", err)
+	}
+	if info.Size != 42 {
+		t.Errorf("Size: got %d, want 42", info.Size)
+	}
+	if info.ETag != "abc123" {
+		t.Errorf("ETag: got %q, want abc123", info.ETag)
+	}
+	if info.Checksum != "sha256-deadbeef" {
+		t.Errorf("Checksum: got %q", info.Checksum)
+	}
+	if info.LastModified.IsZero() {
+		t.Error("expected non-zero LastModified")
+	}
+	if info.Key != "archive/data.tar.zst" {
+		t.Errorf("Key: got %q", info.Key)
+	}
+}
+
+func TestHeadObject_Error(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("HEAD /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	c := newServer(t, mux)
+
+	_, err := c.HeadObject(context.Background(), "missing")
+	if err == nil {
+		t.Fatal("expected error for 502")
+	}
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T", err)
+	}
+}
+
+// ── DeleteObject ──────────────────────────────────────────────────────────────
+
+func TestDeleteObject_OK(t *testing.T) {
+	var gotKey string
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.PathValue("key")
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := newServer(t, mux)
+
+	if err := c.DeleteObject(context.Background(), "reports/q1.csv"); err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	if gotKey != "reports/q1.csv" {
+		t.Errorf("server got key %q, want reports/q1.csv", gotKey)
+	}
+}
+
+func TestDeleteObject_Error(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "network error"})
+	})
+	c := newServer(t, mux)
+
+	err := c.DeleteObject(context.Background(), "k")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T", err)
+	}
+}
+
+// ── ListObjects ───────────────────────────────────────────────────────────────
+
+func TestListObjects_OK(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/objects", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"prefix":  "",
+			"count":   2,
+			"objects": []client.ObjectInfo{{Key: "a"}, {Key: "b"}},
+		})
+	})
+	c := newServer(t, mux)
+
+	objects, err := c.ListObjects(context.Background(), "", 0)
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if len(objects) != 2 {
+		t.Errorf("expected 2 objects, got %d", len(objects))
+	}
+}
+
+func TestListObjects_WithPrefixAndLimit(t *testing.T) {
+	var gotPrefix, gotLimit string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/objects", func(w http.ResponseWriter, r *http.Request) {
+		gotPrefix = r.URL.Query().Get("prefix")
+		gotLimit = r.URL.Query().Get("limit")
+		writeJSON(w, http.StatusOK, map[string]any{
+			"prefix":  gotPrefix,
+			"count":   0,
+			"objects": []client.ObjectInfo{},
+		})
+	})
+	c := newServer(t, mux)
+
+	_, err := c.ListObjects(context.Background(), "data/", 50)
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if gotPrefix != "data/" {
+		t.Errorf("prefix: got %q, want data/", gotPrefix)
+	}
+	if gotLimit != "50" {
+		t.Errorf("limit: got %q, want 50", gotLimit)
+	}
+}
+
+func TestListObjects_Empty(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/objects", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"prefix":  "",
+			"count":   0,
+			"objects": []client.ObjectInfo{},
+		})
+	})
+	c := newServer(t, mux)
+
+	objects, err := c.ListObjects(context.Background(), "", 0)
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if objects == nil {
+		t.Error("expected non-nil slice for empty result")
 	}
 }
