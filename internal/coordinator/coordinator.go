@@ -26,9 +26,11 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
+	"github.com/scttfrdmn/globalfs/internal/metadata"
 	"github.com/scttfrdmn/globalfs/internal/policy"
 	"github.com/scttfrdmn/globalfs/internal/replication"
 	"github.com/scttfrdmn/globalfs/pkg/namespace"
@@ -38,11 +40,14 @@ import (
 
 // Coordinator routes object operations across a prioritized set of SiteMounts.
 type Coordinator struct {
-	mu     sync.RWMutex
-	sites  []*site.SiteMount
-	ns     *namespace.Namespace
-	policy *policy.Engine // never nil; default = empty engine
-	worker *replication.Worker
+	mu          sync.RWMutex
+	sites       []*site.SiteMount
+	ns          *namespace.Namespace
+	policy      *policy.Engine  // never nil; default = empty engine
+	worker      *replication.Worker
+	store       metadata.Store  // optional; nil means no persistence
+	storeCancel context.CancelFunc
+	storeWg     sync.WaitGroup
 }
 
 // New creates a Coordinator from an ordered list of SiteMounts.
@@ -75,15 +80,54 @@ func (c *Coordinator) SetPolicy(e *policy.Engine) {
 	}
 }
 
+// SetStore registers a metadata store for persistence.
+//
+// When set, replication jobs are persisted before they are enqueued so they
+// survive coordinator restarts.  Completed and failed jobs are deleted from
+// the store.  SetStore must be called before Start to enable job recovery.
+func (c *Coordinator) SetStore(s metadata.Store) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.store = s
+}
+
 // Start launches the background replication worker.
 // It is safe to call Start multiple times; only the first call has effect.
+//
+// If a Store has been registered via SetStore, Start also recovers any pending
+// jobs from the previous run and begins draining worker events to keep the
+// store in sync.
 func (c *Coordinator) Start(ctx context.Context) {
+	c.mu.Lock()
+	store := c.store
+	c.mu.Unlock()
+
+	if store != nil {
+		storeCtx, cancel := context.WithCancel(ctx)
+		c.mu.Lock()
+		c.storeCancel = cancel
+		c.mu.Unlock()
+
+		c.recoverPendingJobs(ctx, store)
+		c.storeWg.Add(1)
+		go func() {
+			defer c.storeWg.Done()
+			c.drainWorkerEvents(storeCtx, store)
+		}()
+	}
 	c.worker.Start(ctx)
 }
 
 // Stop signals the background replication worker to stop and waits for it to
 // finish the current job.  Calling Stop before Start is safe.
 func (c *Coordinator) Stop() {
+	c.mu.Lock()
+	cancel := c.storeCancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	c.storeWg.Wait()
 	c.worker.Stop()
 }
 
@@ -193,7 +237,7 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 // target so data is durably stored before Put returns.
 func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	c.mu.RLock()
-	snapshot, pol := c.snapshotSites(), c.policy
+	snapshot, pol, store := c.snapshotSites(), c.policy, c.store
 	c.mu.RUnlock()
 
 	routed, err := pol.Route(ctx, policy.OperationWrite, key, snapshot)
@@ -228,6 +272,19 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 				Key:        key,
 				Size:       int64(len(data)),
 			})
+			if store != nil {
+				metaJob := &metadata.ReplicationJob{
+					ID:         makeJobID(src.Name(), s.Name(), key),
+					SourceSite: src.Name(),
+					DestSite:   s.Name(),
+					Key:        key,
+					Size:       int64(len(data)),
+					CreatedAt:  time.Now(),
+				}
+				if persistErr := store.PutReplicationJob(ctx, metaJob); persistErr != nil {
+					log.Printf("coordinator: persist job %q: %v", metaJob.ID, persistErr)
+				}
+			}
 		}
 	}
 	return nil
@@ -315,4 +372,62 @@ func partitionByRole(sites []*site.SiteMount) (primaries, others []*site.SiteMou
 		}
 	}
 	return
+}
+
+// makeJobID returns a deterministic store key for a pending replication job.
+func makeJobID(sourceSite, destSite, key string) string {
+	return sourceSite + ":" + destSite + ":" + key
+}
+
+// recoverPendingJobs reads all pending replication jobs from the store and
+// re-enqueues them.  Called at Start time when a store is configured.
+func (c *Coordinator) recoverPendingJobs(ctx context.Context, store metadata.Store) {
+	jobs, err := store.GetPendingJobs(ctx)
+	if err != nil {
+		log.Printf("coordinator: recover pending jobs: %v", err)
+		return
+	}
+
+	c.mu.RLock()
+	siteMap := make(map[string]*site.SiteMount, len(c.sites))
+	for _, s := range c.sites {
+		siteMap[s.Name()] = s
+	}
+	c.mu.RUnlock()
+
+	for _, j := range jobs {
+		src, srcOK := siteMap[j.SourceSite]
+		dst, dstOK := siteMap[j.DestSite]
+		if !srcOK || !dstOK {
+			log.Printf("coordinator: skip recovered job %q (site missing)", j.ID)
+			continue
+		}
+		c.worker.Enqueue(replication.ReplicationJob{
+			SourceSite: src,
+			DestSite:   dst,
+			Key:        j.Key,
+			Size:       j.Size,
+		})
+	}
+}
+
+// drainWorkerEvents removes completed and failed replication jobs from the store.
+// Runs in a goroutine until ctx is cancelled.
+func (c *Coordinator) drainWorkerEvents(ctx context.Context, store metadata.Store) {
+	for {
+		select {
+		case ev, ok := <-c.worker.Events():
+			if !ok {
+				return
+			}
+			if ev.Type == replication.EventCompleted || ev.Type == replication.EventFailed {
+				id := makeJobID(ev.Job.SourceSite.Name(), ev.Job.DestSite.Name(), ev.Job.Key)
+				if err := store.DeleteJob(ctx, id); err != nil {
+					log.Printf("coordinator: delete job %q from store: %v", id, err)
+				}
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }

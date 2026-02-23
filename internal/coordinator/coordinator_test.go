@@ -9,6 +9,7 @@ import (
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
+	"github.com/scttfrdmn/globalfs/internal/metadata"
 	"github.com/scttfrdmn/globalfs/internal/policy"
 	"github.com/scttfrdmn/globalfs/pkg/site"
 	"github.com/scttfrdmn/globalfs/pkg/types"
@@ -535,4 +536,142 @@ func TestCoordinator_Health_UnhealthySiteReported(t *testing.T) {
 	if !errors.Is(report["sick"], sentinel) {
 		t.Errorf("Health[sick]: expected sentinel error, got %v", report["sick"])
 	}
+}
+
+// ─── Store integration tests ───────────────────────────────────────────────────
+
+// TestCoordinator_SetStore_PersistsReplicationJob verifies that a Put to a
+// non-primary site writes a ReplicationJob record to the store before the
+// worker delivers it.
+func TestCoordinator_SetStore_PersistsReplicationJob(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, _ := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := metadata.NewMemoryStore()
+	c := New(primary, backup)
+	c.SetStore(store)
+	c.Start(ctx)
+	defer c.Stop()
+
+	if err := c.Put(ctx, "data/sample.bam", []byte("genome")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// The replication job must appear in the store immediately after Put returns.
+	jobs, err := store.GetPendingJobs(ctx)
+	if err != nil {
+		t.Fatalf("GetPendingJobs: %v", err)
+	}
+	if len(jobs) == 0 {
+		t.Fatal("expected at least one pending job after Put, got zero")
+	}
+
+	expectedID := makeJobID("primary", "backup", "data/sample.bam")
+	var found bool
+	for _, j := range jobs {
+		if j.ID == expectedID {
+			found = true
+			if j.Key != "data/sample.bam" {
+				t.Errorf("job Key: got %q, want %q", j.Key, "data/sample.bam")
+			}
+		}
+	}
+	if !found {
+		t.Errorf("job %q not found in store; jobs: %v", expectedID, jobs)
+	}
+}
+
+// TestCoordinator_SetStore_DeletesJobAfterReplication verifies that completed
+// replication jobs are removed from the store by the drain goroutine.
+func TestCoordinator_SetStore_DeletesJobAfterReplication(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := metadata.NewMemoryStore()
+	c := New(primary, backup)
+	c.SetStore(store)
+	c.Start(ctx)
+	defer c.Stop()
+
+	if err := c.Put(ctx, "output.vcf", []byte("variant-calls")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Wait for the worker to deliver the replication (up to 3 seconds).
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if backupClient.hasKey("output.vcf") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !backupClient.hasKey("output.vcf") {
+		t.Fatal("backup: async replication did not deliver key within 3s")
+	}
+
+	// After delivery the job should be removed from the store.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		jobs, _ := store.GetPendingJobs(ctx)
+		if len(jobs) == 0 {
+			return // success: store is clean
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	jobs, _ := store.GetPendingJobs(ctx)
+	t.Errorf("expected store to be empty after replication, got %d pending job(s)", len(jobs))
+}
+
+// TestCoordinator_SetStore_RecoversPendingJobs verifies that jobs persisted in
+// the store before Start are re-enqueued and eventually delivered.
+func TestCoordinator_SetStore_RecoversPendingJobs(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"reads.fastq": []byte("sequence-data"),
+	})
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Pre-populate the store with a job that simulates a prior interrupted run.
+	store := metadata.NewMemoryStore()
+	preJob := &metadata.ReplicationJob{
+		ID:         makeJobID("primary", "backup", "reads.fastq"),
+		SourceSite: "primary",
+		DestSite:   "backup",
+		Key:        "reads.fastq",
+		Size:       int64(len("sequence-data")),
+		CreatedAt:  time.Now(),
+	}
+	if err := store.PutReplicationJob(ctx, preJob); err != nil {
+		t.Fatalf("PutReplicationJob (setup): %v", err)
+	}
+
+	// Start the coordinator; recoverPendingJobs should re-enqueue the job.
+	c := New(primary, backup)
+	c.SetStore(store)
+	c.Start(ctx)
+	defer c.Stop()
+
+	// Backup should eventually receive the recovered replication.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if backupClient.hasKey("reads.fastq") {
+			return // success
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("backup: recovered job was not delivered within 3s")
 }
