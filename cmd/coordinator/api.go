@@ -2,6 +2,7 @@ package main
 
 // api.go — REST API handlers mounted under /api/v1/
 //
+// GET    /api/v1/info                 → coordinator runtime information
 // GET    /api/v1/sites                → list all sites with health
 // POST   /api/v1/sites                → register a new site
 // DELETE /api/v1/sites/{name}         → deregister a site
@@ -454,6 +455,37 @@ func objectHeadHandler(c *coordinator.Coordinator) http.HandlerFunc {
 
 		setObjectHeaders(w, info)
 		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// ── Info handler ──────────────────────────────────────────────────────────────
+
+// infoResponse is the JSON payload for GET /api/v1/info.
+type infoResponse struct {
+	Version               string         `json:"version"`
+	UptimeSeconds         float64        `json:"uptime_seconds"`
+	Sites                 int            `json:"sites"`
+	SitesByRole           map[string]int `json:"sites_by_role"`
+	ReplicationQueueDepth int            `json:"replication_queue_depth"`
+	IsLeader              bool           `json:"is_leader"`
+}
+
+// infoHandler handles GET /api/v1/info — returns coordinator runtime stats.
+func infoHandler(c *coordinator.Coordinator, version string, startTime time.Time) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sites := c.Sites()
+		byRole := make(map[string]int)
+		for _, s := range sites {
+			byRole[string(s.Role())]++
+		}
+		writeJSON(w, http.StatusOK, infoResponse{
+			Version:               version,
+			UptimeSeconds:         time.Since(startTime).Seconds(),
+			Sites:                 len(sites),
+			SitesByRole:           byRole,
+			ReplicationQueueDepth: c.ReplicationQueueDepth(),
+			IsLeader:              c.IsLeader(),
+		})
 	}
 }
 

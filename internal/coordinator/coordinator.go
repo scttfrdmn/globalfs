@@ -508,6 +508,21 @@ func (c *Coordinator) Replicate(ctx context.Context, key, fromSite, toSite strin
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+// ReplicationQueueDepth returns the number of replication jobs currently
+// waiting in the worker queue.
+func (c *Coordinator) ReplicationQueueDepth() int {
+	return c.worker.QueueDepth()
+}
+
+// IsLeader reports whether this coordinator instance is currently the active
+// leader.  In single-node deployments (no lease manager configured) the
+// coordinator is always the leader.
+func (c *Coordinator) IsLeader() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.leaseManager == nil || c.leaderLease != nil
+}
+
 // snapshotSites returns a copy of c.sites. Caller must hold at least RLock.
 func (c *Coordinator) snapshotSites() []*site.SiteMount {
 	cp := make([]*site.SiteMount, len(c.sites))

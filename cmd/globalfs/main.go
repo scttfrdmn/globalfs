@@ -21,6 +21,7 @@
 //	config validate <file>                                – validate a config file
 //	config show     <file>                                – show resolved config
 //	config init     [--output <file>]                     – write starter config template
+//	info                                                  – coordinator runtime stats
 //	status                                                – overall health
 //	version                                               – print CLI version
 //	completion bash|zsh|fish|powershell                   – shell completions
@@ -90,6 +91,7 @@ func buildRoot() *cobra.Command {
 		buildObjectCmd(),
 		buildConfigCmd(),
 		buildReplicateCmd(),
+		buildInfoCmd(),
 		buildStatusCmd(),
 		buildVersionCmd(),
 		buildCompletionCmd(root),
@@ -647,6 +649,74 @@ func buildReplicateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&from, "from", "", "Source site name (required)")
 	cmd.Flags().StringVar(&to, "to", "", "Destination site name (required)")
 	return cmd
+}
+
+// ── info ──────────────────────────────────────────────────────────────────────
+
+// coordinatorInfo mirrors the infoResponse from the coordinator's /api/v1/info endpoint.
+type coordinatorInfo struct {
+	Version               string         `json:"version"`
+	UptimeSeconds         float64        `json:"uptime_seconds"`
+	Sites                 int            `json:"sites"`
+	SitesByRole           map[string]int `json:"sites_by_role"`
+	ReplicationQueueDepth int            `json:"replication_queue_depth"`
+	IsLeader              bool           `json:"is_leader"`
+}
+
+func buildInfoCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "info",
+		Short: "Show coordinator runtime statistics",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			resp, err := apiGet("/api/v1/info")
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				return fmtAPIError(resp)
+			}
+
+			var info coordinatorInfo
+			if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+				return fmt.Errorf("decode response: %w", err)
+			}
+
+			if jsonOutput {
+				return printJSON(cmd.OutOrStdout(), info)
+			}
+
+			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+			fmt.Fprintf(tw, "version\t%s\n", info.Version)
+			fmt.Fprintf(tw, "uptime\t%s\n", formatUptime(info.UptimeSeconds))
+			fmt.Fprintf(tw, "sites\t%d\n", info.Sites)
+			for _, role := range []string{"primary", "backup", "burst"} {
+				if n := info.SitesByRole[role]; n > 0 {
+					fmt.Fprintf(tw, "  %s\t%d\n", role, n)
+				}
+			}
+			fmt.Fprintf(tw, "replication_queue\t%d\n", info.ReplicationQueueDepth)
+			fmt.Fprintf(tw, "is_leader\t%v\n", info.IsLeader)
+			return tw.Flush()
+		},
+	}
+}
+
+// formatUptime converts a float64 number of seconds into a human-readable string
+// of the form "1h2m3s", "45m0s", or "12s".
+func formatUptime(secs float64) string {
+	d := time.Duration(secs) * time.Second
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh%dm%ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm%ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
 }
 
 // ── status ────────────────────────────────────────────────────────────────────

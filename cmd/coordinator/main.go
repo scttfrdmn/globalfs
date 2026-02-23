@@ -135,10 +135,13 @@ func main() {
 
 	// ── HTTP server ───────────────────────────────────────────────────────────
 
+	startTime := time.Now()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler(c))
 	mux.HandleFunc("/readyz", readyzHandler())
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("GET /api/v1/info", infoHandler(c, version, startTime))
 	registerAPIRoutes(mux, ctx, c, m)
 
 	// Build middleware chain (applied innermost → outermost):

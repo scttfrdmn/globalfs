@@ -782,3 +782,99 @@ func TestLoggingMiddleware_ChainedWithRequestID(t *testing.T) {
 		t.Errorf("response X-Request-ID = %q, want %q", got, "chain-test-id")
 	}
 }
+
+// ── infoHandler ───────────────────────────────────────────────────────────────
+
+func TestInfoHandler_ReturnsJSON(t *testing.T) {
+	c, _ := makeTestCoordinator(t, nil)
+	startTime := time.Now().Add(-5 * time.Minute)
+
+	req := httptest.NewRequest("GET", "/api/v1/info", nil)
+	w := httptest.NewRecorder()
+	infoHandler(c, "1.2.3", startTime)(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type: got %q, want application/json", ct)
+	}
+
+	var info infoResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &info); err != nil {
+		t.Fatalf("unmarshal infoResponse: %v", err)
+	}
+	if info.Version != "1.2.3" {
+		t.Errorf("version: got %q, want 1.2.3", info.Version)
+	}
+}
+
+func TestInfoHandler_UptimePositive(t *testing.T) {
+	c, _ := makeTestCoordinator(t, nil)
+	startTime := time.Now().Add(-10 * time.Second)
+
+	req := httptest.NewRequest("GET", "/api/v1/info", nil)
+	w := httptest.NewRecorder()
+	infoHandler(c, "v1", startTime)(w, req)
+
+	var info infoResponse
+	json.Unmarshal(w.Body.Bytes(), &info)
+	if info.UptimeSeconds < 10 {
+		t.Errorf("uptime_seconds: got %f, want >= 10", info.UptimeSeconds)
+	}
+}
+
+func TestInfoHandler_SitesCounted(t *testing.T) {
+	mc1 := newTestMemClient(nil)
+	mc2 := newTestMemClient(nil)
+	s1 := site.New("primary", types.SiteRolePrimary, mc1)
+	s2 := site.New("backup", types.SiteRoleBackup, mc2)
+	c := coordinator.New(s1, s2)
+	c.Start(context.Background())
+	t.Cleanup(c.Stop)
+
+	req := httptest.NewRequest("GET", "/api/v1/info", nil)
+	w := httptest.NewRecorder()
+	infoHandler(c, "v1", time.Now())(w, req)
+
+	var info infoResponse
+	json.Unmarshal(w.Body.Bytes(), &info)
+	if info.Sites != 2 {
+		t.Errorf("sites: got %d, want 2", info.Sites)
+	}
+	if info.SitesByRole["primary"] != 1 {
+		t.Errorf("sites_by_role.primary: got %d, want 1", info.SitesByRole["primary"])
+	}
+	if info.SitesByRole["backup"] != 1 {
+		t.Errorf("sites_by_role.backup: got %d, want 1", info.SitesByRole["backup"])
+	}
+}
+
+func TestInfoHandler_SingleNodeIsLeader(t *testing.T) {
+	// Without a LeaseManager configured, IsLeader always returns true.
+	c, _ := makeTestCoordinator(t, nil)
+
+	req := httptest.NewRequest("GET", "/api/v1/info", nil)
+	w := httptest.NewRecorder()
+	infoHandler(c, "v1", time.Now())(w, req)
+
+	var info infoResponse
+	json.Unmarshal(w.Body.Bytes(), &info)
+	if !info.IsLeader {
+		t.Error("single-node coordinator: is_leader should be true")
+	}
+}
+
+func TestInfoHandler_QueueDepthZero(t *testing.T) {
+	c, _ := makeTestCoordinator(t, nil)
+
+	req := httptest.NewRequest("GET", "/api/v1/info", nil)
+	w := httptest.NewRecorder()
+	infoHandler(c, "v1", time.Now())(w, req)
+
+	var info infoResponse
+	json.Unmarshal(w.Body.Bytes(), &info)
+	if info.ReplicationQueueDepth != 0 {
+		t.Errorf("queue depth: got %d, want 0", info.ReplicationQueueDepth)
+	}
+}

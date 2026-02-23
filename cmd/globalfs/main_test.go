@@ -885,3 +885,109 @@ func TestConfigInit_ToFile(t *testing.T) {
 		t.Errorf("written file missing cluster_name, got %q", string(contents))
 	}
 }
+
+// ── info ──────────────────────────────────────────────────────────────────────
+
+func newInfoTestServer(t *testing.T, info coordinatorInfo) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/info", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(info)
+	})
+	return newTestServer(t, mux)
+}
+
+func TestInfo_TableOutput(t *testing.T) {
+	info := coordinatorInfo{
+		Version:               "0.1.0-alpha",
+		UptimeSeconds:         3723,
+		Sites:                 2,
+		SitesByRole:           map[string]int{"primary": 1, "backup": 1},
+		ReplicationQueueDepth: 3,
+		IsLeader:              true,
+	}
+	addr := newInfoTestServer(t, info)
+
+	out, err := runCmd(t, addr, "info")
+	if err != nil {
+		t.Fatalf("info: %v (output: %s)", err, out)
+	}
+	if !strings.Contains(out, "0.1.0-alpha") {
+		t.Errorf("expected version in output, got %q", out)
+	}
+	if !strings.Contains(out, "1h2m3s") {
+		t.Errorf("expected formatted uptime in output, got %q", out)
+	}
+	if !strings.Contains(out, "primary") {
+		t.Errorf("expected 'primary' in output, got %q", out)
+	}
+	if !strings.Contains(out, "true") {
+		t.Errorf("expected 'true' for is_leader in output, got %q", out)
+	}
+}
+
+func TestInfo_JSONOutput(t *testing.T) {
+	info := coordinatorInfo{
+		Version:       "0.2.0",
+		UptimeSeconds: 60,
+		Sites:         1,
+		SitesByRole:   map[string]int{"primary": 1},
+		IsLeader:      true,
+	}
+	addr := newInfoTestServer(t, info)
+
+	out, err := runCmd(t, addr, "info", "--json")
+	if err != nil {
+		t.Fatalf("info --json: %v (output: %s)", err, out)
+	}
+	var got coordinatorInfo
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v (output: %q)", err, out)
+	}
+	if got.Version != "0.2.0" {
+		t.Errorf("version: got %q, want 0.2.0", got.Version)
+	}
+	if got.Sites != 1 {
+		t.Errorf("sites: got %d, want 1", got.Sites)
+	}
+}
+
+func TestInfo_ServerError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/info", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"internal error"}`))
+	})
+	addr := newTestServer(t, mux)
+
+	_, err := runCmd(t, addr, "info")
+	if err == nil {
+		t.Fatal("expected error for 500 response, got nil")
+	}
+}
+
+// ── formatUptime ──────────────────────────────────────────────────────────────
+
+func TestFormatUptime(t *testing.T) {
+	cases := []struct {
+		secs float64
+		want string
+	}{
+		{0, "0s"},
+		{45, "45s"},
+		{60, "1m0s"},
+		{90, "1m30s"},
+		{3600, "1h0m0s"},
+		{3723, "1h2m3s"},
+		{86400, "24h0m0s"},
+	}
+	for _, tc := range cases {
+		got := formatUptime(tc.secs)
+		if got != tc.want {
+			t.Errorf("formatUptime(%v): got %q, want %q", tc.secs, got, tc.want)
+		}
+	}
+}
