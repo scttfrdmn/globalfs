@@ -114,10 +114,11 @@ func buildSiteCmd() *cobra.Command {
 
 // siteInfo mirrors coordinator.SiteInfo for JSON decoding.
 type siteInfo struct {
-	Name    string `json:"name"`
-	Role    string `json:"role"`
-	Healthy bool   `json:"healthy"`
-	Error   string `json:"error,omitempty"`
+	Name         string `json:"name"`
+	Role         string `json:"role"`
+	Healthy      bool   `json:"healthy"`
+	Error        string `json:"error,omitempty"`
+	CircuitState string `json:"circuit_state,omitempty"`
 }
 
 func buildSiteListCmd() *cobra.Command {
@@ -144,8 +145,22 @@ func buildSiteListCmd() *cobra.Command {
 				return printJSON(cmd.OutOrStdout(), sites)
 			}
 
+			// Show a CIRCUIT column only when at least one site has circuit
+			// state data (i.e. a circuit breaker is configured).
+			showCircuit := false
+			for _, s := range sites {
+				if s.CircuitState != "" {
+					showCircuit = true
+					break
+				}
+			}
+
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(tw, "NAME\tROLE\tSTATUS")
+			if showCircuit {
+				fmt.Fprintln(tw, "NAME\tROLE\tSTATUS\tCIRCUIT")
+			} else {
+				fmt.Fprintln(tw, "NAME\tROLE\tSTATUS")
+			}
 			for _, s := range sites {
 				status := "healthy"
 				if !s.Healthy {
@@ -154,7 +169,11 @@ func buildSiteListCmd() *cobra.Command {
 						status += ": " + s.Error
 					}
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\n", s.Name, s.Role, status)
+				if showCircuit {
+					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", s.Name, s.Role, status, s.CircuitState)
+				} else {
+					fmt.Fprintf(tw, "%s\t%s\t%s\n", s.Name, s.Role, status)
+				}
 			}
 			return tw.Flush()
 		},

@@ -160,6 +160,55 @@ func TestSiteList_JSONOutput(t *testing.T) {
 	}
 }
 
+// TestSiteList_WithCircuitState verifies that the CIRCUIT column is shown when
+// any site carries a circuit_state in the response.
+func TestSiteList_WithCircuitState(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]siteInfo{
+			{Name: "primary", Role: "primary", Healthy: true, CircuitState: "closed"},
+			{Name: "burst", Role: "burst", Healthy: true, CircuitState: "open"},
+		})
+	})
+	addr := newTestServer(t, mux)
+
+	out, err := runCmd(t, addr, "site", "list")
+	if err != nil {
+		t.Fatalf("site list: %v", err)
+	}
+	if !strings.Contains(out, "CIRCUIT") {
+		t.Errorf("expected CIRCUIT column header in output: %q", out)
+	}
+	if !strings.Contains(out, "closed") {
+		t.Errorf("expected 'closed' state in output: %q", out)
+	}
+	if !strings.Contains(out, "open") {
+		t.Errorf("expected 'open' state in output: %q", out)
+	}
+}
+
+// TestSiteList_NoCircuitState verifies that the CIRCUIT column is absent when
+// no site carries circuit state (no circuit breaker configured).
+func TestSiteList_NoCircuitState(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]siteInfo{
+			{Name: "primary", Role: "primary", Healthy: true},
+		})
+	})
+	addr := newTestServer(t, mux)
+
+	out, err := runCmd(t, addr, "site", "list")
+	if err != nil {
+		t.Fatalf("site list: %v", err)
+	}
+	if strings.Contains(out, "CIRCUIT") {
+		t.Errorf("CIRCUIT column should be absent without circuit state data: %q", out)
+	}
+}
+
 // ─── site remove ─────────────────────────────────────────────────────────────
 
 func TestSiteRemove_OK(t *testing.T) {

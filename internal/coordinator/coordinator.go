@@ -663,17 +663,21 @@ func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.Obje
 
 // SiteInfo is a read-only snapshot of a site's name, role, and health.
 type SiteInfo struct {
-	Name    string         `json:"name"`
-	Role    types.SiteRole `json:"role"`
-	Healthy bool           `json:"healthy"`
-	Error   string         `json:"error,omitempty"`
+	Name         string         `json:"name"`
+	Role         types.SiteRole `json:"role"`
+	Healthy      bool           `json:"healthy"`
+	Error        string         `json:"error,omitempty"`
+	CircuitState string         `json:"circuit_state,omitempty"`
 }
 
 // SiteInfos returns a health-annotated snapshot of all registered sites.
 // Health checks run concurrently; the call blocks until all complete.
+// When a circuit breaker is configured, each SiteInfo also carries
+// the current CircuitState for that site.
 func (c *Coordinator) SiteInfos(ctx context.Context) []SiteInfo {
 	c.mu.RLock()
 	snapshot := c.snapshotSites()
+	cb := c.cb
 	c.mu.RUnlock()
 
 	report := c.Health(ctx)
@@ -684,6 +688,9 @@ func (c *Coordinator) SiteInfos(ctx context.Context) []SiteInfo {
 		if err := report[s.Name()]; err != nil {
 			info.Healthy = false
 			info.Error = err.Error()
+		}
+		if cb != nil {
+			info.CircuitState = cb.State(s.Name()).String()
 		}
 		infos[i] = info
 	}

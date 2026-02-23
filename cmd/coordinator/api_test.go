@@ -15,6 +15,7 @@ import (
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
+	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/coordinator"
 	"github.com/scttfrdmn/globalfs/pkg/site"
 	"github.com/scttfrdmn/globalfs/pkg/types"
@@ -1016,3 +1017,108 @@ func TestHealthzHandler_CacheDegradedSite(t *testing.T) {
 		t.Errorf("expected 'DEGRADED' in body, got %q", w.Body.String())
 	}
 }
+
+// ── sitesListHandler circuit_state tests ──────────────────────────────────────
+
+// TestSitesList_NoCircuitBreaker verifies that circuit_state is absent from
+// the JSON response when no circuit breaker is configured.
+func TestSitesList_NoCircuitBreaker(t *testing.T) {
+	t.Parallel()
+	cli := newTestMemClient(nil)
+	c := coordinator.New(site.New("primary", types.SiteRolePrimary, cli))
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	w := httptest.NewRecorder()
+	sitesListHandler(c)(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var sites []struct {
+		Name         string `json:"name"`
+		CircuitState string `json:"circuit_state"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&sites); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(sites) != 1 {
+		t.Fatalf("expected 1 site, got %d", len(sites))
+	}
+	if sites[0].CircuitState != "" {
+		t.Errorf("circuit_state should be absent without CB, got %q", sites[0].CircuitState)
+	}
+}
+
+// TestSitesList_WithCircuitBreaker_Closed verifies that circuit_state is
+// "closed" for a healthy site when a circuit breaker is registered.
+func TestSitesList_WithCircuitBreaker_Closed(t *testing.T) {
+	t.Parallel()
+
+	cli := newTestMemClient(nil)
+	c := coordinator.New(site.New("primary", types.SiteRolePrimary, cli))
+
+	cb := circuitbreaker.New(5, 30*time.Second)
+	c.SetCircuitBreaker(cb)
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	w := httptest.NewRecorder()
+	sitesListHandler(c)(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var sites []struct {
+		Name         string `json:"name"`
+		CircuitState string `json:"circuit_state"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&sites); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(sites) == 0 {
+		t.Fatal("expected at least one site")
+	}
+	if sites[0].CircuitState != "closed" {
+		t.Errorf("circuit_state: got %q, want %q", sites[0].CircuitState, "closed")
+	}
+}
+
+// TestSitesList_WithCircuitBreaker_Open verifies that circuit_state is "open"
+// after the threshold of failures is exceeded.
+func TestSitesList_WithCircuitBreaker_Open(t *testing.T) {
+	t.Parallel()
+
+	cli := newTestMemClient(nil)
+	c := coordinator.New(site.New("primary", types.SiteRolePrimary, cli))
+
+	cb := circuitbreaker.New(2, 30*time.Second) // open after 2 failures
+	c.SetCircuitBreaker(cb)
+
+	// Record enough failures to open the circuit.
+	cb.RecordFailure("primary")
+	cb.RecordFailure("primary")
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	w := httptest.NewRecorder()
+	sitesListHandler(c)(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var sites []struct {
+		Name         string `json:"name"`
+		CircuitState string `json:"circuit_state"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&sites); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(sites) == 0 {
+		t.Fatal("expected at least one site")
+	}
+	if sites[0].CircuitState != "open" {
+		t.Errorf("circuit_state: got %q, want %q", sites[0].CircuitState, "open")
+	}
+}
+

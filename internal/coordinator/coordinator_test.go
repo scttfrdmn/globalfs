@@ -1629,3 +1629,99 @@ func TestCoordinator_Cache_SetCacheNilDisables(t *testing.T) {
 		t.Error("expected site error after cache disabled, got nil")
 	}
 }
+
+// ── SiteInfos / circuit state tests ──────────────────────────────────────────
+
+// TestSiteInfos_NoCircuitBreaker verifies that CircuitState is empty when no
+// circuit breaker is registered.
+func TestSiteInfos_NoCircuitBreaker(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	m, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(m)
+
+	infos := c.SiteInfos(ctx)
+	if len(infos) != 1 {
+		t.Fatalf("expected 1 site info, got %d", len(infos))
+	}
+	if infos[0].CircuitState != "" {
+		t.Errorf("CircuitState should be empty without CB, got %q", infos[0].CircuitState)
+	}
+}
+
+// TestSiteInfos_WithCircuitBreaker_Closed verifies that CircuitState is
+// "closed" for an untripped site.
+func TestSiteInfos_WithCircuitBreaker_Closed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	m, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(m)
+	c.SetCircuitBreaker(circuitbreaker.New(5, 30*time.Second))
+
+	infos := c.SiteInfos(ctx)
+	if len(infos) != 1 {
+		t.Fatalf("expected 1 site info, got %d", len(infos))
+	}
+	if infos[0].CircuitState != "closed" {
+		t.Errorf("CircuitState: got %q, want %q", infos[0].CircuitState, "closed")
+	}
+}
+
+// TestSiteInfos_WithCircuitBreaker_Open verifies that CircuitState is "open"
+// after the threshold of consecutive failures.
+func TestSiteInfos_WithCircuitBreaker_Open(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	m, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(m)
+	cb := circuitbreaker.New(2, 30*time.Second)
+	c.SetCircuitBreaker(cb)
+
+	cb.RecordFailure("primary")
+	cb.RecordFailure("primary")
+
+	infos := c.SiteInfos(ctx)
+	if len(infos) != 1 {
+		t.Fatalf("expected 1 site info, got %d", len(infos))
+	}
+	if infos[0].CircuitState != "open" {
+		t.Errorf("CircuitState: got %q, want %q", infos[0].CircuitState, "open")
+	}
+}
+
+// TestSiteInfos_MultipleSites verifies that each site gets its own circuit
+// state when multiple sites are registered.
+func TestSiteInfos_MultipleSites(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	mA, _ := makeMount("site-a", types.SiteRolePrimary, nil)
+	mB, _ := makeMount("site-b", types.SiteRoleBurst, nil)
+	c := New(mA, mB)
+
+	cb := circuitbreaker.New(1, 30*time.Second)
+	c.SetCircuitBreaker(cb)
+
+	// Trip only site-b.
+	cb.RecordFailure("site-b")
+
+	infos := c.SiteInfos(ctx)
+	if len(infos) != 2 {
+		t.Fatalf("expected 2 site infos, got %d", len(infos))
+	}
+
+	stateByName := make(map[string]string, 2)
+	for _, info := range infos {
+		stateByName[info.Name] = info.CircuitState
+	}
+
+	if stateByName["site-a"] != "closed" {
+		t.Errorf("site-a: got %q, want %q", stateByName["site-a"], "closed")
+	}
+	if stateByName["site-b"] != "open" {
+		t.Errorf("site-b: got %q, want %q", stateByName["site-b"], "open")
+	}
+}
