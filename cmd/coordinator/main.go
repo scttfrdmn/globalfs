@@ -44,7 +44,7 @@ import (
 )
 
 // version is set via -ldflags at build time (see Makefile).
-var version = "0.1.0-alpha"
+var version = "0.1.0"
 
 func main() {
 	configPath       := flag.String("config", "", "Path to YAML configuration file")

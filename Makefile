@@ -3,7 +3,7 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
 BINDIR  := bin
 
-.PHONY: all build build-coordinator build-cli test lint fmt clean
+.PHONY: all build build-coordinator build-cli test lint fmt clean release-dry-run release
 
 all: build
 
@@ -35,6 +35,14 @@ fmt:
 ## clean: remove compiled binaries
 clean:
 	rm -rf $(BINDIR)
+
+## release-dry-run: build and package release artifacts without publishing
+release-dry-run:
+	goreleaser release --snapshot --clean
+
+## release: tag and publish a GitHub release (requires GITHUB_TOKEN)
+release:
+	goreleaser release --clean
 
 ## help: list available targets
 help:
