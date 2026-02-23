@@ -10,7 +10,7 @@
 //
 //   - Get/Head: tries sites in the routed order, returns the first success.
 //   - Put: writes synchronously to primary-role sites in the routed set;
-//     asynchronously replicates to non-primary sites via a bounded queue.
+//     asynchronously replicates to non-primary sites via the replication.Worker.
 //   - Delete: synchronous on primary-role sites (errors returned);
 //     best-effort on non-primaries (errors logged).
 //   - List: delegates to the embedded Namespace (priority-merge, no policy).
@@ -30,19 +30,11 @@ import (
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
 	"github.com/scttfrdmn/globalfs/internal/policy"
+	"github.com/scttfrdmn/globalfs/internal/replication"
 	"github.com/scttfrdmn/globalfs/pkg/namespace"
 	"github.com/scttfrdmn/globalfs/pkg/site"
 	"github.com/scttfrdmn/globalfs/pkg/types"
 )
-
-// replicaTask holds a pending background replication job.
-type replicaTask struct {
-	key  string
-	data []byte
-	dest *site.SiteMount
-}
-
-const defaultReplicaQueueDepth = 256
 
 // Coordinator routes object operations across a prioritized set of SiteMounts.
 type Coordinator struct {
@@ -50,13 +42,7 @@ type Coordinator struct {
 	sites  []*site.SiteMount
 	ns     *namespace.Namespace
 	policy *policy.Engine // never nil; default = empty engine
-
-	// replicaCh carries async replication tasks for non-primary sites.
-	replicaCh chan replicaTask
-
-	wg   sync.WaitGroup
-	done chan struct{}
-	once sync.Once
+	worker *replication.Worker
 }
 
 // New creates a Coordinator from an ordered list of SiteMounts.
@@ -68,11 +54,10 @@ func New(sites ...*site.SiteMount) *Coordinator {
 	cp := make([]*site.SiteMount, len(sites))
 	copy(cp, sites)
 	return &Coordinator{
-		sites:     cp,
-		ns:        namespace.New(cp...),
-		policy:    policy.New(), // empty engine → default role ordering
-		replicaCh: make(chan replicaTask, defaultReplicaQueueDepth),
-		done:      make(chan struct{}),
+		sites:  cp,
+		ns:     namespace.New(cp...),
+		policy: policy.New(), // empty engine → default role ordering
+		worker: replication.NewWorker(0),
 	}
 }
 
@@ -93,22 +78,13 @@ func (c *Coordinator) SetPolicy(e *policy.Engine) {
 // Start launches the background replication worker.
 // It is safe to call Start multiple times; only the first call has effect.
 func (c *Coordinator) Start(ctx context.Context) {
-	c.once.Do(func() {
-		c.wg.Add(1)
-		go c.replicationWorker(ctx)
-	})
+	c.worker.Start(ctx)
 }
 
 // Stop signals the background replication worker to stop and waits for it to
-// drain.  Calling Stop before Start is safe.
+// finish the current job.  Calling Stop before Start is safe.
 func (c *Coordinator) Stop() {
-	c.once.Do(func() {}) // consume once so Start is a no-op if called later
-	select {
-	case <-c.done:
-	default:
-		close(c.done)
-	}
-	c.wg.Wait()
+	c.worker.Stop()
 }
 
 // Close stops background work and closes all sites.
@@ -206,10 +182,15 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 }
 
 // Put writes data to the primary-role sites in the policy-routed set
-// synchronously, and enqueues async replication to non-primary sites.
+// synchronously, and enqueues async replication to non-primary sites via the
+// replication.Worker.
 //
 // Returns once all primary sites have acknowledged the write.  If any primary
 // write fails, Put returns immediately with that error.
+//
+// If the policy routes a write to a set with no primaries (e.g. a burst-only
+// rule), the first non-primary site is promoted to the synchronous write
+// target so data is durably stored before Put returns.
 func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	c.mu.RLock()
 	snapshot, pol := c.snapshotSites(), c.policy
@@ -222,19 +203,31 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 
 	primaries, others := partitionByRole(routed)
 
+	// If the routed set has no primaries (e.g. a burst-only policy rule),
+	// promote the first site to a synchronous write target so the data is
+	// persisted before Put returns.
+	if len(primaries) == 0 && len(others) > 0 {
+		primaries = others[:1]
+		others = others[1:]
+	}
+
 	for _, s := range primaries {
 		if err := s.Put(ctx, key, data); err != nil {
-			return fmt.Errorf("coordinator: Put %q to primary %q: %w", key, s.Name(), err)
+			return fmt.Errorf("coordinator: Put %q to %q: %w", key, s.Name(), err)
 		}
 	}
 
-	for _, s := range others {
-		task := replicaTask{key: key, data: data, dest: s}
-		select {
-		case c.replicaCh <- task:
-		default:
-			log.Printf("coordinator: replication queue full; dropping async copy of %q to %q",
-				key, s.Name())
+	// Enqueue async replication to remaining sites using the first primary
+	// (or promoted site) as the GET source.
+	if len(primaries) > 0 {
+		src := primaries[0]
+		for _, s := range others {
+			c.worker.Enqueue(replication.ReplicationJob{
+				SourceSite: src,
+				DestSite:   s,
+				Key:        key,
+				Size:       int64(len(data)),
+			})
 		}
 	}
 	return nil
@@ -322,22 +315,4 @@ func partitionByRole(sites []*site.SiteMount) (primaries, others []*site.SiteMou
 		}
 	}
 	return
-}
-
-// replicationWorker drains replicaCh until ctx is cancelled or Stop is called.
-func (c *Coordinator) replicationWorker(ctx context.Context) {
-	defer c.wg.Done()
-	for {
-		select {
-		case <-c.done:
-			return
-		case <-ctx.Done():
-			return
-		case task := <-c.replicaCh:
-			if err := task.dest.Put(ctx, task.key, task.data); err != nil {
-				log.Printf("coordinator: async replication of %q to %q failed: %v",
-					task.key, task.dest.Name(), err)
-			}
-		}
-	}
 }
