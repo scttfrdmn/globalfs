@@ -13,6 +13,11 @@
 //	site add --name <n> --uri s3://bucket --role <r>     – register a site
 //	site remove --name <n>                                – deregister a site
 //	replicate --key <k> --from <site> --to <site>         – trigger replication
+//	object get  <key> [--output <file>]                   – download object
+//	object put  <key> [--input  <file>]                   – upload object
+//	object delete <key>                                   – delete object
+//	object head   <key>                                   – show object metadata
+//	object list  [--prefix <p>] [--limit <n>]             – list objects
 //	status                                                – overall health
 //	version                                               – print CLI version
 //	completion bash|zsh|fish|powershell                   – shell completions
@@ -20,6 +25,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,6 +36,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/scttfrdmn/globalfs/pkg/client"
 )
 
 // version is set via -ldflags at build time (see Makefile).
@@ -67,6 +75,7 @@ func buildRoot() *cobra.Command {
 
 	root.AddCommand(
 		buildSiteCmd(),
+		buildObjectCmd(),
 		buildReplicateCmd(),
 		buildStatusCmd(),
 		buildVersionCmd(),
@@ -231,6 +240,206 @@ func buildSiteRemoveCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "Site name to remove (required)")
+	return cmd
+}
+
+// ── object ────────────────────────────────────────────────────────────────────
+
+func buildObjectCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "object",
+		Short: "Manage objects in the global namespace",
+	}
+	cmd.AddCommand(
+		buildObjectGetCmd(),
+		buildObjectPutCmd(),
+		buildObjectDeleteCmd(),
+		buildObjectHeadCmd(),
+		buildObjectListCmd(),
+	)
+	return cmd
+}
+
+// object get ──────────────────────────────────────────────────────────────────
+
+func buildObjectGetCmd() *cobra.Command {
+	var output string
+	cmd := &cobra.Command{
+		Use:   "get <key>",
+		Short: "Download an object to a file or stdout",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			key := args[0]
+			c := client.New(coordinatorAddr)
+			data, err := c.GetObject(context.Background(), key)
+			if err != nil {
+				return err
+			}
+
+			if output == "" || output == "-" {
+				_, err = cmd.OutOrStdout().Write(data)
+				return err
+			}
+
+			f, err := os.Create(output)
+			if err != nil {
+				return fmt.Errorf("create %q: %w", output, err)
+			}
+			defer f.Close()
+			if _, err := f.Write(data); err != nil {
+				return fmt.Errorf("write %q: %w", output, err)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "%s: %d bytes\n", output, len(data))
+			return nil
+		},
+	}
+	cmd.Flags().StringVarP(&output, "output", "o", "", "Output file (- for stdout)")
+	return cmd
+}
+
+// object put ──────────────────────────────────────────────────────────────────
+
+type objectPutResult struct {
+	Key   string `json:"key"`
+	Bytes int    `json:"bytes"`
+}
+
+func buildObjectPutCmd() *cobra.Command {
+	var input string
+	cmd := &cobra.Command{
+		Use:   "put <key>",
+		Short: "Upload an object from a file or stdin",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			key := args[0]
+
+			var r io.Reader
+			if input == "" || input == "-" {
+				r = cmd.InOrStdin()
+			} else {
+				f, err := os.Open(input)
+				if err != nil {
+					return fmt.Errorf("open %q: %w", input, err)
+				}
+				defer f.Close()
+				r = f
+			}
+
+			data, err := io.ReadAll(r)
+			if err != nil {
+				return fmt.Errorf("read input: %w", err)
+			}
+
+			c := client.New(coordinatorAddr)
+			if err := c.PutObject(context.Background(), key, data); err != nil {
+				return err
+			}
+
+			if jsonOutput {
+				return printJSON(cmd.OutOrStdout(), objectPutResult{Key: key, Bytes: len(data)})
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "stored %q (%d bytes)\n", key, len(data))
+			return nil
+		},
+	}
+	cmd.Flags().StringVarP(&input, "input", "i", "", "Input file (- for stdin)")
+	return cmd
+}
+
+// object delete ───────────────────────────────────────────────────────────────
+
+type objectDeleteResult struct {
+	Key     string `json:"key"`
+	Deleted bool   `json:"deleted"`
+}
+
+func buildObjectDeleteCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "delete <key>",
+		Short: "Delete an object",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			key := args[0]
+			c := client.New(coordinatorAddr)
+			if err := c.DeleteObject(context.Background(), key); err != nil {
+				return err
+			}
+			if jsonOutput {
+				return printJSON(cmd.OutOrStdout(), objectDeleteResult{Key: key, Deleted: true})
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "deleted %q\n", key)
+			return nil
+		},
+	}
+}
+
+// object head ─────────────────────────────────────────────────────────────────
+
+func buildObjectHeadCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "head <key>",
+		Short: "Show object metadata without downloading content",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			key := args[0]
+			c := client.New(coordinatorAddr)
+			info, err := c.HeadObject(context.Background(), key)
+			if err != nil {
+				return err
+			}
+
+			if jsonOutput {
+				return printJSON(cmd.OutOrStdout(), info)
+			}
+
+			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+			fmt.Fprintln(tw, "KEY\tSIZE\tLAST_MODIFIED\tETAG\tCHECKSUM")
+			lm := ""
+			if !info.LastModified.IsZero() {
+				lm = info.LastModified.UTC().Format(time.RFC3339)
+			}
+			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\n",
+				info.Key, info.Size, lm, info.ETag, info.Checksum)
+			return tw.Flush()
+		},
+	}
+}
+
+// object list ─────────────────────────────────────────────────────────────────
+
+func buildObjectListCmd() *cobra.Command {
+	var (
+		prefix string
+		limit  int
+	)
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List objects in the global namespace",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			c := client.New(coordinatorAddr)
+			objects, err := c.ListObjects(context.Background(), prefix, limit)
+			if err != nil {
+				return err
+			}
+
+			if jsonOutput {
+				return printJSON(cmd.OutOrStdout(), objects)
+			}
+
+			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+			fmt.Fprintln(tw, "KEY\tSIZE\tLAST_MODIFIED")
+			for _, o := range objects {
+				lm := ""
+				if !o.LastModified.IsZero() {
+					lm = o.LastModified.UTC().Format(time.RFC3339)
+				}
+				fmt.Fprintf(tw, "%s\t%d\t%s\n", o.Key, o.Size, lm)
+			}
+			return tw.Flush()
+		},
+	}
+	cmd.Flags().StringVar(&prefix, "prefix", "", "Key prefix filter")
+	cmd.Flags().IntVar(&limit, "limit", 0, "Maximum number of results (0 = all)")
 	return cmd
 }
 
