@@ -169,7 +169,9 @@ func TestWorker_BasicTransfer(t *testing.T) {
 	w.Start(ctx)
 	defer w.Stop()
 
-	w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "genome.bam", Size: 13})
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "genome.bam", Size: 13}); err != nil {
+		t.Fatalf("Enqueue: unexpected error: %v", err)
+	}
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -200,7 +202,9 @@ func TestWorker_EmitsStartedAndCompleted(t *testing.T) {
 	w.Start(ctx)
 	defer w.Stop()
 
-	w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "sample.fastq"})
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "sample.fastq"}); err != nil {
+		t.Fatalf("Enqueue: unexpected error: %v", err)
+	}
 
 	ev1, ok := drainEvent(t, w, 2*time.Second)
 	if !ok {
@@ -249,7 +253,9 @@ func TestWorker_RetryOnTransientGetError(t *testing.T) {
 	w.Start(ctx)
 	defer w.Stop()
 
-	w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "key"})
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "key"}); err != nil {
+		t.Fatalf("Enqueue: unexpected error: %v", err)
+	}
 
 	// Wait for completion event.
 	var got ReplicationEvent
@@ -300,7 +306,9 @@ func TestWorker_ExhaustsRetries_EmitsFailed(t *testing.T) {
 	w.Start(ctx)
 	defer w.Stop()
 
-	w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "missing"})
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "missing"}); err != nil {
+		t.Fatalf("Enqueue: unexpected error: %v", err)
+	}
 
 	// Drain until we get EventFailed.
 	var got ReplicationEvent
@@ -328,9 +336,9 @@ done:
 	}
 }
 
-// TestWorker_QueueFull_DropsWithoutPanic verifies that enqueueing to a full
-// queue does not block or panic.
-func TestWorker_QueueFull_DropsWithoutPanic(t *testing.T) {
+// TestWorker_QueueFull_ReturnsError verifies that enqueueing to a full queue
+// returns a non-nil error without blocking or panicking.
+func TestWorker_QueueFull_ReturnsError(t *testing.T) {
 	t.Parallel()
 
 	src, _ := makeMount("src", types.SiteRolePrimary, nil)
@@ -340,9 +348,15 @@ func TestWorker_QueueFull_DropsWithoutPanic(t *testing.T) {
 	w := NewWorker(2)
 
 	job := ReplicationJob{SourceSite: src, DestSite: dst, Key: "k"}
-	w.Enqueue(job) // slot 1
-	w.Enqueue(job) // slot 2
-	w.Enqueue(job) // full: should be dropped without panic or block
+	if err := w.Enqueue(job); err != nil { // slot 1
+		t.Fatalf("slot 1: unexpected error: %v", err)
+	}
+	if err := w.Enqueue(job); err != nil { // slot 2
+		t.Fatalf("slot 2: unexpected error: %v", err)
+	}
+	if err := w.Enqueue(job); err == nil { // full: must return error
+		t.Error("expected error when queue is full, got nil")
+	}
 }
 
 // TestWorker_StopBeforeStart verifies that Stop is safe to call without Start.
@@ -372,7 +386,9 @@ func TestWorker_MultipleJobs(t *testing.T) {
 	defer w.Stop()
 
 	for _, k := range keys {
-		w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: k})
+		if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: k}); err != nil {
+			t.Fatalf("Enqueue %q: unexpected error: %v", k, err)
+		}
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -416,7 +432,9 @@ func TestWorker_ContextCancellation(t *testing.T) {
 	}
 	w.Start(ctx)
 
-	w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "key"})
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "key"}); err != nil {
+		t.Fatalf("Enqueue: unexpected error: %v", err)
+	}
 
 	// Wait for EventStarted (first attempt fired).
 	var found bool

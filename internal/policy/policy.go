@@ -25,7 +25,6 @@
 package policy
 
 import (
-	"context"
 	"fmt"
 	"path"
 	"sort"
@@ -179,7 +178,7 @@ func (e *Engine) Rules() []Rule {
 //     burst → other).
 //
 // The returned slice is a new allocation.
-func (e *Engine) Route(_ context.Context, op OperationType, key string, sites []*site.SiteMount) ([]*site.SiteMount, error) {
+func (e *Engine) Route(op OperationType, key string, sites []*site.SiteMount) ([]*site.SiteMount, error) {
 	for i := range e.rules {
 		r := &e.rules[i]
 		if !r.matchesOperation(op) {

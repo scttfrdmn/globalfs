@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.4] - 2026-02-23
+
+### Fixed
+- `Namespace.List` takes a snapshot of the sites slice under `sync.RWMutex` before fan-out so concurrent `AddSite` calls cannot race with ongoing list iterations (#39)
+- `replication.Worker.Enqueue` now returns an `error` when the queue is full instead of logging and silently dropping; coordinator callers log or propagate the error (#40)
+- `addSiteHandler` and `replicateHandler` apply `http.MaxBytesReader` (1 MiB) to JSON request bodies and return `413 Request Entity Too Large` on oversized input (#41)
+- Object key handlers (`GET`, `PUT`, `DELETE`, `HEAD`) reject keys containing null bytes or `..` path components with `400 Bad Request` (#42)
+- `Coordinator.List` now routes through the policy engine (using `OperationRead` and the prefix as the key) and applies health-aware ordering and circuit-breaker filtering, matching the routing behaviour of `Get` and `Head` (#43)
+
+### Changed
+- `policy.Engine.Route` no longer takes a `context.Context` parameter; the argument was unused (`_ context.Context`) and all callers have been updated (#44)
+
+---
+
 ## [0.1.3] - 2026-02-23
 
 ### Fixed

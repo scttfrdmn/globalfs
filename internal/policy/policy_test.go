@@ -200,7 +200,7 @@ func TestEngine_Route_NoRules_DefaultOrdering(t *testing.T) {
 		siteMount("burst", types.SiteRoleBurst),
 		siteMount("primary", types.SiteRolePrimary),
 	}
-	result, err := e.Route(context.Background(), OperationRead, "any.bam", sites)
+	result, err := e.Route(OperationRead, "any.bam", sites)
 	if err != nil {
 		t.Fatalf("Route: unexpected error: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestEngine_Route_RuleMatchesTargetRoles(t *testing.T) {
 		siteMount("burst", types.SiteRoleBurst),
 	}
 
-	result, err := e.Route(context.Background(), OperationRead, "genome.bam", sites)
+	result, err := e.Route(OperationRead, "genome.bam", sites)
 	if err != nil {
 		t.Fatalf("Route: unexpected error: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestEngine_Route_WrongOperation_NoMatch(t *testing.T) {
 	}
 
 	// Write operation: rule should NOT match → default ordering (all sites).
-	result, err := e.Route(context.Background(), OperationWrite, "genome.bam", sites)
+	result, err := e.Route(OperationWrite, "genome.bam", sites)
 	if err != nil {
 		t.Fatalf("Route: unexpected error: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestEngine_Route_WrongKey_NoMatch(t *testing.T) {
 	}
 
 	// .fastq key → rule doesn't match → default ordering (all sites).
-	result, err := e.Route(context.Background(), OperationRead, "sample.fastq", sites)
+	result, err := e.Route(OperationRead, "sample.fastq", sites)
 	if err != nil {
 		t.Fatalf("Route: unexpected error: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestEngine_Route_PriorityOrdering(t *testing.T) {
 		siteMount("burst", types.SiteRoleBurst),
 	}
 
-	result, err := e.Route(context.Background(), OperationRead, "genome.bam", sites)
+	result, err := e.Route(OperationRead, "genome.bam", sites)
 	if err != nil {
 		t.Fatalf("Route: unexpected error: %v", err)
 	}
@@ -335,7 +335,7 @@ func TestEngine_Route_RecursivePrefix(t *testing.T) {
 	}
 
 	for _, key := range []string{"archive/2025/data.bam", "archive/old/sub/file.fastq"} {
-		result, err := e.Route(context.Background(), OperationRead, key, sites)
+		result, err := e.Route(OperationRead, key, sites)
 		if err != nil {
 			t.Fatalf("Route(%q): unexpected error: %v", key, err)
 		}
@@ -345,7 +345,7 @@ func TestEngine_Route_RecursivePrefix(t *testing.T) {
 	}
 
 	// Key outside prefix → both sites (default ordering: primary first).
-	result, err := e.Route(context.Background(), OperationRead, "data/fresh.bam", sites)
+	result, err := e.Route(OperationRead, "data/fresh.bam", sites)
 	if err != nil {
 		t.Fatalf("Route(non-archive): unexpected error: %v", err)
 	}
@@ -369,7 +369,7 @@ func TestEngine_Route_EmptyTargetRoles_AllSitesDefaultOrder(t *testing.T) {
 		siteMount("primary", types.SiteRolePrimary),
 	}
 
-	result, err := e.Route(context.Background(), OperationRead, "genome.bam", sites)
+	result, err := e.Route(OperationRead, "genome.bam", sites)
 	if err != nil {
 		t.Fatalf("Route: unexpected error: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestEngine_Route_WritesBurstOnly(t *testing.T) {
 		siteMount("cloud-burst", types.SiteRoleBurst),
 	}
 
-	result, err := e.Route(context.Background(), OperationWrite, "tmp/job123/output.bam", sites)
+	result, err := e.Route(OperationWrite, "tmp/job123/output.bam", sites)
 	if err != nil {
 		t.Fatalf("Route: unexpected error: %v", err)
 	}
@@ -476,7 +476,7 @@ func TestEngine_Route_WritesBurstOnly(t *testing.T) {
 
 	// Reads from tmp/ also hit burst (rule matches any operation).
 	// But the rule only applies to writes — reads fall back to default.
-	result2, err := e.Route(context.Background(), OperationRead, "tmp/job123/output.bam", sites)
+	result2, err := e.Route(OperationRead, "tmp/job123/output.bam", sites)
 	if err != nil {
 		t.Fatalf("Route(read): unexpected error: %v", err)
 	}

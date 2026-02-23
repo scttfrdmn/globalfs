@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
@@ -42,6 +43,25 @@ const apiKeyHeader = "X-GlobalFS-API-Key"
 // request body.  Requests that exceed this limit are rejected with 413 to
 // prevent memory exhaustion from unbounded reads.
 const maxObjectBodyBytes = 256 * 1024 * 1024 // 256 MiB
+
+// maxJSONBodyBytes is the maximum number of bytes accepted for JSON request
+// bodies (site registration, replicate).  1 MiB is far more than any valid
+// payload requires.
+const maxJSONBodyBytes = 1 << 20 // 1 MiB
+
+// validateObjectKey returns an error if key contains path-traversal characters
+// (null bytes or ".." components) that could bypass bucket prefix boundaries.
+func validateObjectKey(key string) error {
+	if strings.Contains(key, "\x00") {
+		return fmt.Errorf("key contains null byte")
+	}
+	for _, part := range strings.Split(key, "/") {
+		if part == ".." {
+			return fmt.Errorf("key contains path traversal component")
+		}
+	}
+	return nil
+}
 
 // ── API key middleware ────────────────────────────────────────────────────────
 
@@ -198,8 +218,15 @@ func sitesListHandler(c *coordinator.Coordinator) http.HandlerFunc {
 // addSiteHandler handles POST /api/v1/sites — register a new site at runtime.
 func addSiteHandler(daemonCtx context.Context, c *coordinator.Coordinator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 		var req addSiteRequest
 		if err := decodeJSON(r, &req); err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				writeError(w, http.StatusRequestEntityTooLarge,
+					fmt.Sprintf("request body exceeds maximum size of %d bytes", maxJSONBodyBytes))
+				return
+			}
 			writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
 			return
 		}
@@ -285,8 +312,15 @@ func removeSiteHandler(c *coordinator.Coordinator) http.HandlerFunc {
 // replicateHandler handles POST /api/v1/replicate — enqueue manual replication.
 func replicateHandler(c *coordinator.Coordinator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 		var req replicateRequest
 		if err := decodeJSON(r, &req); err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				writeError(w, http.StatusRequestEntityTooLarge,
+					fmt.Sprintf("request body exceeds maximum size of %d bytes", maxJSONBodyBytes))
+				return
+			}
 			writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
 			return
 		}
@@ -392,6 +426,10 @@ func objectGetHandler(c *coordinator.Coordinator) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "object key required in path")
 			return
 		}
+		if err := validateObjectKey(key); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid object key: "+err.Error())
+			return
+		}
 
 		data, err := c.Get(r.Context(), key)
 		if err != nil {
@@ -412,6 +450,10 @@ func objectPutHandler(c *coordinator.Coordinator) http.HandlerFunc {
 		key := r.PathValue("key")
 		if key == "" {
 			writeError(w, http.StatusBadRequest, "object key required in path")
+			return
+		}
+		if err := validateObjectKey(key); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid object key: "+err.Error())
 			return
 		}
 
@@ -446,6 +488,10 @@ func objectDeleteHandler(c *coordinator.Coordinator) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "object key required in path")
 			return
 		}
+		if err := validateObjectKey(key); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid object key: "+err.Error())
+			return
+		}
 
 		if err := c.Delete(r.Context(), key); err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
@@ -463,6 +509,11 @@ func objectHeadHandler(c *coordinator.Coordinator) http.HandlerFunc {
 		key := r.PathValue("key")
 		if key == "" {
 			// HEAD must not return a body; use a plain 400 status.
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if err := validateObjectKey(key); err != nil {
+			// HEAD must not return a body.
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}

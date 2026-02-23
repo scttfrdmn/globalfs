@@ -125,13 +125,14 @@ func (w *Worker) QueueDepth() int {
 }
 
 // Enqueue adds a job to the work queue.
-// If the queue is full the job is dropped and a warning is logged.
+// Returns an error when the queue is full so callers can log or propagate it.
 // Enqueue is safe to call before Start.
-func (w *Worker) Enqueue(job ReplicationJob) {
+func (w *Worker) Enqueue(job ReplicationJob) error {
 	select {
 	case w.queue <- job:
+		return nil
 	default:
-		log.Printf("replication: queue full; dropping job key=%q → %q",
+		return fmt.Errorf("replication: queue full; key=%q → %q",
 			job.Key, job.DestSite.Name())
 	}
 }

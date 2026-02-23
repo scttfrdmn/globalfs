@@ -446,7 +446,7 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 		m.RecordCacheMiss()
 	}
 
-	ordered, err := pol.Route(ctx, policy.OperationRead, key, snapshot)
+	ordered, err := pol.Route(policy.OperationRead, key, snapshot)
 	if err != nil {
 		return nil, fmt.Errorf("coordinator: Get %q: policy error: %w", key, err)
 	}
@@ -506,7 +506,7 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	snapshot, pol, store, cb, oc, m := c.snapshotSites(), c.policy, c.store, c.cb, c.objCache, c.m
 	c.mu.RUnlock()
 
-	routed, err := pol.Route(ctx, policy.OperationWrite, key, snapshot)
+	routed, err := pol.Route(policy.OperationWrite, key, snapshot)
 	if err != nil {
 		return fmt.Errorf("coordinator: Put %q: policy error: %w", key, err)
 	}
@@ -556,12 +556,14 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 					log.Printf("coordinator: persist job %q: %v", metaJob.ID, persistErr)
 				}
 			}
-			c.worker.Enqueue(replication.ReplicationJob{
+			if enqErr := c.worker.Enqueue(replication.ReplicationJob{
 				SourceSite: src,
 				DestSite:   s,
 				Key:        key,
 				Size:       int64(len(data)),
-			})
+			}); enqErr != nil {
+				log.Printf("coordinator: %v", enqErr)
+			}
 		}
 	}
 
@@ -583,7 +585,7 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 	snapshot, pol, cb, oc, m := c.snapshotSites(), c.policy, c.cb, c.objCache, c.m
 	c.mu.RUnlock()
 
-	routed, err := pol.Route(ctx, policy.OperationDelete, key, snapshot)
+	routed, err := pol.Route(policy.OperationDelete, key, snapshot)
 	if err != nil {
 		return fmt.Errorf("coordinator: Delete %q: policy error: %w", key, err)
 	}
@@ -620,11 +622,33 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// List returns up to limit objects under prefix, merged across all sites.
-// Delegates to the embedded Namespace (highest-priority site wins on conflicts).
+// List returns up to limit objects under prefix, merged across policy-routed sites.
+//
+// The policy engine is consulted using the prefix as the key and
+// OperationRead as the operation type.  Healthy sites are promoted and open
+// circuit breakers are filtered before the Namespace merge so that routing
+// rules, health state, and breaker state all apply consistently to List —
+// the same way they do for Get and Head.
 // Pass limit ≤ 0 to retrieve all matching objects.
 func (c *Coordinator) List(ctx context.Context, prefix string, limit int) ([]objectfstypes.ObjectInfo, error) {
-	return c.ns.List(ctx, prefix, limit)
+	c.mu.RLock()
+	snapshot, pol, cb := c.snapshotSites(), c.policy, c.cb
+	c.mu.RUnlock()
+
+	// Apply policy routing using the prefix as the key.
+	// List is treated as a read operation for routing purposes.
+	routed, err := pol.Route(policy.OperationRead, prefix, snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("coordinator: List %q: policy error: %w", prefix, err)
+	}
+
+	healthReport, _ := c.HealthStatus()
+	routed = preferHealthySites(routed, healthReport)
+	routed = filterByCircuitBreaker(cb, routed)
+
+	// Merge from the policy-selected sites only.
+	ns := namespace.New(routed...)
+	return ns.List(ctx, prefix, limit)
 }
 
 // Head returns metadata for the object at key.
@@ -635,7 +659,7 @@ func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.Obje
 	snapshot, pol, cb, retryCfg := c.snapshotSites(), c.policy, c.cb, c.retryConfig
 	c.mu.RUnlock()
 
-	ordered, err := pol.Route(ctx, policy.OperationRead, key, snapshot)
+	ordered, err := pol.Route(policy.OperationRead, key, snapshot)
 	if err != nil {
 		return nil, fmt.Errorf("coordinator: Head %q: policy error: %w", key, err)
 	}
@@ -732,11 +756,13 @@ func (c *Coordinator) Replicate(ctx context.Context, key, fromSite, toSite strin
 		return fmt.Errorf("coordinator: replicate: destination site %q not found", toSite)
 	}
 
-	c.worker.Enqueue(replication.ReplicationJob{
+	if err := c.worker.Enqueue(replication.ReplicationJob{
 		SourceSite: src,
 		DestSite:   dst,
 		Key:        key,
-	})
+	}); err != nil {
+		return fmt.Errorf("coordinator: replicate: %w", err)
+	}
 	return nil
 }
 
@@ -865,12 +891,14 @@ func (c *Coordinator) recoverPendingJobs(ctx context.Context, store metadata.Sto
 			log.Printf("coordinator: skip recovered job %q (site missing)", j.ID)
 			continue
 		}
-		c.worker.Enqueue(replication.ReplicationJob{
+		if err := c.worker.Enqueue(replication.ReplicationJob{
 			SourceSite: src,
 			DestSite:   dst,
 			Key:        j.Key,
 			Size:       j.Size,
-		})
+		}); err != nil {
+			log.Printf("coordinator: recover job %q: %v", j.ID, err)
+		}
 	}
 }
 

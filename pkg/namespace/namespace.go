@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
@@ -18,7 +19,9 @@ import (
 )
 
 // Namespace provides a unified, merged view across multiple SiteMounts.
+// It is safe for concurrent use.
 type Namespace struct {
+	mu    sync.RWMutex
 	sites []*site.SiteMount
 }
 
@@ -33,12 +36,18 @@ func New(sites ...*site.SiteMount) *Namespace {
 
 // AddSite appends a site at the lowest priority.
 func (n *Namespace) AddSite(s *site.SiteMount) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.sites = append(n.sites, s)
 }
 
-// Sites returns the ordered list of sites (highest priority first).
+// Sites returns a snapshot of the ordered site list (highest priority first).
 func (n *Namespace) Sites() []*site.SiteMount {
-	return n.sites
+	n.mu.RLock()
+	cp := make([]*site.SiteMount, len(n.sites))
+	copy(cp, n.sites)
+	n.mu.RUnlock()
+	return cp
 }
 
 // List returns up to limit objects under prefix, merged across all sites.
@@ -51,11 +60,18 @@ func (n *Namespace) Sites() []*site.SiteMount {
 // incomplete listing.
 // Pass limit ≤ 0 to retrieve all matching objects.
 func (n *Namespace) List(ctx context.Context, prefix string, limit int) ([]objectfstypes.ObjectInfo, error) {
+	// Take a snapshot under the read lock so AddSite cannot race with
+	// the fan-out goroutines below (fixes #39).
+	n.mu.RLock()
+	sites := make([]*site.SiteMount, len(n.sites))
+	copy(sites, n.sites)
+	n.mu.RUnlock()
+
 	seen := make(map[string]struct{})
 	var result []objectfstypes.ObjectInfo
 	var siteErrs []error
 
-	for _, s := range n.sites {
+	for _, s := range sites {
 		items, err := s.List(ctx, prefix, 0)
 		if err != nil {
 			siteErrs = append(siteErrs, fmt.Errorf("site %q: %w", s.Name(), err))
@@ -82,8 +98,13 @@ func (n *Namespace) List(ctx context.Context, prefix string, limit int) ([]objec
 // Close closes all sites in the namespace, returning the first error
 // encountered (subsequent errors are still attempted).
 func (n *Namespace) Close() error {
+	n.mu.RLock()
+	sites := make([]*site.SiteMount, len(n.sites))
+	copy(sites, n.sites)
+	n.mu.RUnlock()
+
 	var firstErr error
-	for _, s := range n.sites {
+	for _, s := range sites {
 		if err := s.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
