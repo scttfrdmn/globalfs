@@ -361,8 +361,9 @@ func (c *Coordinator) Health(ctx context.Context) map[string]error {
 
 // Get fetches the full content of the object at key.
 //
-// The policy engine determines site order; sites are tried in that order and
-// the first successful read is returned.
+// The policy engine determines site order; healthy sites (from the background
+// health cache) are then promoted to the front of that list so degraded sites
+// are only tried as a fallback.  The first successful read is returned.
 func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 	c.mu.RLock()
 	snapshot, pol := c.snapshotSites(), c.policy
@@ -375,6 +376,9 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 	if len(ordered) == 0 {
 		return nil, fmt.Errorf("coordinator: Get %q: no sites available", key)
 	}
+
+	healthReport, _ := c.HealthStatus()
+	ordered = preferHealthySites(ordered, healthReport)
 
 	var lastErr error
 	for _, s := range ordered {
@@ -489,7 +493,8 @@ func (c *Coordinator) List(ctx context.Context, prefix string, limit int) ([]obj
 }
 
 // Head returns metadata for the object at key.
-// Sites are checked in policy-routed order; the first hit is returned.
+// Sites are checked in policy-routed order with healthy sites promoted to the
+// front (same health-aware reordering as Get).  The first hit is returned.
 func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.ObjectInfo, error) {
 	c.mu.RLock()
 	snapshot, pol := c.snapshotSites(), c.policy
@@ -502,6 +507,9 @@ func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.Obje
 	if len(ordered) == 0 {
 		return nil, fmt.Errorf("coordinator: Head %q: no sites available", key)
 	}
+
+	healthReport, _ := c.HealthStatus()
+	ordered = preferHealthySites(ordered, healthReport)
 
 	var lastErr error
 	for _, s := range ordered {
@@ -599,6 +607,33 @@ func (c *Coordinator) snapshotSites() []*site.SiteMount {
 	cp := make([]*site.SiteMount, len(c.sites))
 	copy(cp, c.sites)
 	return cp
+}
+
+// preferHealthySites returns a reordered copy of sites where sites with a nil
+// health-cache entry (healthy) appear before sites with a non-nil entry
+// (degraded), preserving relative order within each group.
+//
+// When report is nil (cache not yet populated) the original slice is returned
+// unchanged.  Degraded sites are placed last but never omitted, so they
+// remain available as a fallback if the cache is stale or a site partially
+// recovers.
+func preferHealthySites(sites []*site.SiteMount, report map[string]error) []*site.SiteMount {
+	if report == nil {
+		return sites
+	}
+	healthy := make([]*site.SiteMount, 0, len(sites))
+	degraded := make([]*site.SiteMount, 0)
+	for _, s := range sites {
+		if report[s.Name()] == nil {
+			healthy = append(healthy, s)
+		} else {
+			degraded = append(degraded, s)
+		}
+	}
+	if len(degraded) == 0 {
+		return healthy
+	}
+	return append(healthy, degraded...)
 }
 
 // partitionByRole splits sites into primary-role and non-primary slices,

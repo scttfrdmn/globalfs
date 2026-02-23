@@ -911,3 +911,192 @@ func TestCoordinator_SetHealthPollInterval_StopsWithStop(t *testing.T) {
 		t.Fatal("Stop() did not return within 2s — health polling goroutine may be leaked")
 	}
 }
+
+// ─── preferHealthySites ────────────────────────────────────────────────────────
+
+func TestPreferHealthySites_NilReport_Unchanged(t *testing.T) {
+	t.Parallel()
+	a, _ := makeMount("a", types.SiteRolePrimary, nil)
+	b, _ := makeMount("b", types.SiteRoleBackup, nil)
+	in := []*site.SiteMount{a, b}
+	out := preferHealthySites(in, nil)
+	if len(out) != 2 || out[0] != a || out[1] != b {
+		t.Errorf("nil report: expected [a, b], got names %v", siteNames(out))
+	}
+}
+
+func TestPreferHealthySites_AllHealthy_Unchanged(t *testing.T) {
+	t.Parallel()
+	a, _ := makeMount("a", types.SiteRolePrimary, nil)
+	b, _ := makeMount("b", types.SiteRoleBackup, nil)
+	report := map[string]error{"a": nil, "b": nil}
+	out := preferHealthySites([]*site.SiteMount{a, b}, report)
+	if len(out) != 2 || out[0] != a || out[1] != b {
+		t.Errorf("all healthy: expected [a, b], got %v", siteNames(out))
+	}
+}
+
+func TestPreferHealthySites_DegradedMovedLast(t *testing.T) {
+	t.Parallel()
+	a, _ := makeMount("a", types.SiteRolePrimary, nil)
+	b, _ := makeMount("b", types.SiteRoleBackup, nil)
+	c, _ := makeMount("c", types.SiteRoleBurst, nil)
+	// b is degraded; a and c are healthy.
+	report := map[string]error{
+		"a": nil,
+		"b": errors.New("timeout"),
+		"c": nil,
+	}
+	out := preferHealthySites([]*site.SiteMount{a, b, c}, report)
+	if len(out) != 3 {
+		t.Fatalf("expected 3 sites, got %d", len(out))
+	}
+	// a and c should come first (in original order), b last.
+	if out[0] != a || out[1] != c || out[2] != b {
+		t.Errorf("expected [a, c, b], got %v", siteNames(out))
+	}
+}
+
+func TestPreferHealthySites_AllDegraded_Unchanged(t *testing.T) {
+	t.Parallel()
+	a, _ := makeMount("a", types.SiteRolePrimary, nil)
+	b, _ := makeMount("b", types.SiteRoleBackup, nil)
+	report := map[string]error{
+		"a": errors.New("err-a"),
+		"b": errors.New("err-b"),
+	}
+	out := preferHealthySites([]*site.SiteMount{a, b}, report)
+	// All degraded → original order preserved (all are "fallback").
+	if len(out) != 2 || out[0] != a || out[1] != b {
+		t.Errorf("all degraded: expected [a, b], got %v", siteNames(out))
+	}
+}
+
+// ─── Get/Head health-aware routing ────────────────────────────────────────────
+
+// TestCoordinator_Get_SkipsDegradedPrimary verifies that when the health cache
+// marks the primary as degraded, Get returns data from the backup without
+// first attempting the primary.
+func TestCoordinator_Get_SkipsDegradedPrimary(t *testing.T) {
+	t.Parallel()
+
+	// Primary has data but health is flagged as degraded.
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"genome.bam": []byte("primary-data"),
+	})
+	primaryClient.setHealthErr(errors.New("disk full"))
+
+	// Backup also has the data.
+	backup, _ := makeMount("backup", types.SiteRoleBackup, map[string][]byte{
+		"genome.bam": []byte("backup-data"),
+	})
+
+	c := New(primary, backup)
+	c.SetHealthPollInterval(10 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Stop()
+
+	// Wait for health cache to show primary as degraded.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if r, _ := c.HealthStatus(); r != nil && r["primary"] != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	data, err := c.Get(ctx, "genome.bam")
+	if err != nil {
+		t.Fatalf("Get: unexpected error: %v", err)
+	}
+	// Health-aware routing should return the backup's data, not the primary's.
+	if string(data) != "backup-data" {
+		t.Errorf("Get: got %q, want backup-data (degraded primary should be tried last)", string(data))
+	}
+}
+
+// TestCoordinator_Get_FallsBackToDegradedWhenAllDegraded verifies that when
+// all sites are marked degraded, Get still tries them (cache fallback).
+func TestCoordinator_Get_FallsBackToDegradedWhenAllDegraded(t *testing.T) {
+	t.Parallel()
+
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"key": []byte("data"),
+	})
+	primaryClient.setHealthErr(errors.New("degraded"))
+
+	c := New(primary)
+	c.SetHealthPollInterval(10 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Stop()
+
+	// Wait for cache to mark primary degraded.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if r, _ := c.HealthStatus(); r != nil && r["primary"] != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Even though primary is degraded in the cache, Get should still try it
+	// (all-degraded fallback) and succeed because the client's Get works.
+	data, err := c.Get(ctx, "key")
+	if err != nil {
+		t.Fatalf("Get (all-degraded fallback): unexpected error: %v", err)
+	}
+	if string(data) != "data" {
+		t.Errorf("Get (all-degraded fallback): got %q, want data", string(data))
+	}
+}
+
+// TestCoordinator_Head_SkipsDegradedSite verifies the same health-aware
+// reordering for Head operations.
+func TestCoordinator_Head_SkipsDegradedSite(t *testing.T) {
+	t.Parallel()
+
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"file.txt": []byte("content"),
+	})
+	primaryClient.setHealthErr(errors.New("network error"))
+
+	backup, _ := makeMount("backup", types.SiteRoleBackup, map[string][]byte{
+		"file.txt": []byte("content"),
+	})
+
+	c := New(primary, backup)
+	c.SetHealthPollInterval(10 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Stop()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if r, _ := c.HealthStatus(); r != nil && r["primary"] != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	info, err := c.Head(ctx, "file.txt")
+	if err != nil {
+		t.Fatalf("Head: unexpected error: %v", err)
+	}
+	if info.Key != "file.txt" {
+		t.Errorf("Head: got key %q, want file.txt", info.Key)
+	}
+}
+
+// siteNames is a test helper that extracts site names from a slice.
+func siteNames(sites []*site.SiteMount) []string {
+	names := make([]string, len(sites))
+	for i, s := range sites {
+		names[i] = s.Name()
+	}
+	return names
+}
