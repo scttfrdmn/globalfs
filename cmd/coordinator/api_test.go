@@ -1018,6 +1018,252 @@ func TestHealthzHandler_CacheDegradedSite(t *testing.T) {
 	}
 }
 
+// ── objectPutHandler: body size limit (#27) ───────────────────────────────────
+
+func TestObjectPut_BodyTooLarge(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	// Build a body that is exactly one byte over the limit.
+	body := make([]byte, maxObjectBodyBytes+1)
+	req := httptest.NewRequest("PUT", "/api/v1/objects/big", bytes.NewReader(body))
+	req.SetPathValue("key", "big")
+	w := httptest.NewRecorder()
+	objectPutHandler(c)(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 413, got %d", w.Code)
+	}
+}
+
+// ── addSiteHandler ────────────────────────────────────────────────────────────
+
+func TestAddSite_MissingName(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	body := `{"s3_bucket":"bucket","s3_region":"us-west-2"}`
+	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	addSiteHandler(context.Background(), c)(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("missing name: expected 400, got %d", w.Code)
+	}
+}
+
+func TestAddSite_MissingBucket(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	body := `{"name":"site2","s3_region":"us-west-2"}`
+	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	addSiteHandler(context.Background(), c)(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("missing bucket: expected 400, got %d", w.Code)
+	}
+}
+
+func TestAddSite_InvalidRole(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	body := `{"name":"site2","s3_bucket":"b","s3_region":"us-west-2","role":"invalid"}`
+	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	addSiteHandler(context.Background(), c)(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("invalid role: expected 400, got %d", w.Code)
+	}
+}
+
+func TestAddSite_InvalidJSON(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader("{not json}"))
+	w := httptest.NewRecorder()
+	addSiteHandler(context.Background(), c)(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("invalid JSON: expected 400, got %d", w.Code)
+	}
+}
+
+func TestAddSite_S3Unreachable_Returns502(t *testing.T) {
+	// Provides a syntactically valid request that will fail to connect.
+	// We use a context with a short timeout so the test does not hang.
+	c, _ := makeTestCoordinator(t, nil)
+
+	body := `{"name":"remote","s3_bucket":"bucket","s3_region":"us-east-1","s3_endpoint":"http://127.0.0.1:19999"}`
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader(body)).WithContext(ctx)
+	w := httptest.NewRecorder()
+	addSiteHandler(context.Background(), c)(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("unreachable S3: expected 502, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── removeSiteHandler ─────────────────────────────────────────────────────────
+
+func TestRemoveSite_NotFound(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	req := httptest.NewRequest("DELETE", "/api/v1/sites/nonexistent", nil)
+	req.SetPathValue("name", "nonexistent")
+	w := httptest.NewRecorder()
+	removeSiteHandler(c)(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("missing site: expected 404, got %d", w.Code)
+	}
+}
+
+func TestRemoveSite_MissingNameInPath(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	req := httptest.NewRequest("DELETE", "/api/v1/sites/", nil)
+	req.SetPathValue("name", "")
+	w := httptest.NewRecorder()
+	removeSiteHandler(c)(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("empty name: expected 400, got %d", w.Code)
+	}
+}
+
+func TestRemoveSite_Success(t *testing.T) {
+	t.Parallel()
+	// Coordinator starts with one primary site named "primary".
+	c, _ := makeTestCoordinator(t, nil)
+
+	if len(c.Sites()) != 1 {
+		t.Fatalf("expected 1 site before removal, got %d", len(c.Sites()))
+	}
+
+	req := httptest.NewRequest("DELETE", "/api/v1/sites/primary", nil)
+	req.SetPathValue("name", "primary")
+	w := httptest.NewRecorder()
+	removeSiteHandler(c)(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(c.Sites()) != 0 {
+		t.Errorf("expected 0 sites after removal, got %d", len(c.Sites()))
+	}
+}
+
+// ── replicateHandler ──────────────────────────────────────────────────────────
+
+func TestReplicate_MissingKey(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	body := `{"from":"primary","to":"backup"}`
+	req := httptest.NewRequest("POST", "/api/v1/replicate", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	replicateHandler(c)(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("missing key: expected 400, got %d", w.Code)
+	}
+}
+
+func TestReplicate_MissingFrom(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	body := `{"key":"data/file.bam","to":"backup"}`
+	req := httptest.NewRequest("POST", "/api/v1/replicate", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	replicateHandler(c)(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("missing from: expected 400, got %d", w.Code)
+	}
+}
+
+func TestReplicate_MissingTo(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	body := `{"key":"data/file.bam","from":"primary"}`
+	req := httptest.NewRequest("POST", "/api/v1/replicate", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	replicateHandler(c)(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("missing to: expected 400, got %d", w.Code)
+	}
+}
+
+func TestReplicate_InvalidJSON(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/replicate", strings.NewReader("{not json}"))
+	w := httptest.NewRecorder()
+	replicateHandler(c)(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("invalid JSON: expected 400, got %d", w.Code)
+	}
+}
+
+func TestReplicate_UnknownSourceSite(t *testing.T) {
+	t.Parallel()
+	// Coordinator has only "primary"; "backup" does not exist as source.
+	mc2 := newTestMemClient(nil)
+	s2 := site.New("backup", types.SiteRoleBackup, mc2)
+	c, _ := makeTestCoordinator(t, nil)
+	c.AddSite(s2)
+
+	body := `{"key":"data/file.bam","from":"unknown","to":"backup"}`
+	req := httptest.NewRequest("POST", "/api/v1/replicate", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	replicateHandler(c)(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("unknown from: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestReplicate_Success(t *testing.T) {
+	t.Parallel()
+	mc2 := newTestMemClient(nil)
+	s2 := site.New("backup", types.SiteRoleBackup, mc2)
+	c, _ := makeTestCoordinator(t, nil)
+	c.AddSite(s2)
+
+	body := `{"key":"data/genome.bam","from":"primary","to":"backup"}`
+	req := httptest.NewRequest("POST", "/api/v1/replicate", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	replicateHandler(c)(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Errorf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp replicateResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Status != "accepted" {
+		t.Errorf("status: got %q, want %q", resp.Status, "accepted")
+	}
+	if resp.Key != "data/genome.bam" {
+		t.Errorf("key: got %q, want %q", resp.Key, "data/genome.bam")
+	}
+}
+
 // ── sitesListHandler circuit_state tests ──────────────────────────────────────
 
 // TestSitesList_NoCircuitBreaker verifies that circuit_state is absent from

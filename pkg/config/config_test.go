@@ -302,6 +302,139 @@ sites:
 	}
 }
 
+// ── Validate resilience/cache fields (#30) ───────────────────────────────────
+
+// baseValidConfig returns a minimal valid configuration for Validate() tests.
+func baseValidConfig() *config.Configuration {
+	cfg := config.NewDefault()
+	cfg.Sites = []config.SiteConfig{
+		{
+			Name: "primary",
+			Role: "primary",
+			ObjectFS: config.ObjectFSConfig{
+				MountPoint: "/mnt",
+				S3Bucket:   "test-bucket",
+				S3Region:   "us-west-2",
+			},
+		},
+	}
+	return cfg
+}
+
+func TestValidate_InvalidLogLevel(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Global.LogLevel = "VERBOSE"
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for invalid log_level, got nil")
+	}
+}
+
+func TestValidate_CircuitBreaker_ThresholdZero(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Resilience.CircuitBreaker.Enabled = true
+	cfg.Resilience.CircuitBreaker.Threshold = 0
+	cfg.Resilience.CircuitBreaker.Cooldown = 30 * time.Second
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for threshold=0 with CB enabled, got nil")
+	}
+}
+
+func TestValidate_CircuitBreaker_CooldownZero(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Resilience.CircuitBreaker.Enabled = true
+	cfg.Resilience.CircuitBreaker.Threshold = 5
+	cfg.Resilience.CircuitBreaker.Cooldown = 0
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for cooldown=0 with CB enabled, got nil")
+	}
+}
+
+func TestValidate_CircuitBreaker_Disabled_IgnoresBadValues(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Resilience.CircuitBreaker.Enabled = false
+	cfg.Resilience.CircuitBreaker.Threshold = 0 // would be invalid if enabled
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("disabled circuit breaker should not validate threshold: %v", err)
+	}
+}
+
+func TestValidate_Retry_MaxAttemptsZero(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Resilience.Retry.Enabled = true
+	cfg.Resilience.Retry.MaxAttempts = 0
+	cfg.Resilience.Retry.Multiplier = 2.0
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for max_attempts=0 with retry enabled, got nil")
+	}
+}
+
+func TestValidate_Retry_MultiplierBelowOne(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Resilience.Retry.Enabled = true
+	cfg.Resilience.Retry.MaxAttempts = 3
+	cfg.Resilience.Retry.Multiplier = 0.5
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for multiplier < 1.0 with retry enabled, got nil")
+	}
+}
+
+func TestValidate_Retry_InitialDelayExceedsMaxDelay(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Resilience.Retry.Enabled = true
+	cfg.Resilience.Retry.MaxAttempts = 3
+	cfg.Resilience.Retry.Multiplier = 2.0
+	cfg.Resilience.Retry.InitialDelay = 5 * time.Second
+	cfg.Resilience.Retry.MaxDelay = 1 * time.Second
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for initial_delay > max_delay, got nil")
+	}
+}
+
+func TestValidate_Cache_MaxBytesZero(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Cache.Enabled = true
+	cfg.Cache.MaxBytes = 0
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for max_bytes=0 with cache enabled, got nil")
+	}
+}
+
+func TestValidate_Cache_Disabled_IgnoresBadValues(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Cache.Enabled = false
+	cfg.Cache.MaxBytes = 0 // would be invalid if enabled
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("disabled cache should not validate max_bytes: %v", err)
+	}
+}
+
+func TestValidate_Valid_ResilienceAndCache(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Resilience.CircuitBreaker.Enabled = true
+	cfg.Resilience.CircuitBreaker.Threshold = 5
+	cfg.Resilience.CircuitBreaker.Cooldown = 30 * time.Second
+	cfg.Resilience.Retry.Enabled = true
+	cfg.Resilience.Retry.MaxAttempts = 3
+	cfg.Resilience.Retry.Multiplier = 2.0
+	cfg.Resilience.Retry.InitialDelay = 100 * time.Millisecond
+	cfg.Resilience.Retry.MaxDelay = 2 * time.Second
+	cfg.Cache.Enabled = true
+	cfg.Cache.MaxBytes = 64 * 1024 * 1024
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid config should pass validation: %v", err)
+	}
+}
+
 // writeTempFile writes content to a temp file and returns its path.
 // The file is removed when the test completes.
 func writeTempFile(t *testing.T, content string) string {

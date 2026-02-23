@@ -535,15 +535,14 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 
 	// Enqueue async replication to remaining sites using the first primary
 	// (or promoted site) as the GET source.
+	//
+	// Persist to the store BEFORE enqueueing so that the job is durable before
+	// the worker can complete it.  If the order were reversed, a fast worker
+	// could complete the job and drainWorkerEvents could call DeleteJob before
+	// PutReplicationJob runs, leaving a phantom entry in the store.
 	if len(primaries) > 0 {
 		src := primaries[0]
 		for _, s := range others {
-			c.worker.Enqueue(replication.ReplicationJob{
-				SourceSite: src,
-				DestSite:   s,
-				Key:        key,
-				Size:       int64(len(data)),
-			})
 			if store != nil {
 				metaJob := &metadata.ReplicationJob{
 					ID:         makeJobID(src.Name(), s.Name(), key),
@@ -557,6 +556,12 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 					log.Printf("coordinator: persist job %q: %v", metaJob.ID, persistErr)
 				}
 			}
+			c.worker.Enqueue(replication.ReplicationJob{
+				SourceSite: src,
+				DestSite:   s,
+				Key:        key,
+				Size:       int64(len(data)),
+			})
 		}
 	}
 

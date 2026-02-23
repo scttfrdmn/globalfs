@@ -38,11 +38,13 @@ func NewMemoryStore() *MemoryStore {
 // PutSite creates or updates the record for site.Name.
 func (m *MemoryStore) PutSite(_ context.Context, site *SiteRecord) error {
 	cp := *site
+	data, _ := json.Marshal(&cp)
 	m.mu.Lock()
 	m.sites[site.Name] = &cp
-	data, _ := json.Marshal(&cp)
-	m.notify("sites/"+site.Name, WatchEventPut, data)
 	m.mu.Unlock()
+	// Notify outside the lock so watcher consumers can call store methods
+	// without risk of deadlock, and so the lock is not held during channel I/O.
+	m.notify("sites/"+site.Name, WatchEventPut, data)
 	return nil
 }
 
@@ -74,8 +76,8 @@ func (m *MemoryStore) ListSites(_ context.Context) ([]*SiteRecord, error) {
 func (m *MemoryStore) DeleteSite(_ context.Context, name string) error {
 	m.mu.Lock()
 	delete(m.sites, name)
-	m.notify("sites/"+name, WatchEventDelete, nil)
 	m.mu.Unlock()
+	m.notify("sites/"+name, WatchEventDelete, nil)
 	return nil
 }
 
@@ -84,11 +86,11 @@ func (m *MemoryStore) DeleteSite(_ context.Context, name string) error {
 // PutReplicationJob creates or replaces the job record.
 func (m *MemoryStore) PutReplicationJob(_ context.Context, job *ReplicationJob) error {
 	cp := *job
+	data, _ := json.Marshal(&cp)
 	m.mu.Lock()
 	m.jobs[job.ID] = &cp
-	data, _ := json.Marshal(&cp)
-	m.notify("jobs/"+job.ID, WatchEventPut, data)
 	m.mu.Unlock()
+	m.notify("jobs/"+job.ID, WatchEventPut, data)
 	return nil
 }
 
@@ -108,8 +110,8 @@ func (m *MemoryStore) GetPendingJobs(_ context.Context) ([]*ReplicationJob, erro
 func (m *MemoryStore) DeleteJob(_ context.Context, id string) error {
 	m.mu.Lock()
 	delete(m.jobs, id)
-	m.notify("jobs/"+id, WatchEventDelete, nil)
 	m.mu.Unlock()
+	m.notify("jobs/"+id, WatchEventDelete, nil)
 	return nil
 }
 
@@ -127,6 +129,10 @@ func (m *MemoryStore) Watch(ctx context.Context, prefix string) (<-chan WatchEve
 
 	go func() {
 		<-ctx.Done()
+		// Remove the watcher under the lock so future notify calls will not
+		// include it in their snapshot.  Close the channel after releasing the
+		// lock to avoid a send-on-closed-channel panic in concurrent notifies
+		// that may have already snapshotted this watcher.
 		m.mu.Lock()
 		for i, existing := range m.watchers {
 			if existing == w {
@@ -134,8 +140,8 @@ func (m *MemoryStore) Watch(ctx context.Context, prefix string) (<-chan WatchEve
 				break
 			}
 		}
-		close(ch)
 		m.mu.Unlock()
+		close(ch)
 	}()
 
 	return ch, nil
@@ -149,15 +155,36 @@ func (m *MemoryStore) Close() error { return nil }
 // ── Internal ───────────────────────────────────────────────────────────────────
 
 // notify fans out a WatchEvent to all watchers whose prefix matches key.
-// Caller must hold m.mu (write lock).
+// Must NOT be called with m.mu held — it acquires its own RLock to snapshot
+// the watchers list and then sends outside the lock so that:
+//  1. Watcher consumers may call store methods without deadlocking.
+//  2. Channel I/O does not delay other writers.
+//
+// A per-send recover guards against the rare race where a watcher is removed
+// and its channel is closed between the snapshot and the send.
 func (m *MemoryStore) notify(key string, evType WatchEventType, value []byte) {
-	for _, w := range m.watchers {
+	ev := WatchEvent{Type: evType, Key: key, Value: value}
+
+	m.mu.RLock()
+	snapshot := make([]*memWatcher, len(m.watchers))
+	copy(snapshot, m.watchers)
+	m.mu.RUnlock()
+
+	for _, w := range snapshot {
 		if strings.HasPrefix(key, w.prefix) {
-			select {
-			case w.ch <- WatchEvent{Type: evType, Key: key, Value: value}:
-			default:
-				// Drop event if subscriber is not keeping up.
-			}
+			safeWatchSend(w.ch, ev)
 		}
+	}
+}
+
+// safeWatchSend performs a non-blocking send on ch, recovering from a panic
+// in the event the channel was closed between the watchers snapshot and the
+// send (a narrow but theoretically possible race).
+func safeWatchSend(ch chan WatchEvent, ev WatchEvent) {
+	defer func() { recover() }() //nolint:errcheck
+	select {
+	case ch <- ev:
+	default:
+		// Drop event if subscriber is not keeping up.
 	}
 }

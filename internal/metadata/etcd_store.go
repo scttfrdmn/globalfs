@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -182,6 +183,14 @@ func (e *EtcdStore) Watch(ctx context.Context, prefix string) (<-chan WatchEvent
 	go func() {
 		defer close(out)
 		for resp := range wch {
+			// resp.Err() is non-nil when etcd signals a compaction event or a
+			// reconnect error.  Ignoring it would silently skip events that
+			// occurred during the gap, so log and continue — the channel
+			// remains open and future responses are still processed.
+			if err := resp.Err(); err != nil {
+				log.Printf("etcd: watch %q: response error (events may have been missed): %v", watchKey, err)
+				continue
+			}
 			for _, ev := range resp.Events {
 				we := WatchEvent{Key: string(ev.Kv.Key)}
 				switch ev.Type {

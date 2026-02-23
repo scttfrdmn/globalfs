@@ -270,6 +270,12 @@ func (c *Configuration) Validate() error {
 	if c.Global.ClusterName == "" {
 		return fmt.Errorf("global.cluster_name is required")
 	}
+	switch c.Global.LogLevel {
+	case "", "DEBUG", "INFO", "WARN", "WARNING", "ERROR":
+		// valid
+	default:
+		return fmt.Errorf("global.log_level %q is invalid (DEBUG|INFO|WARN|WARNING|ERROR)", c.Global.LogLevel)
+	}
 
 	// Validate coordinator settings
 	if c.Coordinator.ListenAddr == "" {
@@ -332,6 +338,33 @@ func (c *Configuration) Validate() error {
 				return fmt.Errorf("policies[%d].replicate_to references unknown site: %s", i, replica)
 			}
 		}
+	}
+
+	// Validate resilience settings.
+	if cb := c.Resilience.CircuitBreaker; cb.Enabled {
+		if cb.Threshold < 1 {
+			return fmt.Errorf("resilience.circuit_breaker.threshold must be >= 1 when circuit breaker is enabled")
+		}
+		if cb.Cooldown <= 0 {
+			return fmt.Errorf("resilience.circuit_breaker.cooldown must be > 0 when circuit breaker is enabled")
+		}
+	}
+	if r := c.Resilience.Retry; r.Enabled {
+		if r.MaxAttempts < 1 {
+			return fmt.Errorf("resilience.retry.max_attempts must be >= 1 when retry is enabled")
+		}
+		if r.Multiplier < 1.0 {
+			return fmt.Errorf("resilience.retry.multiplier must be >= 1.0 when retry is enabled")
+		}
+		if r.InitialDelay > 0 && r.MaxDelay > 0 && r.InitialDelay > r.MaxDelay {
+			return fmt.Errorf("resilience.retry.initial_delay (%v) must not exceed max_delay (%v)",
+				r.InitialDelay, r.MaxDelay)
+		}
+	}
+
+	// Validate cache settings.
+	if c.Cache.Enabled && c.Cache.MaxBytes <= 0 {
+		return fmt.Errorf("cache.max_bytes must be > 0 when cache is enabled")
 	}
 
 	return nil
