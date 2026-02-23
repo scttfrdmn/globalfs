@@ -144,6 +144,48 @@ func (c *Cache) Put(key string, data []byte) {
 	c.curBytes += newSize
 }
 
+// PutAndRecordEvictions inserts or replaces the value for key, exactly like
+// [Put], and additionally returns the number of entries that were evicted to
+// make room for the new value.  Callers that track eviction metrics should
+// prefer this method over a separate [Stats] call to avoid a TOCTOU race when
+// concurrent goroutines are also inserting values.
+func (c *Cache) PutAndRecordEvictions(key string, data []byte) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	newSize := int64(len(data))
+
+	if c.cfg.MaxBytes > 0 && newSize > c.cfg.MaxBytes {
+		return 0
+	}
+
+	if el, ok := c.index[key]; ok {
+		c.removeElement(el)
+	}
+
+	var evicted int64
+	if c.cfg.MaxBytes > 0 {
+		for c.curBytes+newSize > c.cfg.MaxBytes && c.list.Len() > 0 {
+			c.evictLRU()
+			evicted++
+		}
+	}
+
+	e := &entry{
+		key:  key,
+		data: make([]byte, len(data)),
+	}
+	copy(e.data, data)
+	if c.cfg.TTL > 0 {
+		e.expiresAt = time.Now().Add(c.cfg.TTL)
+	}
+
+	el := c.list.PushFront(e)
+	c.index[key] = el
+	c.curBytes += newSize
+	return evicted
+}
+
 // Delete removes the entry for key if it exists.
 func (c *Cache) Delete(key string) {
 	c.mu.Lock()

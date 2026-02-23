@@ -408,6 +408,76 @@ func TestWorker_MultipleJobs(t *testing.T) {
 	t.Error("not all keys replicated within 3s")
 }
 
+// TestWorker_StopDuringBackoff_WrapsLastErr verifies that when the worker is
+// stopped during a retry backoff sleep the EventFailed error wraps the last
+// transfer error so the cause is not lost (#53).
+func TestWorker_StopDuringBackoff_WrapsLastErr(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("disk-full")
+	srcClient := &failClient{
+		data:    map[string][]byte{},
+		getErrs: []error{sentinel, sentinel, sentinel},
+	}
+	src := site.New("src", types.SiteRolePrimary, srcClient)
+	dst, _ := makeMount("dst", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := &Worker{
+		queue:       make(chan ReplicationJob, 8),
+		events:      make(chan ReplicationEvent, 8),
+		done:        make(chan struct{}),
+		baseBackoff: 500 * time.Millisecond, // long enough that Stop fires mid-backoff
+	}
+	w.Start(ctx)
+
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "key"}); err != nil {
+		t.Fatalf("Enqueue: unexpected error: %v", err)
+	}
+
+	// Wait for EventStarted (attempt 1 fired and failed).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case ev := <-w.Events():
+			if ev.Type == EventStarted {
+				goto started
+			}
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	t.Fatal("timed out waiting for EventStarted")
+started:
+
+	// Stop the worker while it is sleeping before attempt 2.
+	w.Stop()
+
+	var gotFailed bool
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case ev := <-w.Events():
+			if ev.Type == EventFailed {
+				gotFailed = true
+				if !errors.Is(ev.Err, sentinel) {
+					t.Errorf("EventFailed.Err should wrap sentinel; got: %v", ev.Err)
+				}
+			}
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+		if gotFailed {
+			break
+		}
+	}
+	if !gotFailed {
+		t.Error("expected EventFailed after Stop during backoff")
+	}
+}
+
 // TestWorker_ContextCancellation verifies that a pending job is abandoned when
 // the context is cancelled during retry backoff.
 func TestWorker_ContextCancellation(t *testing.T) {

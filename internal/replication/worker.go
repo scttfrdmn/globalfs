@@ -196,7 +196,7 @@ func (w *Worker) processJob(ctx context.Context, job ReplicationJob) {
 					Job:     job,
 					Type:    EventFailed,
 					Attempt: attempt,
-					Err:     fmt.Errorf("worker stopped"),
+					Err:     fmt.Errorf("worker stopped: %w", lastErr),
 				})
 				return
 			}

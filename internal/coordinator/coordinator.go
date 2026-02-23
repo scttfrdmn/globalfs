@@ -521,11 +521,9 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 		if siteErr == nil {
 			// Populate cache on successful site fetch.
 			if oc != nil {
-				prevEvictions := oc.Stats().Evictions
-				oc.Put(key, data)
-				newStats := oc.Stats()
-				m.SetCacheBytes(newStats.Bytes)
-				for i := int64(0); i < newStats.Evictions-prevEvictions; i++ {
+				evicted := oc.PutAndRecordEvictions(key, data)
+				m.SetCacheBytes(oc.Stats().Bytes)
+				for i := int64(0); i < evicted; i++ {
 					m.RecordCacheEviction()
 				}
 			}

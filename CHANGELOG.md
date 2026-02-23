@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.6] - 2026-02-23
+
+### Fixed
+- `MemoryStore.PutSite` and `PutReplicationJob` now log a `slog.Error` when `json.Marshal` fails rather than silently discarding the error and sending `nil` data to watchers (#52)
+- `replication.Worker` stop-during-backoff now wraps `lastErr` into the `EventFailed` error (`"worker stopped: <cause>"`) so the transfer failure cause is not lost (#53)
+- `cache.Cache.PutAndRecordEvictions` added: atomically inserts a value and returns the exact number of entries evicted, eliminating the TOCTOU eviction double-count in `Coordinator.Get` metrics (#54)
+
+---
+
 ## [0.1.5] - 2026-02-23
 
 ### Fixed

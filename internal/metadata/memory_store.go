@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 )
@@ -38,7 +39,11 @@ func NewMemoryStore() *MemoryStore {
 // PutSite creates or updates the record for site.Name.
 func (m *MemoryStore) PutSite(_ context.Context, site *SiteRecord) error {
 	cp := *site
-	data, _ := json.Marshal(&cp)
+	data, err := json.Marshal(&cp)
+	if err != nil {
+		slog.Error("metadata: failed to marshal SiteRecord for watcher notification", "site", site.Name, "err", err)
+		// data is nil; watchers receive a WatchEvent with nil Value.
+	}
 	m.mu.Lock()
 	m.sites[site.Name] = &cp
 	m.mu.Unlock()
@@ -86,7 +91,11 @@ func (m *MemoryStore) DeleteSite(_ context.Context, name string) error {
 // PutReplicationJob creates or replaces the job record.
 func (m *MemoryStore) PutReplicationJob(_ context.Context, job *ReplicationJob) error {
 	cp := *job
-	data, _ := json.Marshal(&cp)
+	data, err := json.Marshal(&cp)
+	if err != nil {
+		slog.Error("metadata: failed to marshal ReplicationJob for watcher notification", "id", job.ID, "err", err)
+		// data is nil; watchers receive a WatchEvent with nil Value.
+	}
 	m.mu.Lock()
 	m.jobs[job.ID] = &cp
 	m.mu.Unlock()

@@ -323,3 +323,69 @@ func TestCache_ConcurrentSafe(t *testing.T) {
 		<-done
 	}
 }
+
+// ── PutAndRecordEvictions ─────────────────────────────────────────────────────
+
+// TestCache_PutAndRecordEvictions_NoEviction verifies that zero is returned
+// when the new entry fits without displacing anything.
+func TestCache_PutAndRecordEvictions_NoEviction(t *testing.T) {
+	t.Parallel()
+	c := New(Config{MaxBytes: 10})
+	evicted := c.PutAndRecordEvictions("k", []byte("hello")) // 5 bytes; fits
+	if evicted != 0 {
+		t.Errorf("expected 0 evictions, got %d", evicted)
+	}
+}
+
+// TestCache_PutAndRecordEvictions_OneEviction verifies that the exact number
+// of evictions caused by a Put is returned (#54).
+func TestCache_PutAndRecordEvictions_OneEviction(t *testing.T) {
+	t.Parallel()
+	// Budget = 10 bytes; two 5-byte entries fill it exactly.
+	c := New(Config{MaxBytes: 10})
+	c.Put("a", []byte("AAAAA"))
+	c.Put("b", []byte("BBBBB"))
+	// Third 5-byte entry must evict exactly one LRU entry.
+	evicted := c.PutAndRecordEvictions("c", []byte("CCCCC"))
+	if evicted != 1 {
+		t.Errorf("expected 1 eviction, got %d", evicted)
+	}
+	// Verify cache state: "a" should be gone, "b" and "c" present.
+	if _, ok := c.Get("a"); ok {
+		t.Error("a should have been evicted")
+	}
+}
+
+// TestCache_PutAndRecordEvictions_OversizedDropped verifies that zero is
+// returned when the value exceeds MaxBytes and is silently dropped.
+func TestCache_PutAndRecordEvictions_OversizedDropped(t *testing.T) {
+	t.Parallel()
+	c := New(Config{MaxBytes: 5})
+	evicted := c.PutAndRecordEvictions("big", make([]byte, 10))
+	if evicted != 0 {
+		t.Errorf("oversized drop should return 0 evictions, got %d", evicted)
+	}
+	if _, ok := c.Get("big"); ok {
+		t.Error("oversized entry should not be cached")
+	}
+}
+
+// TestCache_PutAndRecordEvictions_ConsistentWithPut verifies that
+// PutAndRecordEvictions produces the same cache state as Put.
+func TestCache_PutAndRecordEvictions_ConsistentWithPut(t *testing.T) {
+	t.Parallel()
+	// Two caches with same config; use Put in one and PutAndRecordEvictions
+	// in the other; end state must be identical.
+	c1 := New(Config{MaxBytes: 10})
+	c2 := New(Config{MaxBytes: 10})
+	for _, key := range []string{"a", "b", "c"} {
+		c1.Put(key, []byte("AAAAA"))
+		c2.PutAndRecordEvictions(key, []byte("AAAAA"))
+	}
+	if c1.Stats().Bytes != c2.Stats().Bytes {
+		t.Errorf("bytes differ: c1=%d c2=%d", c1.Stats().Bytes, c2.Stats().Bytes)
+	}
+	if c1.Len() != c2.Len() {
+		t.Errorf("len differs: c1=%d c2=%d", c1.Len(), c2.Len())
+	}
+}
