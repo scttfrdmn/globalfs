@@ -32,6 +32,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/scttfrdmn/globalfs/internal/cache"
 	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/coordinator"
 	"github.com/scttfrdmn/globalfs/internal/metrics"
@@ -182,6 +183,20 @@ func main() {
 			"initial_delay", initialDelay,
 			"max_delay", maxDelay,
 			"multiplier", multiplier)
+	}
+
+	// ── Cache ──────────────────────────────────────────────────────────────────
+	if cfg.Cache.Enabled {
+		maxBytes := cfg.Cache.MaxBytes
+		if maxBytes <= 0 {
+			maxBytes = 64 * 1024 * 1024 // 64 MiB
+		}
+		oc := cache.New(cache.Config{
+			MaxBytes: maxBytes,
+			TTL:      cfg.Cache.TTL,
+		})
+		c.SetCache(oc)
+		slog.Info("object cache enabled", "max_bytes", maxBytes, "ttl", cfg.Cache.TTL)
 	}
 
 	if len(cfg.Policy.Rules) > 0 {

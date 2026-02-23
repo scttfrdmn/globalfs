@@ -73,6 +73,23 @@ type RetryConfig struct {
 	Multiplier float64 `yaml:"multiplier"`
 }
 
+// CacheConfig configures the in-memory LRU object cache.
+// The cache reduces latency and remote-site load for read-hot workloads by
+// serving repeated Gets from memory.
+type CacheConfig struct {
+	// Enabled activates the in-memory cache.  Default false.
+	Enabled bool `yaml:"enabled"`
+
+	// MaxBytes is the maximum number of bytes the cache may hold.
+	// Entries are evicted LRU when inserting a value would exceed the budget.
+	// Default 67108864 (64 MiB).
+	MaxBytes int64 `yaml:"max_bytes"`
+
+	// TTL is the maximum age of a cached entry before it is considered stale.
+	// A value of 0 means entries never expire.  Default 0.
+	TTL time.Duration `yaml:"ttl"`
+}
+
 // ResilienceConfig groups fault-tolerance and health-monitoring settings.
 type ResilienceConfig struct {
 	// HealthPollInterval sets the background site health check cadence.
@@ -109,6 +126,9 @@ type Configuration struct {
 	// Resilience configures fault tolerance: health polling, circuit breaker,
 	// and per-site retry.
 	Resilience ResilienceConfig `yaml:"resilience"`
+
+	// Cache configures the in-memory LRU object cache.
+	Cache CacheConfig `yaml:"cache"`
 }
 
 // GlobalConfig contains global settings.
@@ -207,6 +227,11 @@ func NewDefault() *Configuration {
 				MaxDelay:     2 * time.Second,
 				Multiplier:   2.0,
 			},
+		},
+		Cache: CacheConfig{
+			Enabled:  false,
+			MaxBytes: 64 * 1024 * 1024, // 64 MiB
+			TTL:      0,
 		},
 	}
 }

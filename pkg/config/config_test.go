@@ -205,6 +205,103 @@ resilience:
 	}
 }
 
+// TestNewDefault_CacheDefaults verifies that NewDefault populates all cache
+// fields with the correct zero values and defaults.
+func TestNewDefault_CacheDefaults(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.NewDefault()
+	cc := cfg.Cache
+
+	if cc.Enabled {
+		t.Error("Cache.Enabled should default to false")
+	}
+	if cc.MaxBytes != 64*1024*1024 {
+		t.Errorf("Cache.MaxBytes: got %d, want 67108864 (64 MiB)", cc.MaxBytes)
+	}
+	if cc.TTL != 0 {
+		t.Errorf("Cache.TTL: got %v, want 0", cc.TTL)
+	}
+}
+
+// TestLoadFromFile_CacheFields verifies that cache settings are correctly
+// parsed from a YAML file.
+func TestLoadFromFile_CacheFields(t *testing.T) {
+	t.Parallel()
+
+	yaml := `
+global:
+  cluster_name: test-cluster
+coordinator:
+  listen_addr: ":8090"
+  etcd_endpoints:
+    - localhost:2379
+sites:
+  - name: primary
+    role: primary
+    objectfs:
+      mount_point: /tmp/mnt
+      s3_bucket: test-bucket
+      s3_region: us-west-2
+cache:
+  enabled: true
+  max_bytes: 134217728
+  ttl: 5m
+`
+	f := writeTempFile(t, yaml)
+
+	cfg := config.NewDefault()
+	if err := cfg.LoadFromFile(f); err != nil {
+		t.Fatalf("LoadFromFile: %v", err)
+	}
+
+	cc := cfg.Cache
+	if !cc.Enabled {
+		t.Error("Cache.Enabled should be true")
+	}
+	if cc.MaxBytes != 134217728 {
+		t.Errorf("Cache.MaxBytes: got %d, want 134217728", cc.MaxBytes)
+	}
+	if cc.TTL != 5*time.Minute {
+		t.Errorf("Cache.TTL: got %v, want 5m", cc.TTL)
+	}
+}
+
+// TestLoadFromFile_CacheOmitted verifies that omitting the cache section
+// leaves the default values intact.
+func TestLoadFromFile_CacheOmitted(t *testing.T) {
+	t.Parallel()
+
+	yaml := `
+global:
+  cluster_name: test-cluster
+coordinator:
+  listen_addr: ":8090"
+  etcd_endpoints:
+    - localhost:2379
+sites:
+  - name: primary
+    role: primary
+    objectfs:
+      mount_point: /tmp/mnt
+      s3_bucket: test-bucket
+      s3_region: us-west-2
+`
+	f := writeTempFile(t, yaml)
+
+	cfg := config.NewDefault()
+	if err := cfg.LoadFromFile(f); err != nil {
+		t.Fatalf("LoadFromFile: %v", err)
+	}
+
+	if cfg.Cache.Enabled {
+		t.Error("Cache.Enabled should remain false when omitted")
+	}
+	if cfg.Cache.MaxBytes != 64*1024*1024 {
+		t.Errorf("Cache.MaxBytes: got %d, want 67108864 (default)", cfg.Cache.MaxBytes)
+	}
+}
+
 // writeTempFile writes content to a temp file and returns its path.
 // The file is removed when the test completes.
 func writeTempFile(t *testing.T, content string) string {

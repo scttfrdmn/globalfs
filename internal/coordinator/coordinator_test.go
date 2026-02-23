@@ -9,6 +9,7 @@ import (
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
+	"github.com/scttfrdmn/globalfs/internal/cache"
 	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/lease"
 	"github.com/scttfrdmn/globalfs/internal/metadata"
@@ -1496,5 +1497,135 @@ func TestDoWithRetry_NilConfigCallsOnce(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("expected 1 call, got %d", calls)
+	}
+}
+
+// ── Cache tests ───────────────────────────────────────────────────────────────
+
+// TestCoordinator_Cache_NilIsNoop verifies that a coordinator without a cache
+// configured still processes Get/Put/Delete correctly.
+func TestCoordinator_Cache_NilIsNoop(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cli := newMemClient(map[string][]byte{"k": []byte("v")})
+	c := New(site.New("s1", types.SiteRolePrimary, cli))
+	// No SetCache call — nil cache.
+	data, err := c.Get(ctx, "k")
+	if err != nil || string(data) != "v" {
+		t.Fatalf("Get without cache: err=%v data=%q", err, data)
+	}
+}
+
+// TestCoordinator_Cache_GetHitServesFromCache verifies that a second Get for
+// the same key is served from the cache without calling the site.
+func TestCoordinator_Cache_GetHitServesFromCache(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cli := newMemClient(map[string][]byte{"k": []byte("cached-value")})
+
+	c := New(site.New("s1", types.SiteRolePrimary, cli))
+	c.SetCache(cache.New(cache.Config{MaxBytes: 1024}))
+
+	// First call — cache miss → fetches from site.
+	if _, err := c.Get(ctx, "k"); err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+
+	// Poison the site so any further site access would fail.
+	cli.getErr = errors.New("site should not be called on cache hit")
+
+	// Second call — must be served from cache.
+	data, err := c.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("second Get (should hit cache): %v", err)
+	}
+	if string(data) != "cached-value" {
+		t.Errorf("got %q, want %q", data, "cached-value")
+	}
+}
+
+// TestCoordinator_Cache_PutInvalidatesKey verifies that Put evicts the cached
+// value so the next Get re-fetches from the site.
+func TestCoordinator_Cache_PutInvalidatesKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cli := newMemClient(map[string][]byte{"k": []byte("old")})
+
+	c := New(site.New("s1", types.SiteRolePrimary, cli))
+	c.SetCache(cache.New(cache.Config{MaxBytes: 1024}))
+
+	// Populate the cache.
+	if _, err := c.Get(ctx, "k"); err != nil {
+		t.Fatalf("initial Get: %v", err)
+	}
+
+	// Write new data via Put — should invalidate the cached entry.
+	if err := c.Put(ctx, "k", []byte("new")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Next Get should fetch from the (now updated) site, not the stale cache.
+	data, err := c.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("Get after Put: %v", err)
+	}
+	if string(data) != "new" {
+		t.Errorf("got %q, want %q", data, "new")
+	}
+}
+
+// TestCoordinator_Cache_DeleteInvalidatesKey verifies that Delete removes the
+// cached value so a subsequent Get no longer returns stale data.
+func TestCoordinator_Cache_DeleteInvalidatesKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cli := newMemClient(map[string][]byte{"k": []byte("v")})
+
+	c := New(site.New("s1", types.SiteRolePrimary, cli))
+	c.SetCache(cache.New(cache.Config{MaxBytes: 1024}))
+
+	// Populate the cache.
+	if _, err := c.Get(ctx, "k"); err != nil {
+		t.Fatalf("initial Get: %v", err)
+	}
+
+	// Delete from coordinator — should invalidate cache.
+	if err := c.Delete(ctx, "k"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	// Poison the site error so if cache is consulted and returns a hit we'd
+	// get stale data; the site returning an error confirms the cache is clear.
+	cli.getErr = errors.New("object deleted")
+	_, err := c.Get(ctx, "k")
+	if err == nil {
+		t.Error("expected error on Get after Delete (cache should be invalidated)")
+	}
+}
+
+// TestCoordinator_Cache_SetCacheNilDisables verifies that passing nil to
+// SetCache disables caching.
+func TestCoordinator_Cache_SetCacheNilDisables(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cli := newMemClient(map[string][]byte{"k": []byte("v")})
+
+	c := New(site.New("s1", types.SiteRolePrimary, cli))
+	c.SetCache(cache.New(cache.Config{MaxBytes: 1024}))
+
+	// Populate cache.
+	if _, err := c.Get(ctx, "k"); err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+
+	// Disable cache.
+	c.SetCache(nil)
+
+	// Poison the site — if cache was still active, this would be a hit.
+	cli.getErr = errors.New("site error after cache disabled")
+
+	_, err := c.Get(ctx, "k")
+	if err == nil {
+		t.Error("expected site error after cache disabled, got nil")
 	}
 }

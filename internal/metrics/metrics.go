@@ -17,6 +17,10 @@ type Metrics struct {
 	sitesCurrent          prometheus.Gauge
 	replicationTotal      *prometheus.CounterVec
 	replicationQueueDepth prometheus.Gauge
+	cacheHits             prometheus.Counter
+	cacheMisses           prometheus.Counter
+	cacheEvictions        prometheus.Counter
+	cacheBytes            prometheus.Gauge
 }
 
 // New creates a Metrics instance and registers all descriptors with reg.
@@ -54,6 +58,22 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "globalfs_replication_queue_depth",
 			Help: "Current number of jobs waiting in the replication queue.",
 		}),
+		cacheHits: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "globalfs_cache_hits_total",
+			Help: "Total number of cache hits.",
+		}),
+		cacheMisses: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "globalfs_cache_misses_total",
+			Help: "Total number of cache misses.",
+		}),
+		cacheEvictions: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "globalfs_cache_evictions_total",
+			Help: "Total number of cache entries evicted due to byte-budget pressure.",
+		}),
+		cacheBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "globalfs_cache_bytes",
+			Help: "Current number of bytes stored in the object cache.",
+		}),
 	}
 	reg.MustRegister(
 		m.objectOpsTotal,
@@ -61,6 +81,10 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.sitesCurrent,
 		m.replicationTotal,
 		m.replicationQueueDepth,
+		m.cacheHits,
+		m.cacheMisses,
+		m.cacheEvictions,
+		m.cacheBytes,
 	)
 	return m
 }
@@ -99,4 +123,36 @@ func (m *Metrics) SetReplicationQueueDepth(n int) {
 		return
 	}
 	m.replicationQueueDepth.Set(float64(n))
+}
+
+// RecordCacheHit increments the cache hit counter.
+func (m *Metrics) RecordCacheHit() {
+	if m == nil {
+		return
+	}
+	m.cacheHits.Inc()
+}
+
+// RecordCacheMiss increments the cache miss counter.
+func (m *Metrics) RecordCacheMiss() {
+	if m == nil {
+		return
+	}
+	m.cacheMisses.Inc()
+}
+
+// RecordCacheEviction increments the cache eviction counter.
+func (m *Metrics) RecordCacheEviction() {
+	if m == nil {
+		return
+	}
+	m.cacheEvictions.Inc()
+}
+
+// SetCacheBytes updates the current cache size gauge.
+func (m *Metrics) SetCacheBytes(n int64) {
+	if m == nil {
+		return
+	}
+	m.cacheBytes.Set(float64(n))
 }

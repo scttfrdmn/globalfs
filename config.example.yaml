@@ -120,3 +120,15 @@ resilience:
     initial_delay: 100ms  # pause before first retry
     max_delay: 2s         # cap on inter-retry pause
     multiplier: 2.0       # exponential scale factor
+
+# Cache settings — in-memory LRU object cache for read-hot workloads
+cache:
+  # enabled activates the read-through in-memory cache.
+  enabled: false
+
+  # max_bytes caps total cache memory (bytes).  LRU eviction applies.
+  max_bytes: 67108864    # 64 MiB
+
+  # ttl sets the maximum age of a cached entry (e.g. 5m, 1h).
+  # 0 means entries never expire.
+  ttl: 0s

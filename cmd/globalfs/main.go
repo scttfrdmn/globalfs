@@ -583,6 +583,12 @@ resilience:
     initial_delay: 100ms      # pause before first retry
     max_delay: 2s             # cap on inter-retry pause
     multiplier: 2.0           # exponential scale factor
+
+# Cache — in-memory LRU object cache for read-hot workloads
+cache:
+  enabled: false              # set true to enable read-through caching
+  max_bytes: 67108864         # maximum cache size in bytes (default 64 MiB)
+  ttl: 0s                     # entry TTL; 0 means entries never expire
 `
 
 func buildConfigInitCmd() *cobra.Command {

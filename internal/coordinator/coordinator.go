@@ -30,13 +30,14 @@ import (
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
+	"github.com/scttfrdmn/globalfs/internal/cache"
 	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/lease"
-	"github.com/scttfrdmn/globalfs/internal/retry"
 	"github.com/scttfrdmn/globalfs/internal/metadata"
 	"github.com/scttfrdmn/globalfs/internal/metrics"
 	"github.com/scttfrdmn/globalfs/internal/policy"
 	"github.com/scttfrdmn/globalfs/internal/replication"
+	"github.com/scttfrdmn/globalfs/internal/retry"
 	"github.com/scttfrdmn/globalfs/pkg/namespace"
 	"github.com/scttfrdmn/globalfs/pkg/site"
 	"github.com/scttfrdmn/globalfs/pkg/types"
@@ -68,6 +69,9 @@ type Coordinator struct {
 
 	// Per-site retry (optional).
 	retryConfig *retry.Config // nil = single attempt (no retry)
+
+	// Read-through object cache (optional).
+	objCache *cache.Cache // nil = disabled
 }
 
 // defaultHealthPollInterval is the cadence for background site health checks
@@ -177,6 +181,19 @@ func (c *Coordinator) SetRetryConfig(cfg *retry.Config) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.retryConfig = cfg
+}
+
+// SetCache registers an in-memory LRU cache with the coordinator.
+//
+// When set, Get serves reads from the cache when available (read-through).
+// Put and Delete invalidate the affected key so stale data is never returned.
+//
+// Pass nil to disable caching.  May be called at any time; safe for
+// concurrent use.
+func (c *Coordinator) SetCache(oc *cache.Cache) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.objCache = oc
 }
 
 // HealthStatus returns the most recent cached health report and the time it
@@ -401,13 +418,27 @@ func (c *Coordinator) Health(ctx context.Context) map[string]error {
 
 // Get fetches the full content of the object at key.
 //
+// When a cache is registered via SetCache, Get returns the cached value
+// immediately on a hit without contacting any site.  On a miss the data is
+// fetched from a site and stored in the cache before being returned.
+//
 // The policy engine determines site order; healthy sites (from the background
 // health cache) are then promoted to the front of that list so degraded sites
 // are only tried as a fallback.  The first successful read is returned.
 func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 	c.mu.RLock()
-	snapshot, pol, cb, retryCfg := c.snapshotSites(), c.policy, c.cb, c.retryConfig
+	snapshot, pol, cb, retryCfg, oc, m := c.snapshotSites(), c.policy, c.cb, c.retryConfig, c.objCache, c.m
 	c.mu.RUnlock()
+
+	// Cache read-through: serve from cache when available.
+	if oc != nil {
+		if cached, ok := oc.Get(key); ok {
+			m.RecordCacheHit()
+			m.SetCacheBytes(oc.Stats().Bytes)
+			return cached, nil
+		}
+		m.RecordCacheMiss()
+	}
 
 	ordered, err := pol.Route(ctx, policy.OperationRead, key, snapshot)
 	if err != nil {
@@ -437,6 +468,16 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 			}
 		}
 		if siteErr == nil {
+			// Populate cache on successful site fetch.
+			if oc != nil {
+				prevEvictions := oc.Stats().Evictions
+				oc.Put(key, data)
+				newStats := oc.Stats()
+				m.SetCacheBytes(newStats.Bytes)
+				for i := int64(0); i < newStats.Evictions-prevEvictions; i++ {
+					m.RecordCacheEviction()
+				}
+			}
 			return data, nil
 		}
 		lastErr = siteErr
@@ -456,7 +497,7 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 // target so data is durably stored before Put returns.
 func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	c.mu.RLock()
-	snapshot, pol, store, cb := c.snapshotSites(), c.policy, c.store, c.cb
+	snapshot, pol, store, cb, oc, m := c.snapshotSites(), c.policy, c.store, c.cb, c.objCache, c.m
 	c.mu.RUnlock()
 
 	routed, err := pol.Route(ctx, policy.OperationWrite, key, snapshot)
@@ -512,6 +553,12 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 			}
 		}
 	}
+
+	// Invalidate the cache so the next Get fetches the freshly-written value.
+	if oc != nil {
+		oc.Delete(key)
+		m.SetCacheBytes(oc.Stats().Bytes)
+	}
 	return nil
 }
 
@@ -519,9 +566,10 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 //
 // Primary site deletes are synchronous and return errors on failure.
 // Non-primary deletes are best-effort: errors are logged but not returned.
+// The cache entry for key is invalidated regardless of per-site outcome.
 func (c *Coordinator) Delete(ctx context.Context, key string) error {
 	c.mu.RLock()
-	snapshot, pol, cb := c.snapshotSites(), c.policy, c.cb
+	snapshot, pol, cb, oc, m := c.snapshotSites(), c.policy, c.cb, c.objCache, c.m
 	c.mu.RUnlock()
 
 	routed, err := pol.Route(ctx, policy.OperationDelete, key, snapshot)
@@ -551,6 +599,12 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 		} else if cb != nil {
 			cb.RecordSuccess(s.Name())
 		}
+	}
+
+	// Invalidate the cache entry whether or not site deletes succeeded.
+	if oc != nil {
+		oc.Delete(key)
+		m.SetCacheBytes(oc.Stats().Bytes)
 	}
 	return nil
 }
