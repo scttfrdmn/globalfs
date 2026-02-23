@@ -18,6 +18,9 @@
 //	object delete <key>                                   – delete object
 //	object head   <key>                                   – show object metadata
 //	object list  [--prefix <p>] [--limit <n>]             – list objects
+//	config validate <file>                                – validate a config file
+//	config show     <file>                                – show resolved config
+//	config init     [--output <file>]                     – write starter config template
 //	status                                                – overall health
 //	version                                               – print CLI version
 //	completion bash|zsh|fish|powershell                   – shell completions
@@ -36,8 +39,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 
 	"github.com/scttfrdmn/globalfs/pkg/client"
+	"github.com/scttfrdmn/globalfs/pkg/config"
 )
 
 // version is set via -ldflags at build time (see Makefile).
@@ -83,6 +88,7 @@ func buildRoot() *cobra.Command {
 	root.AddCommand(
 		buildSiteCmd(),
 		buildObjectCmd(),
+		buildConfigCmd(),
 		buildReplicateCmd(),
 		buildStatusCmd(),
 		buildVersionCmd(),
@@ -447,6 +453,139 @@ func buildObjectListCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&prefix, "prefix", "", "Key prefix filter")
 	cmd.Flags().IntVar(&limit, "limit", 0, "Maximum number of results (0 = all)")
+	return cmd
+}
+
+// ── config ────────────────────────────────────────────────────────────────────
+
+func buildConfigCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "config",
+		Short: "Work with coordinator configuration files",
+	}
+	cmd.AddCommand(buildConfigValidateCmd(), buildConfigShowCmd(), buildConfigInitCmd())
+	return cmd
+}
+
+// config validate ─────────────────────────────────────────────────────────────
+
+func buildConfigValidateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "validate <file>",
+		Short: "Validate a coordinator YAML configuration file",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := config.NewDefault()
+			if err := cfg.LoadFromFile(args[0]); err != nil {
+				return fmt.Errorf("cannot parse %s: %w", args[0], err)
+			}
+			if err := cfg.Validate(); err != nil {
+				return fmt.Errorf("configuration validation failed: %w", err)
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "Configuration is valid.")
+			return nil
+		},
+	}
+}
+
+// config show ─────────────────────────────────────────────────────────────────
+
+func buildConfigShowCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "show <file>",
+		Short: "Show the resolved configuration (after applying defaults)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := config.NewDefault()
+			if err := cfg.LoadFromFile(args[0]); err != nil {
+				return fmt.Errorf("cannot parse %s: %w", args[0], err)
+			}
+
+			if jsonOutput {
+				return printJSON(cmd.OutOrStdout(), cfg)
+			}
+
+			data, err := yaml.Marshal(cfg)
+			if err != nil {
+				return fmt.Errorf("marshal config: %w", err)
+			}
+			_, err = cmd.OutOrStdout().Write(data)
+			return err
+		},
+	}
+}
+
+// config init ─────────────────────────────────────────────────────────────────
+
+// configTemplate is a commented starter YAML that serves as a practical example.
+const configTemplate = `# GlobalFS coordinator configuration
+# See https://github.com/scttfrdmn/globalfs for full documentation.
+
+global:
+  cluster_name: my-globalfs-cluster
+  log_level: INFO             # DEBUG | INFO | WARN | ERROR
+  metrics_enabled: true
+  metrics_port: 9090
+
+coordinator:
+  listen_addr: ":8090"
+  etcd_endpoints:
+    - localhost:2379
+  lease_timeout: 60s
+  health_check_interval: 30s
+
+sites:
+  - name: primary
+    role: primary             # primary | backup | burst
+    objectfs:
+      mount_point: /mnt/globalfs/primary
+      s3_bucket: my-primary-bucket
+      s3_region: us-west-2
+    cargoship:
+      enabled: false
+      endpoint: ""
+
+  # - name: backup
+  #   role: backup
+  #   objectfs:
+  #     mount_point: /mnt/globalfs/backup
+  #     s3_bucket: my-backup-bucket
+  #     s3_region: us-east-1
+
+policy:
+  rules: []
+  # rules:
+  #   - name: read-from-primary
+  #     key_pattern: ""
+  #     operations: [read]
+  #     target_roles: [primary]
+  #     priority: 10
+
+performance:
+  max_concurrent_transfers: 8
+  transfer_chunk_size: 16777216  # 16 MiB
+  cache_size: "1GB"
+`
+
+func buildConfigInitCmd() *cobra.Command {
+	var outputPath string
+	cmd := &cobra.Command{
+		Use:   "init",
+		Short: "Write a starter configuration template",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if outputPath == "" {
+				_, err := fmt.Fprint(cmd.OutOrStdout(), configTemplate)
+				return err
+			}
+
+			if err := os.WriteFile(outputPath, []byte(configTemplate), 0644); err != nil {
+				return fmt.Errorf("write %s: %w", outputPath, err)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Configuration template written to %s\n", outputPath)
+			return nil
+		},
+	}
+	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "Write template to file instead of stdout")
 	return cmd
 }
 

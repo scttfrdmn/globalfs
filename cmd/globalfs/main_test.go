@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/scttfrdmn/globalfs/pkg/client"
+	"gopkg.in/yaml.v3"
 )
 
 // newTestServer spins up an httptest.Server and returns its URL.
@@ -715,5 +716,172 @@ func TestAuth_CorrectKey_ObjectGet(t *testing.T) {
 	out, err := runCmd(t, addr, "--api-key", "obj-key", "object", "get", "mykey", "--output", "-")
 	if err != nil {
 		t.Fatalf("object get with key: %v (output: %s)", err, out)
+	}
+}
+
+// ── config validate ───────────────────────────────────────────────────────────
+
+// validConfigYAML is a minimal config that passes Validate().
+const validConfigYAML = `
+global:
+  cluster_name: test-cluster
+coordinator:
+  listen_addr: ":8090"
+  etcd_endpoints:
+    - localhost:2379
+sites:
+  - name: primary
+    role: primary
+    objectfs:
+      mount_point: /mnt/primary
+      s3_bucket: my-bucket
+      s3_region: us-west-2
+`
+
+func writeConfigFile(t *testing.T, content string) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "config-*.yaml")
+	if err != nil {
+		t.Fatalf("create temp config: %v", err)
+	}
+	if _, err := f.WriteString(content); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	f.Close()
+	return f.Name()
+}
+
+func TestConfigValidate_Valid(t *testing.T) {
+	path := writeConfigFile(t, validConfigYAML)
+	out, err := runCmd(t, "http://localhost:0", "config", "validate", path)
+	if err != nil {
+		t.Fatalf("config validate (valid): %v (output: %s)", err, out)
+	}
+	if !strings.Contains(out, "valid") {
+		t.Errorf("expected 'valid' in output, got %q", out)
+	}
+}
+
+func TestConfigValidate_MissingFile(t *testing.T) {
+	_, err := runCmd(t, "http://localhost:0", "config", "validate", "/does/not/exist.yaml")
+	if err == nil {
+		t.Fatal("expected error for missing file, got nil")
+	}
+}
+
+func TestConfigValidate_InvalidYAML(t *testing.T) {
+	path := writeConfigFile(t, ":\tinvalid: yaml: [")
+	_, err := runCmd(t, "http://localhost:0", "config", "validate", path)
+	if err == nil {
+		t.Fatal("expected error for invalid YAML, got nil")
+	}
+}
+
+func TestConfigValidate_ValidationError(t *testing.T) {
+	// Valid YAML but no sites → Validate() returns error.
+	noSites := `
+global:
+  cluster_name: test-cluster
+coordinator:
+  listen_addr: ":8090"
+  etcd_endpoints:
+    - localhost:2379
+sites: []
+`
+	path := writeConfigFile(t, noSites)
+	_, err := runCmd(t, "http://localhost:0", "config", "validate", path)
+	if err == nil {
+		t.Fatal("expected validation error for config with no sites")
+	}
+	if !strings.Contains(err.Error(), "validation failed") {
+		t.Errorf("error should mention 'validation failed': %v", err)
+	}
+}
+
+// ── config show ───────────────────────────────────────────────────────────────
+
+func TestConfigShow_YAML(t *testing.T) {
+	path := writeConfigFile(t, validConfigYAML)
+	out, err := runCmd(t, "http://localhost:0", "config", "show", path)
+	if err != nil {
+		t.Fatalf("config show: %v (output: %s)", err, out)
+	}
+	// The output should be valid YAML that contains the cluster name.
+	var m map[string]any
+	if err := yaml.Unmarshal([]byte(out), &m); err != nil {
+		t.Fatalf("config show output is not valid YAML: %v\n%s", err, out)
+	}
+	global, ok := m["global"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected 'global' key in output, got: %v", m)
+	}
+	if global["cluster_name"] != "test-cluster" {
+		t.Errorf("cluster_name: got %v, want test-cluster", global["cluster_name"])
+	}
+}
+
+func TestConfigShow_JSON(t *testing.T) {
+	path := writeConfigFile(t, validConfigYAML)
+	out, err := runCmd(t, "http://localhost:0", "config", "show", path, "--json")
+	if err != nil {
+		t.Fatalf("config show --json: %v (output: %s)", err, out)
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(out), &m); err != nil {
+		t.Fatalf("config show --json output is not valid JSON: %v\n%s", err, out)
+	}
+	// Configuration struct has no JSON tags; Go uses exported field names (e.g. "Global").
+	global, ok := m["Global"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected 'Global' key in JSON output, got: %v", m)
+	}
+	if global["ClusterName"] != "test-cluster" {
+		t.Errorf("ClusterName: got %v, want test-cluster", global["ClusterName"])
+	}
+}
+
+func TestConfigShow_MissingFile(t *testing.T) {
+	_, err := runCmd(t, "http://localhost:0", "config", "show", "/no/such/file.yaml")
+	if err == nil {
+		t.Fatal("expected error for missing file, got nil")
+	}
+}
+
+// ── config init ───────────────────────────────────────────────────────────────
+
+func TestConfigInit_Stdout(t *testing.T) {
+	out, err := runCmd(t, "http://localhost:0", "config", "init")
+	if err != nil {
+		t.Fatalf("config init: %v (output: %s)", err, out)
+	}
+	if !strings.Contains(out, "GlobalFS coordinator configuration") {
+		t.Errorf("expected header comment in output, got %q", out)
+	}
+	if !strings.Contains(out, "cluster_name") {
+		t.Errorf("expected cluster_name in template, got %q", out)
+	}
+	// Template should be parseable YAML.
+	var m map[string]any
+	if err := yaml.Unmarshal([]byte(out), &m); err != nil {
+		t.Fatalf("config init output is not valid YAML: %v\n%s", err, out)
+	}
+}
+
+func TestConfigInit_ToFile(t *testing.T) {
+	outFile := t.TempDir() + "/new-config.yaml"
+	out, err := runCmd(t, "http://localhost:0", "config", "init", "--output", outFile)
+	if err != nil {
+		t.Fatalf("config init --output: %v (output: %s)", err, out)
+	}
+	if !strings.Contains(out, outFile) {
+		t.Errorf("expected output path in message, got %q", out)
+	}
+
+	contents, readErr := os.ReadFile(outFile)
+	if readErr != nil {
+		t.Fatalf("read output file: %v", readErr)
+	}
+	if !strings.Contains(string(contents), "cluster_name") {
+		t.Errorf("written file missing cluster_name, got %q", string(contents))
 	}
 }
