@@ -1,636 +1,652 @@
-# GlobalFS - Global Namespace for Hybrid HPC Clouds
+# GlobalFS — Global Namespace for Hybrid HPC Clouds
 
-**Status**: Design Phase
-**Version**: 0.1.0-alpha
-**Target Use Case**: HPC Cloud Bursting with Seamless Data Access
+**Version**: v0.1.0
+**Status**: Production-ready coordinator for multi-site object routing
+**License**: Apache 2.0
+
+GlobalFS is a coordinator daemon and CLI for routing object operations across
+multiple S3-backed sites. It provides a single unified namespace over two or
+more [ObjectFS](https://github.com/scttfrdmn/objectfs) instances — on-premises
+and cloud — enabling seamless HPC cloud bursting without changing application
+code.
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [Quick Start](#quick-start)
+4. [Configuration Reference](#configuration-reference)
+5. [CLI Reference](#cli-reference)
+6. [API Reference](#api-reference)
+7. [Development](#development)
 
 ---
 
 ## Overview
 
-GlobalFS provides a unified global namespace across on-premises and cloud compute resources, enabling seamless HPC cloud bursting. It coordinates multiple ObjectFS instances and uses CargoShip for efficient data movement.
+### What GlobalFS does
 
-### Key Capabilities
+- **Routes reads** to the nearest healthy site; falls back to other sites automatically
+- **Routes writes** synchronously to primary sites; replicates asynchronously to others
+- **Health monitors** all sites in the background and skips degraded ones
+- **Circuit-breaks** failing sites after a configurable threshold; probes recovery
+- **Retries** transient read failures with exponential back-off before giving up
+- **Caches** hot objects in memory (LRU with byte-budget eviction) to reduce latency
+- **Policy routes** operations by key pattern and operation type (read/write/delete)
+- **Exposes** a REST API and `globalfs` CLI for runtime management
 
-- **Global Namespace**: Single unified filesystem view across multiple sites
-- **Hybrid Cloud**: On-premises primary + cloud burst compute
-- **Seamless Access**: Transparent data access from any site
-- **Intelligent Replication**: Lazy data movement with predictive pre-staging
-- **High Performance**: Leverages ObjectFS local performance + CargoShip bulk transfers
+### What GlobalFS does not do
+
+- It is not a FUSE filesystem — it routes object (key/value) operations, not POSIX calls
+- It does not implement distributed consensus or etcd integration in v0.1.0
+- It does not encrypt data in transit (terminate TLS at a load balancer)
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                GlobalFS Coordinator                      │
-│  • Global namespace mapping                              │
-│  • Distributed metadata (etcd/Raft)                     │
-│  • Site health monitoring                               │
-│  • Data placement policy engine                         │
-│  • Cache coherency protocol                             │
-└──────────┬────────────────────────────┬─────────────────┘
-           │                            │
-    ┌──────▼──────┐            ┌───────▼────────┐
-    │  On-Prem    │            │     Cloud      │
-    │  Site       │            │     Site       │
-    │             │            │                │
-    │  ObjectFS   │            │   ObjectFS     │
-    │  Instance   │            │    Instance    │
-    └──────┬──────┘            └───────┬────────┘
-           │                            │
-    ┌──────▼──────┐            ┌───────▼────────┐
-    │  Local S3   │◄──────────►│   AWS S3       │
-    │  (MinIO)    │  CargoShip │                │
-    └─────────────┘  Transfer  └────────────────┘
+                        ┌──────────────────────────┐
+  globalfs CLI  ──────► │   globalfs-coordinator    │ ◄─── Prometheus /metrics
+  REST clients  ──────► │   :8090  (HTTP API)       │
+                        │                           │
+                        │  Policy Engine            │
+                        │  Health Cache             │
+                        │  Circuit Breaker          │
+                        │  Retry                    │
+                        │  LRU Object Cache         │
+                        │  Replication Worker       │
+                        └──────┬──────────┬─────────┘
+                               │          │
+                    ┌──────────▼──┐   ┌───▼──────────┐
+                    │  Site A     │   │  Site B       │
+                    │  (primary)  │   │  (burst)      │
+                    │             │   │               │
+                    │  ObjectFS   │   │  ObjectFS     │
+                    │  S3 bucket  │   │  S3 bucket    │
+                    └─────────────┘   └───────────────┘
 ```
 
-### Component Responsibilities
+### Routing rules
 
-**GlobalFS Coordinator**
-- Manages global namespace → site mappings
-- Coordinates metadata across sites
-- Implements data placement policies
-- Handles cache coherency
-- Triggers data replication via CargoShip
+| Operation | Behaviour |
+|-----------|-----------|
+| **Get / Head** | Tries sites in policy order; promotes healthy sites to front; applies circuit breaker filter; retries per site |
+| **Put** | Writes synchronously to primary-role sites; enqueues async replication to others |
+| **Delete** | Synchronous on primaries (error returned on failure); best-effort on others (logged) |
+| **List** | Priority-merge across all sites; highest-priority site wins on key conflicts |
 
-**ObjectFS Instances**
-- Local high-performance POSIX filesystem
-- S3 backend optimization
-- Caching and prefetching
-- Reports local state to coordinator
+### Site roles
 
-**CargoShip**
-- Bulk data transfers between sites
-- Compression and deduplication
-- Bandwidth optimization
-- Progress tracking
+| Role | Meaning |
+|------|---------|
+| `primary` | Authoritative site; synchronous writes required |
+| `burst` | Cloud overflow site; async replication target |
+| `backup` | Read-only fallback; async replication target |
 
 ---
 
-## Use Case: HPC Cloud Bursting
+## Quick Start
 
-### Scenario
+### 1. Build
 
-1. **Normal State**: HPC cluster runs on-premises
-   - 1000 compute nodes
-   - Local high-speed storage (MinIO S3)
-   - ObjectFS provides POSIX interface
-
-2. **Burst Event**: Queue depth exceeds capacity
-   - Detect: 500+ jobs queued
-   - Decision: Burst to AWS
-   - Action: Provision 500 cloud nodes
-
-3. **Data Movement**: Intelligent replication
-   - Pre-stage "hot" datasets (frequently accessed)
-   - Lazy-fetch remaining data on-demand
-   - CargoShip handles bulk transfers
-
-4. **Seamless Compute**: Jobs run in cloud
-   - Same /globalfs mount point
-   - Transparent data access
-   - Performance optimized by ObjectFS
-
-5. **Completion**: Results sync back
-   - Write results to cloud ObjectFS
-   - CargoShip syncs back to on-prem
-   - Tear down cloud resources
-
-### Performance Characteristics
-
-| Operation | On-Prem | First Cloud Access | Cached Cloud Access |
-|-----------|---------|-------------------|---------------------|
-| Read (small file) | <1ms | 50-100ms (fetch) | <1ms |
-| Read (large file) | 10ms | 200ms-2s (fetch) | 10-50ms |
-| Write | <1ms | <1ms | <1ms |
-| Metadata ops | <1ms | 10-20ms | <1ms |
-
----
-
-## Design Principles
-
-### 1. Separation of Concerns
-
-- **ObjectFS**: Local filesystem performance (single-site)
-- **GlobalFS**: Global coordination (multi-site)
-- **CargoShip**: Data movement (transfer optimization)
-
-Each component does one thing well and can evolve independently.
-
-### 2. Lazy Replication
-
-Data is **not** eagerly replicated to all sites. Instead:
-
-- **Hot datasets** are pre-staged based on policy
-- **On-demand fetch** for first access (one-time cost)
-- **Caching** at destination for subsequent access
-- **Bandwidth efficiency** over immediate availability
-
-Rationale: HPC datasets are often TB-PB scale. Full replication is wasteful.
-
-### 3. Eventual Consistency
-
-For cloud burst use case:
-
-- **On-prem writes**: Immediately consistent (single site)
-- **Cloud reads**: Eventually consistent (acceptable for batch compute)
-- **Critical files**: Synchronous replication (configurable)
-- **Bulk data**: Asynchronous background replication
-
-### 4. Composability
-
-GlobalFS is a coordination layer that **uses** ObjectFS and CargoShip:
-
-```go
-// GlobalFS doesn't reimplement filesystem or transfer logic
-type GlobalFS struct {
-    sites      map[string]*ObjectFSClient  // Delegate to ObjectFS
-    metadata   *DistributedStore           // Coordinate state
-    mover      *CargoShipClient            // Delegate transfers
-}
+```bash
+git clone https://github.com/scttfrdmn/globalfs
+cd globalfs
+make build
+# produces: bin/globalfs-coordinator  bin/globalfs
 ```
 
----
+### 2. Write a minimal config
 
-## Technical Architecture
-
-### Metadata Design
-
-**Distributed Metadata Store** (etcd-based)
-
-```
-/globalfs/
-  metadata/
-    sites/
-      onprem/
-        status: "active"
-        role: "primary"
-        endpoint: "file:///mnt/objectfs-onprem"
-        health: {"cpu": 20, "disk": "50GB free"}
-      cloud/
-        status: "active"
-        role: "burst"
-        endpoint: "file:///mnt/objectfs-cloud"
-        health: {"cpu": 10, "disk": "100GB free"}
-
-    namespace/
-      /datasets/hot/simulation.dat
-        primary: "onprem"
-        replicas: ["cloud"]
-        size: 10737418240
-        checksum: "sha256:abc123..."
-        last_modified: "2025-10-16T20:00:00Z"
-
-      /results/job-1234/
-        primary: "cloud"
-        replicas: []
-        pending_sync: true
-
-    replication/
-      jobs/
-        job-5678:
-          source: "onprem"
-          destination: "cloud"
-          files: ["/datasets/hot/simulation.dat"]
-          status: "in_progress"
-          progress: 45
+```bash
+./bin/globalfs config init --output config.yaml
+# Edit the generated file or use the example below
 ```
 
-### Data Placement Policies
-
-**Policy Engine** determines where data lives:
+Minimal two-site config:
 
 ```yaml
-# globalfs-policy.yaml
-policies:
-  - name: hot_datasets
-    pattern: /datasets/hot/*
-    primary: onprem
-    replicate_to: [cloud]
-    sync_mode: eager  # Pre-stage before burst
+global:
+  cluster_name: my-cluster
 
-  - name: input_data
-    pattern: /inputs/**
-    primary: onprem
-    replicate_to: [cloud]
-    sync_mode: lazy   # Fetch on first access
+coordinator:
+  listen_addr: ":8090"
+  etcd_endpoints:
+    - localhost:2379
 
-  - name: output_data
-    pattern: /results/**
-    primary: onprem   # Eventually sync back
-    replicate_to: []
-    sync_mode: async  # Background sync
+sites:
+  - name: onprem
+    role: primary
+    objectfs:
+      s3_bucket: my-onprem-bucket
+      s3_region: us-west-2
 
-  - name: scratch
-    pattern: /scratch/**
-    primary: null     # Local to each site
-    replicate_to: []
-    sync_mode: never
+  - name: cloud
+    role: burst
+    objectfs:
+      s3_bucket: my-cloud-bucket
+      s3_region: us-east-1
 ```
 
-### Cache Coherency Protocol
+### 3. Start the coordinator
 
-**Problem**: Multiple sites may cache the same file
+```bash
+# AWS credentials must be available (profile, env vars, or instance role)
+AWS_PROFILE=myprofile ./bin/globalfs-coordinator --config config.yaml
 
-**Solution**: Lease-based invalidation
-
-```
-1. Site requests file access
-2. Coordinator grants lease (read or write)
-3. Other sites' caches invalidated on write lease
-4. Lease expires → must revalidate
+# With API key authentication
+GLOBALFS_API_KEY=secret ./bin/globalfs-coordinator --config config.yaml
 ```
 
-**Protocol:**
-```go
-type FileLeaseRequest struct {
-    Path      string
-    SiteID    string
-    LeaseType LeaseType  // Read or Write
-}
+The coordinator logs to stderr and listens on `:8090`.
 
-type FileLease struct {
-    Path      string
-    SiteID    string
-    LeaseType LeaseType
-    ExpiresAt time.Time
-    Version   uint64     // For cache validation
-}
+### 4. Use the CLI
 
-// Coordinator tracks leases
-type LeaseManager struct {
-    mu     sync.RWMutex
-    leases map[string][]FileLease  // path -> leases
-}
+```bash
+export GLOBALFS_COORDINATOR=http://localhost:8090
+export GLOBALFS_API_KEY=secret   # if auth is enabled
 
-// On write lease grant:
-// 1. Invalidate all read leases
-// 2. Increment version
-// 3. Grant write lease to requester
+# Check health
+./bin/globalfs status
+
+# List sites
+./bin/globalfs site list
+
+# Store and retrieve an object
+echo "hello world" | ./bin/globalfs object put my-key --input -
+./bin/globalfs object get my-key
+
+# Coordinator runtime stats
+./bin/globalfs info
+```
+
+### 5. Verify health and metrics
+
+```bash
+curl http://localhost:8090/healthz    # 200 OK when all primaries healthy
+curl http://localhost:8090/readyz     # 200 OK once coordinator is started
+curl http://localhost:8090/metrics    # Prometheus metrics
 ```
 
 ---
 
-## API Design
+## Configuration Reference
 
-### GlobalFS Client API
+Configuration is loaded from a YAML file passed to `--config`. Missing fields
+use the defaults shown below. Generate a starter file with:
 
-```go
-package globalfs
-
-// Client provides global filesystem operations
-type Client struct {
-    config *Config
-    coord  *CoordinatorClient
-    local  *ObjectFSClient
-}
-
-// Mount a global namespace locally
-func (c *Client) Mount(globalPath, localPath string) error
-
-// Open a file (may trigger remote fetch)
-func (c *Client) Open(path string) (*File, error)
-
-// Create a file (writes to primary site)
-func (c *Client) Create(path string) (*File, error)
-
-// Stat file metadata (from coordinator)
-func (c *Client) Stat(path string) (*FileInfo, error)
-
-// ReadDir lists directory (from coordinator)
-func (c *Client) ReadDir(path string) ([]FileInfo, error)
-
-// Prefetch triggers eager replication
-func (c *Client) Prefetch(paths []string) (*ReplicationJob, error)
-
-// Sync ensures data is replicated to site
-func (c *Client) Sync(paths []string, site string) error
+```bash
+globalfs config init --output config.yaml
 ```
 
-### Configuration API
+### `global`
 
-```go
-// Config defines GlobalFS behavior
-type Config struct {
-    // Coordinator settings
-    Coordinator CoordinatorConfig
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cluster_name` | string | `globalfs-cluster` | Human-readable cluster identifier |
+| `log_level` | string | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARN`, `ERROR` |
+| `log_file` | string | _(stderr)_ | Path to log file; empty = stderr |
+| `metrics_enabled` | bool | `true` | Enable Prometheus metrics on `/metrics` |
+| `metrics_port` | int | `9090` | Port for the metrics endpoint |
 
-    // Site definitions
-    Sites []SiteConfig
+### `coordinator`
 
-    // Replication policies
-    Policies []ReplicationPolicy
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `listen_addr` | string | `:8090` | HTTP server bind address |
+| `etcd_endpoints` | []string | `[localhost:2379]` | etcd cluster endpoints (reserved for future use) |
+| `lease_timeout` | duration | `60s` | Distributed lease TTL |
+| `health_check_interval` | duration | `30s` | Per-site health check interval |
 
-    // Performance tuning
-    Performance PerformanceConfig
-}
+### `sites[]`
 
-type SiteConfig struct {
-    Name       string
-    Role       SiteRole  // Primary, Burst, Backup
-    ObjectFS   string    // ObjectFS mount endpoint
-    S3Backend  string    // Underlying S3 storage
-    CargoShip  string    // CargoShip endpoint for transfers
-    Network    NetworkConfig
-}
+Each entry defines one storage site.
 
-type ReplicationPolicy struct {
-    Name        string
-    PathPattern string  // Glob pattern
-    Primary     string  // Primary site name
-    ReplicateTo []string
-    SyncMode    SyncMode  // Eager, Lazy, Async, Never
-    Priority    int       // For scheduling
-}
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Unique site identifier |
+| `role` | string | yes | `primary`, `burst`, or `backup` |
+| `objectfs.s3_bucket` | string | yes | S3 bucket backing this site |
+| `objectfs.s3_region` | string | yes | AWS region |
+| `objectfs.s3_endpoint` | string | no | Custom endpoint (MinIO, LocalStack, etc.) |
+| `objectfs.mount_point` | string | no | Local filesystem path (informational) |
+| `cargoship.endpoint` | string | no | CargoShip service endpoint |
+| `cargoship.enabled` | bool | no | Enable CargoShip for this site |
+| `network.bandwidth` | int | no | Available bandwidth in bytes/sec |
+| `network.latency` | duration | no | Expected round-trip latency |
 
-type SyncMode string
+### `policy`
 
-const (
-    SyncEager SyncMode = "eager"  // Pre-stage before needed
-    SyncLazy  SyncMode = "lazy"   // Fetch on first access
-    SyncAsync SyncMode = "async"  // Background sync
-    SyncNever SyncMode = "never"  // Never replicate
-)
+Routing rules are evaluated in `priority` order (lower = higher precedence).
+When no rule matches, sites are ordered: primary → backup → burst.
+
+```yaml
+policy:
+  rules:
+    - name: hot-reads
+      key_pattern: "datasets/hot/*"  # glob, prefix (ends with /), or exact
+      operations: [read]             # read, write, delete (empty = all)
+      target_roles: [primary]        # primary, backup, burst (empty = all)
+      priority: 10
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Rule identifier |
+| `key_pattern` | string | Glob (`*`, `**`), prefix ending in `/`, or exact key |
+| `operations` | []string | `read`, `write`, `delete` |
+| `target_roles` | []string | `primary`, `backup`, `burst` |
+| `priority` | int | Evaluation order (lower = first) |
+
+### `resilience`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `health_poll_interval` | duration | `30s` | Background health check cadence |
+| `circuit_breaker.enabled` | bool | `false` | Activate circuit breaking |
+| `circuit_breaker.threshold` | int | `5` | Consecutive failures before circuit opens |
+| `circuit_breaker.cooldown` | duration | `30s` | Time before a probe is allowed after opening |
+| `retry.enabled` | bool | `false` | Activate per-site retry |
+| `retry.max_attempts` | int | `3` | Total attempts per site (1 = no retry) |
+| `retry.initial_delay` | duration | `100ms` | Pause before first retry |
+| `retry.max_delay` | duration | `2s` | Cap on inter-retry pause |
+| `retry.multiplier` | float | `2.0` | Exponential back-off scale factor |
+
+Retry applies only to **read** operations (Get, Head). Writes are fail-fast.
+
+### `cache`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Activate in-memory LRU object cache |
+| `max_bytes` | int | `67108864` | Maximum cache size in bytes (64 MiB) |
+| `ttl` | duration | `0` | Entry TTL; `0` = entries never expire |
+
+The cache is read-through: a Get hit returns data without contacting a site.
+Put and Delete invalidate the affected key so stale data is never returned.
+
+### `performance`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_concurrent_transfers` | int | `8` | Maximum parallel replication jobs |
+| `transfer_chunk_size` | int | `16777216` | Transfer chunk size in bytes (16 MiB) |
+| `cache_size` | string | `1GB` | Passed to ObjectFS (informational) |
+
+---
+
+## CLI Reference
+
+### Global flags
+
+```
+--coordinator-addr  addr   Coordinator HTTP address (env: GLOBALFS_COORDINATOR, default: http://localhost:8090)
+--api-key           key    API key for X-GlobalFS-API-Key auth (env: GLOBALFS_API_KEY)
+--json                     Output in JSON format instead of a table
+```
+
+### `site`
+
+#### `site list`
+
+List registered sites with health and optional circuit state.
+
+```
+globalfs site list [--json]
+```
+
+Output columns: `NAME`, `ROLE`, `STATUS`, and `CIRCUIT` (when a circuit
+breaker is configured).
+
+#### `site add`
+
+Register a new site at runtime without restarting the coordinator.
+
+```
+globalfs site add --name <name> --uri s3://<bucket>[?region=<r>&endpoint=<url>] --role <primary|burst|backup>
+```
+
+#### `site remove`
+
+Deregister a site.
+
+```
+globalfs site remove --name <name>
+```
+
+### `object`
+
+#### `object get`
+
+Download an object to stdout or a file.
+
+```
+globalfs object get <key> [--output <file>]
+```
+
+#### `object put`
+
+Upload an object from stdin or a file.
+
+```
+globalfs object put <key> [--input <file>]
+```
+
+#### `object delete`
+
+Delete an object from all sites.
+
+```
+globalfs object delete <key>
+```
+
+#### `object head`
+
+Show object metadata (size, ETag, last modified).
+
+```
+globalfs object head <key>
+```
+
+#### `object list`
+
+List objects across all sites.
+
+```
+globalfs object list [--prefix <prefix>] [--limit <n>]
+```
+
+### `replicate`
+
+Trigger manual replication of a key between two named sites.
+
+```
+globalfs replicate --key <key> --from <site> --to <site>
+```
+
+### `config`
+
+#### `config init`
+
+Write a starter configuration template to a file (or stdout).
+
+```
+globalfs config init [--output <file>]
+```
+
+#### `config validate`
+
+Validate a YAML configuration file.
+
+```
+globalfs config validate <file>
+```
+
+#### `config show`
+
+Print the resolved configuration (defaults merged with file values).
+
+```
+globalfs config show <file>
+```
+
+### `info`
+
+Print coordinator runtime statistics (version, uptime, site count, queue depth, health summary).
+
+```
+globalfs info [--json]
+```
+
+### `status`
+
+Print overall cluster health. Exits non-zero if any primary site is degraded.
+
+```
+globalfs status
+```
+
+### `version`
+
+Print the CLI version string.
+
+### `completion`
+
+Generate shell completion scripts.
+
+```
+globalfs completion bash|zsh|fish|powershell
 ```
 
 ---
 
-## Implementation Phases
+## API Reference
 
-### Phase 1: Foundation (3-4 months)
-
-**Goal**: Basic 2-site coordinator with lazy replication
-
-**Deliverables**:
-- [x] Project structure and architecture docs
-- [ ] Coordinator service (etcd-based metadata)
-- [ ] ObjectFS client library
-- [ ] Simple namespace mapping (path → site)
-- [ ] Basic replication trigger (manual)
-- [ ] CargoShip integration (file transfer)
-
-**Milestones**:
-- Week 1-2: Project setup, etcd integration
-- Week 3-4: ObjectFS client wrapper
-- Week 5-8: Namespace coordinator
-- Week 9-12: Basic replication with CargoShip
-
-### Phase 2: Intelligent Replication (3-4 months)
-
-**Goal**: Policy-based replication with cache coherency
-
-**Deliverables**:
-- [ ] Policy engine (path patterns, sync modes)
-- [ ] Lease-based cache coherency
-- [ ] Burst detection and auto-scaling
-- [ ] Pre-staging for hot datasets
-- [ ] Progress tracking and monitoring
-
-**Milestones**:
-- Week 1-4: Policy engine implementation
-- Week 5-8: Cache coherency protocol
-- Week 9-12: Burst detection and integration
-
-### Phase 3: Production Hardening (3-4 months)
-
-**Goal**: Enterprise-ready with HA and monitoring
-
-**Deliverables**:
-- [ ] High availability (multi-coordinator)
-- [ ] Failure recovery (site failures, network partitions)
-- [ ] Comprehensive monitoring and metrics
-- [ ] Performance optimization
-- [ ] Security (authentication, encryption)
-- [ ] Documentation and examples
-
-**Milestones**:
-- Week 1-4: HA coordinator (Raft consensus)
-- Week 5-8: Failure recovery testing
-- Week 9-12: Performance tuning and docs
-
----
-
-## Technology Stack
-
-### Core
-
-- **Language**: Go 1.23+ (for consistency with ObjectFS/CargoShip)
-- **Metadata Store**: etcd v3.5+ (distributed, consistent, proven)
-- **RPC Framework**: gRPC (for coordinator-to-site communication)
-- **Configuration**: YAML + Go structs
-
-### Dependencies
-
-- **ObjectFS**: File system operations
-- **CargoShip**: Bulk data transfers
-- **etcd**: Distributed metadata
-- **gRPC**: Inter-component communication
-- **Prometheus**: Metrics and monitoring
-
-### Deployment
-
-- **On-Prem**: systemd services
-- **Cloud**: Kubernetes/ECS
-- **Hybrid**: Consul/Nomad for service discovery
-
----
-
-## Security Model
-
-### Authentication
-
-- **mTLS**: All coordinator-to-site communication encrypted
-- **API Tokens**: For administrative operations
-- **Integration**: Leverage existing ObjectFS/S3 auth
-
-### Authorization
-
-- **Site-level**: Which sites can join cluster
-- **Path-level**: Which sites can access which paths
-- **Policy-based**: Defined in configuration
-
-### Data Protection
-
-- **Encryption at Rest**: Via ObjectFS/S3 backend
-- **Encryption in Transit**: Via CargoShip + mTLS
-- **Audit Logging**: All replication and access events
-
----
-
-## Monitoring and Observability
-
-### Metrics (Prometheus)
+All endpoints are under `http://<coordinator-addr>/`. When API key
+authentication is enabled, every request (except `/healthz` and `/readyz`)
+must carry the header:
 
 ```
-globalfs_site_status{site="onprem",role="primary"} 1
-globalfs_replication_jobs_active 3
-globalfs_replication_bytes_transferred{src="onprem",dst="cloud"} 10737418240
-globalfs_cache_hits{site="cloud"} 1523
-globalfs_cache_misses{site="cloud"} 47
-globalfs_lease_grants_total{type="read"} 5234
-globalfs_lease_invalidations_total 42
+X-GlobalFS-API-Key: <key>
 ```
 
-### Logs (Structured JSON)
+Responses are `application/json`. Error responses have the shape:
+
+```json
+{"error": "message"}
+```
+
+### Health endpoints
+
+#### `GET /healthz`
+
+Returns `200 OK` (body `OK`) when all primary sites are healthy.
+Returns `503 Service Unavailable` (body `DEGRADED\n<site: error>`) otherwise.
+
+Uses the background health cache; falls back to a live check on first startup.
+
+#### `GET /readyz`
+
+Returns `200 OK` once the coordinator has started. Always succeeds after boot.
+
+### Metrics
+
+#### `GET /metrics`
+
+Prometheus metrics. Key metrics:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `globalfs_object_operations_total` | counter | Operations by `operation` and `status` |
+| `globalfs_object_operation_duration_seconds` | histogram | Operation latency |
+| `globalfs_sites_current` | gauge | Number of registered sites |
+| `globalfs_replication_jobs_total` | counter | Replication jobs by `status` |
+| `globalfs_replication_queue_depth` | gauge | Jobs waiting in queue |
+| `globalfs_cache_hits_total` | counter | Cache hits |
+| `globalfs_cache_misses_total` | counter | Cache misses |
+| `globalfs_cache_evictions_total` | counter | Cache evictions |
+| `globalfs_cache_bytes` | gauge | Bytes currently stored in cache |
+
+### Coordinator info
+
+#### `GET /api/v1/info`
 
 ```json
 {
-  "timestamp": "2025-10-16T20:00:00Z",
-  "level": "info",
-  "component": "coordinator",
-  "event": "replication_started",
-  "job_id": "job-5678",
-  "source": "onprem",
-  "destination": "cloud",
-  "files": 15,
-  "total_bytes": 10737418240
+  "version": "0.1.0",
+  "uptime_seconds": 3600.5,
+  "sites": 2,
+  "is_leader": true,
+  "replication_queue_depth": 0,
+  "sites_by_role": {"primary": 1, "burst": 1},
+  "health": {
+    "healthy": 2,
+    "unhealthy": 0,
+    "last_checked_at": "2026-02-22T10:00:00Z"
+  }
 }
 ```
 
-### Tracing (OpenTelemetry)
+### Sites
 
-- End-to-end request tracing
-- Cross-site operation latency
-- Replication job timelines
+#### `GET /api/v1/sites`
 
----
+Returns all registered sites with health and circuit state.
 
-## Comparison with Alternatives
-
-### vs. NFS/CIFS
-
-| Feature | NFS/CIFS | GlobalFS |
-|---------|----------|----------|
-| Cross-site | Poor (WAN latency) | Optimized (local cache) |
-| Consistency | Strong | Tunable |
-| Performance | Network-bound | Cache-accelerated |
-| S3 Integration | None | Native |
-| Burst Support | Manual | Automated |
-
-### vs. Ceph/GlusterFS
-
-| Feature | Ceph/Gluster | GlobalFS |
-|---------|--------------|----------|
-| Setup Complexity | High | Medium |
-| On-prem → Cloud | Complex | Native |
-| S3 Backend | Addon (RGW) | Native (ObjectFS) |
-| Burst Optimization | None | CargoShip |
-| HPC Workload | Good | Optimized |
-
-### vs. Manual Sync (rsync/s3sync)
-
-| Feature | Manual Sync | GlobalFS |
-|---------|-------------|----------|
-| Namespace | Separate | Unified |
-| Automation | Scripts | Policy-based |
-| Cache Coherency | Manual | Automatic |
-| Performance | Basic | Optimized |
-| Burst Integration | Manual | Automated |
-
----
-
-## Future Enhancements
-
-### Multi-Master Writes
-
-Currently, writes go to primary site. Future: allow writes at any site with conflict resolution.
-
-### Automatic Tiering
-
-Move cold data to cheaper storage (S3 Glacier) automatically based on access patterns.
-
-### ML-Based Pre-staging
-
-Use job history and access patterns to predict which data to pre-stage for bursts.
-
-### Multi-Region Support
-
-Extend beyond 2 sites to support multi-region deployments (US, EU, Asia).
-
-### Read-Only Mirrors
-
-Low-cost read-only replicas for disaster recovery.
-
----
-
-## Getting Started
-
-### Prerequisites
-
-```bash
-# ObjectFS installed and configured
-objectfs version  # Should be 0.4.0+
-
-# CargoShip installed
-cargoship version  # Should be 0.4.5+
-
-# etcd cluster running
-etcdctl version  # Should be 3.5+
+```json
+[
+  {
+    "name": "onprem",
+    "role": "primary",
+    "healthy": true,
+    "circuit_state": "closed"
+  },
+  {
+    "name": "cloud",
+    "role": "burst",
+    "healthy": false,
+    "error": "connection timeout",
+    "circuit_state": "open"
+  }
+]
 ```
 
-### Installation
+`circuit_state` is omitted when no circuit breaker is configured.
 
-```bash
-# Clone repository
-git clone https://github.com/yourorg/globalfs
-cd globalfs
+#### `POST /api/v1/sites`
 
-# Build
-make build
+Register a new site. Returns `201 Created`.
 
-# Install
-sudo make install
+```json
+{
+  "name": "cloud2",
+  "role": "burst",
+  "s3_bucket": "my-burst-bucket",
+  "s3_region": "eu-west-1",
+  "s3_endpoint": ""
+}
 ```
 
-### Quick Start
+#### `DELETE /api/v1/sites/{name}`
 
-```bash
-# 1. Start coordinator
-globalfs coordinator start --config coordinator.yaml
+Deregister a site. Returns `204 No Content`.
 
-# 2. Register sites
-globalfs site register onprem --config site-onprem.yaml
-globalfs site register cloud --config site-cloud.yaml
+### Replication
 
-# 3. Mount global namespace
-globalfs mount /globalfs --config globalfs.yaml
+#### `POST /api/v1/replicate`
 
-# 4. Use transparently
-cd /globalfs
-ls  # Shows unified view across sites
-./my-hpc-job --data inputs/data.dat  # Transparent access
+Enqueue manual replication of a key. Returns `202 Accepted`.
+
+```json
+{"key": "datasets/hot/sim.dat", "from": "onprem", "to": "cloud"}
+```
+
+### Objects
+
+All object endpoints accept an arbitrary key path after `/api/v1/objects/`.
+
+#### `GET /api/v1/objects/{key...}`
+
+Returns object data as `application/octet-stream`.
+
+#### `PUT /api/v1/objects/{key...}`
+
+Stores the request body. Returns `201 Created` on success.
+
+#### `DELETE /api/v1/objects/{key...}`
+
+Deletes the object from all sites. Returns `204 No Content`.
+
+#### `HEAD /api/v1/objects/{key...}`
+
+Returns object metadata as response headers:
+
+```
+Content-Length: 1048576
+ETag: "abc123"
+Last-Modified: Sat, 22 Feb 2026 10:00:00 GMT
+```
+
+#### `GET /api/v1/objects?prefix=<p>&limit=<n>`
+
+Lists objects. `prefix` and `limit` are optional. Returns:
+
+```json
+[
+  {"key": "datasets/hot/sim.dat", "size": 1048576, "etag": "abc123", "last_modified": "..."},
+  ...
+]
 ```
 
 ---
 
-## Contributing
+## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+### Requirements
 
----
+- Go 1.26+
+- AWS credentials (profile `aws` or environment variables) for integration tests
 
-## License
+### Build and test
 
-Apache 2.0 - See [LICENSE](LICENSE)
+```bash
+make build          # compile both binaries
+make test           # go test -race ./...
+make lint           # golangci-lint
 
----
+go build ./...      # verify compilation only
+```
 
-## Contact
+### Integration tests
 
-- **Issues**: https://github.com/yourorg/globalfs/issues
-- **Discussions**: https://github.com/yourorg/globalfs/discussions
-- **Slack**: #globalfs on HPC Cloud Workspace
+Integration tests hit real AWS S3. Set the `aws` named profile:
+
+```bash
+AWS_PROFILE=aws AWS_REGION=us-west-2 go test -race -tags=integration ./...
+```
+
+### Pre-commit hooks
+
+The project uses pre-commit hooks (gofmt, go build, golangci-lint,
+markdownlint). They run automatically on `git commit` and auto-fix what they
+can. Re-stage and commit again if files are modified.
+
+### Project layout
+
+```
+cmd/
+  coordinator/    daemon binary (globalfs-coordinator)
+  globalfs/       operator CLI binary (globalfs)
+internal/
+  cache/          in-memory LRU object cache
+  circuitbreaker/ per-site three-state circuit breaker
+  coordinator/    routing, health, replication orchestration
+  lease/          distributed lease manager
+  metadata/       replication job persistence
+  metrics/        Prometheus instrumentation
+  policy/         key-pattern routing rule engine
+  replication/    background async replication worker
+  retry/          exponential back-off retry
+pkg/
+  client/         Go client library
+  config/         YAML configuration types and loader
+  namespace/      multi-site object namespace (priority-merge list)
+  site/           ObjectFS site connection wrapper
+  types/          shared type definitions
+```
 
 ---
 
 ## Related Projects
 
-- **ObjectFS**: https://github.com/scttfrdmn/objectfs
-- **CargoShip**: https://github.com/yourorg/cargoship
-- **etcd**: https://etcd.io
+- **[ObjectFS](https://github.com/scttfrdmn/objectfs)** — POSIX-compliant FUSE filesystem for S3; provides the per-site backend
+- **[CargoShip](https://github.com/scttfrdmn/cargoship)** — streaming archive/upload pipeline for S3 bulk transfers
 
 ---
 
-**Status**: This project is in the design phase. Architecture and APIs are subject to change.
+## License
+
+Apache 2.0 — Copyright 2025-2026 Scott Friedman. See [LICENSE](LICENSE).
