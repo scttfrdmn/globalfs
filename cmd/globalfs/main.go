@@ -43,9 +43,10 @@ import (
 // version is set via -ldflags at build time (see Makefile).
 var version = "0.1.0-alpha"
 
-// coordinatorAddr and jsonOutput are global flags inherited by all subcommands.
+// coordinatorAddr, apiKey, and jsonOutput are global flags inherited by all subcommands.
 var (
 	coordinatorAddr string
+	apiKey          string
 	jsonOutput      bool
 )
 
@@ -70,6 +71,12 @@ func buildRoot() *cobra.Command {
 		"coordinator-addr",
 		envOrDefault("GLOBALFS_COORDINATOR", "http://localhost:8090"),
 		"Coordinator HTTP address (env: GLOBALFS_COORDINATOR)",
+	)
+	root.PersistentFlags().StringVar(
+		&apiKey,
+		"api-key",
+		envOrDefault("GLOBALFS_API_KEY", ""),
+		"API key for X-GlobalFS-API-Key authentication (env: GLOBALFS_API_KEY)",
 	)
 	root.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 
@@ -270,7 +277,7 @@ func buildObjectGetCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			key := args[0]
-			c := client.New(coordinatorAddr)
+			c := newClient()
 			data, err := c.GetObject(context.Background(), key)
 			if err != nil {
 				return err
@@ -330,7 +337,7 @@ func buildObjectPutCmd() *cobra.Command {
 				return fmt.Errorf("read input: %w", err)
 			}
 
-			c := client.New(coordinatorAddr)
+			c := newClient()
 			if err := c.PutObject(context.Background(), key, data); err != nil {
 				return err
 			}
@@ -360,7 +367,7 @@ func buildObjectDeleteCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			key := args[0]
-			c := client.New(coordinatorAddr)
+			c := newClient()
 			if err := c.DeleteObject(context.Background(), key); err != nil {
 				return err
 			}
@@ -382,7 +389,7 @@ func buildObjectHeadCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			key := args[0]
-			c := client.New(coordinatorAddr)
+			c := newClient()
 			info, err := c.HeadObject(context.Background(), key)
 			if err != nil {
 				return err
@@ -416,7 +423,7 @@ func buildObjectListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List objects in the global namespace",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			c := client.New(coordinatorAddr)
+			c := newClient()
 			objects, err := c.ListObjects(context.Background(), prefix, limit)
 			if err != nil {
 				return err
@@ -603,12 +610,29 @@ func buildCompletionCmd(root *cobra.Command) *cobra.Command {
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
+// newClient creates a coordinator client with the current global flags applied.
+func newClient() *client.Client {
+	return client.New(coordinatorAddr, client.WithAPIKey(apiKey))
+}
+
 func apiURL(path string) string {
 	return coordinatorAddr + path
 }
 
+// setAuthHeader adds the API key header to req when a key is configured.
+func setAuthHeader(req *http.Request) {
+	if apiKey != "" {
+		req.Header.Set("X-GlobalFS-API-Key", apiKey)
+	}
+}
+
 func apiGet(path string) (*http.Response, error) {
-	resp, err := httpClient.Get(apiURL(path))
+	req, err := http.NewRequest(http.MethodGet, apiURL(path), nil)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", path, err)
+	}
+	setAuthHeader(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("GET %s: %w", path, err)
 	}
@@ -620,7 +644,13 @@ func apiPost(path string, body any) (*http.Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
-	resp, err := httpClient.Post(apiURL(path), "application/json", bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, apiURL(path), bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("POST %s: %w", path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setAuthHeader(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("POST %s: %w", path, err)
 	}
@@ -632,6 +662,7 @@ func apiDelete(path string) (*http.Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("DELETE %s: %w", path, err)
 	}
+	setAuthHeader(req)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("DELETE %s: %w", path, err)

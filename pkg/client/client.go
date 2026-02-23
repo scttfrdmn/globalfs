@@ -100,12 +100,16 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("coordinator error (%d): %s", e.StatusCode, e.Message)
 }
 
+// apiKeyHeader is the HTTP request header used for authentication.
+const apiKeyHeader = "X-GlobalFS-API-Key"
+
 // ── Client ────────────────────────────────────────────────────────────────────
 
 // Client communicates with a GlobalFS coordinator over HTTP.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
+	apiKey     string // set via WithAPIKey; empty means no auth header is sent
 }
 
 // Option is a functional option for New.
@@ -119,6 +123,19 @@ func WithHTTPClient(hc *http.Client) Option {
 // WithTimeout sets the HTTP client timeout (default 30s).
 func WithTimeout(d time.Duration) Option {
 	return func(c *Client) { c.httpClient.Timeout = d }
+}
+
+// WithAPIKey sets the API key sent as X-GlobalFS-API-Key on every request.
+// Pass an empty string to send no authentication header.
+func WithAPIKey(key string) Option {
+	return func(c *Client) { c.apiKey = key }
+}
+
+// setAPIKey adds the X-GlobalFS-API-Key header to req when an API key is set.
+func (c *Client) setAPIKey(req *http.Request) {
+	if c.apiKey != "" {
+		req.Header.Set(apiKeyHeader, c.apiKey)
+	}
 }
 
 // New creates a Client that speaks to the coordinator at coordinatorAddr.
@@ -346,6 +363,7 @@ func (c *Client) doGet(ctx context.Context, path string) (*http.Response, error)
 	if err != nil {
 		return nil, fmt.Errorf("build GET %s: %w", path, err)
 	}
+	c.setAPIKey(req)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("GET %s: %w", path, err)
@@ -363,6 +381,7 @@ func (c *Client) doPost(ctx context.Context, path string, body any) (*http.Respo
 		return nil, fmt.Errorf("build POST %s: %w", path, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.setAPIKey(req)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("POST %s: %w", path, err)
@@ -376,6 +395,7 @@ func (c *Client) doPut(ctx context.Context, path string, body []byte) (*http.Res
 		return nil, fmt.Errorf("build PUT %s: %w", path, err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
+	c.setAPIKey(req)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("PUT %s: %w", path, err)
@@ -388,6 +408,7 @@ func (c *Client) doHead(ctx context.Context, path string) (*http.Response, error
 	if err != nil {
 		return nil, fmt.Errorf("build HEAD %s: %w", path, err)
 	}
+	c.setAPIKey(req)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HEAD %s: %w", path, err)
@@ -400,6 +421,7 @@ func (c *Client) doDelete(ctx context.Context, path string) (*http.Response, err
 	if err != nil {
 		return nil, fmt.Errorf("build DELETE %s: %w", path, err)
 	}
+	c.setAPIKey(req)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("DELETE %s: %w", path, err)

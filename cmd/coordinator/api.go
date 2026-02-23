@@ -32,6 +32,36 @@ import (
 	"github.com/scttfrdmn/globalfs/pkg/types"
 )
 
+// apiKeyHeader is the HTTP request header checked for authentication.
+const apiKeyHeader = "X-GlobalFS-API-Key"
+
+// ── API key middleware ────────────────────────────────────────────────────────
+
+// apiKeyMiddleware returns an HTTP middleware that enforces API key auth.
+// Requests must carry the correct key in the X-GlobalFS-API-Key header.
+// The /healthz and /readyz endpoints are always exempt (for health probes).
+// When key is empty the middleware is a no-op — auth is disabled.
+func apiKeyMiddleware(key string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if key == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			// Always allow health/readiness probes (no auth needed by load balancers).
+			if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if r.Header.Get(apiKeyHeader) != key {
+				writeError(w, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // ── Request / response types ──────────────────────────────────────────────────
 
 type addSiteRequest struct {

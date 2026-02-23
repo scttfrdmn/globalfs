@@ -47,8 +47,15 @@ func main() {
 	configPath  := flag.String("config", "", "Path to YAML configuration file")
 	logLevelStr := flag.String("log-level", "INFO", "Log level: DEBUG, INFO, WARN, ERROR")
 	bindAddr    := flag.String("bind-addr", "", "HTTP server address (default :8090, or coordinator.listen_addr from config)")
+	apiKeyFlag  := flag.String("api-key", "", "Shared API key for X-GlobalFS-API-Key auth (env: GLOBALFS_API_KEY; empty = disabled)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	// Env var overrides the flag default if the flag was not explicitly set.
+	apiKey := *apiKeyFlag
+	if apiKey == "" {
+		apiKey = os.Getenv("GLOBALFS_API_KEY")
+	}
 
 	if *showVersion {
 		fmt.Printf("globalfs-coordinator %s\n", version)
@@ -134,9 +141,15 @@ func main() {
 	mux.Handle("/metrics", promhttp.Handler())
 	registerAPIRoutes(mux, ctx, c, m)
 
+	var handler http.Handler = mux
+	if apiKey != "" {
+		handler = apiKeyMiddleware(apiKey)(mux)
+		slog.Info("API key authentication enabled")
+	}
+
 	srv := &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}

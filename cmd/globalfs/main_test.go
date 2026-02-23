@@ -622,3 +622,98 @@ func TestObjectList_WithFlags(t *testing.T) {
 		t.Errorf("limit: got %q, want 25", gotLimit)
 	}
 }
+
+// ── API key auth ──────────────────────────────────────────────────────────────
+
+// newAuthTestServer creates a test server that requires apiKey on every request
+// except /healthz and /readyz.
+func newAuthTestServer(t *testing.T, apiKey string, mux *http.ServeMux) string {
+	t.Helper()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" {
+			if r.Header.Get("X-GlobalFS-API-Key") != apiKey {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"error":"unauthorized"}`))
+				return
+			}
+		}
+		mux.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func TestAuth_CorrectKey_SiteList(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[]`))
+	})
+	addr := newAuthTestServer(t, "my-secret", mux)
+
+	out, err := runCmd(t, addr, "--api-key", "my-secret", "site", "list")
+	if err != nil {
+		t.Fatalf("expected success with correct key, got: %v (output: %s)", err, out)
+	}
+}
+
+func TestAuth_MissingKey_SiteList(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[]`))
+	})
+	addr := newAuthTestServer(t, "my-secret", mux)
+
+	_, err := runCmd(t, addr, "site", "list") // no --api-key
+	if err == nil {
+		t.Fatal("expected error when API key is missing")
+	}
+}
+
+func TestAuth_WrongKey_SiteList(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[]`))
+	})
+	addr := newAuthTestServer(t, "my-secret", mux)
+
+	_, err := runCmd(t, addr, "--api-key", "wrong-key", "site", "list")
+	if err == nil {
+		t.Fatal("expected error with wrong API key")
+	}
+}
+
+func TestAuth_EnvVar_SiteList(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[]`))
+	})
+	addr := newAuthTestServer(t, "env-secret", mux)
+
+	t.Setenv("GLOBALFS_API_KEY", "env-secret")
+	out, err := runCmd(t, addr, "site", "list") // no --api-key flag; env var should supply it
+	if err != nil {
+		t.Fatalf("expected success via env var, got: %v (output: %s)", err, out)
+	}
+}
+
+func TestAuth_CorrectKey_ObjectGet(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data"))
+	})
+	addr := newAuthTestServer(t, "obj-key", mux)
+
+	out, err := runCmd(t, addr, "--api-key", "obj-key", "object", "get", "mykey", "--output", "-")
+	if err != nil {
+		t.Fatalf("object get with key: %v (output: %s)", err, out)
+	}
+}

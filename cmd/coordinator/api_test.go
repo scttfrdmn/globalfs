@@ -499,3 +499,115 @@ func TestObjectAPI_FullRoundtrip(t *testing.T) {
 		t.Error("expected non-200 after DELETE")
 	}
 }
+
+// ── apiKeyMiddleware ──────────────────────────────────────────────────────────
+
+func TestAPIKeyMiddleware_NoKey_AllowsAll(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := apiKeyMiddleware("")(inner)
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("no-key middleware: expected 200, got %d", w.Code)
+	}
+}
+
+func TestAPIKeyMiddleware_CorrectKey_Passes(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := apiKeyMiddleware("s3cr3t")(inner)
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	req.Header.Set(apiKeyHeader, "s3cr3t")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("correct key: expected 200, got %d", w.Code)
+	}
+}
+
+func TestAPIKeyMiddleware_MissingKey_Returns401(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := apiKeyMiddleware("s3cr3t")(inner)
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	// no key header
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("missing key: expected 401, got %d", w.Code)
+	}
+}
+
+func TestAPIKeyMiddleware_WrongKey_Returns401(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := apiKeyMiddleware("s3cr3t")(inner)
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	req.Header.Set(apiKeyHeader, "wrong-key")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("wrong key: expected 401, got %d", w.Code)
+	}
+}
+
+func TestAPIKeyMiddleware_HealthzExempt(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := apiKeyMiddleware("s3cr3t")(inner)
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	// deliberately omit the key
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("/healthz should be exempt from auth, got %d", w.Code)
+	}
+}
+
+func TestAPIKeyMiddleware_ReadyzExempt(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := apiKeyMiddleware("s3cr3t")(inner)
+
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("/readyz should be exempt from auth, got %d", w.Code)
+	}
+}
+
+func TestAPIKeyMiddleware_401ResponseBody(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := apiKeyMiddleware("s3cr3t")(inner)
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("401 Content-Type: got %q, want application/json", ct)
+	}
+	var body struct{ Error string }
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode 401 body: %v", err)
+	}
+	if body.Error == "" {
+		t.Error("expected non-empty error field in 401 response")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,6 +30,24 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 // ── New / options ─────────────────────────────────────────────────────────────
+
+// newServerWithKey creates a test server that enforces the given API key and
+// returns a client configured with the same key.
+func newServerWithKey(t *testing.T, key string, mux *http.ServeMux) *client.Client {
+	t.Helper()
+	auth := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-GlobalFS-API-Key") != key {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":"unauthorized"}`))
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(auth)
+	t.Cleanup(srv.Close)
+	return client.New(srv.URL, client.WithAPIKey(key))
+}
 
 func TestNew_DefaultTimeout(t *testing.T) {
 	c := client.New("http://localhost:8090")
@@ -601,5 +620,100 @@ func TestListObjects_Empty(t *testing.T) {
 	}
 	if objects == nil {
 		t.Error("expected non-nil slice for empty result")
+	}
+}
+
+// ── WithAPIKey ────────────────────────────────────────────────────────────────
+
+func TestWithAPIKey_SetsHeader(t *testing.T) {
+	var gotKey string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("X-GlobalFS-API-Key")
+		writeJSON(w, http.StatusOK, []client.SiteInfo{})
+	})
+	c := newServerWithKey(t, "my-secret", mux)
+
+	_, err := c.ListSites(context.Background())
+	if err != nil {
+		t.Fatalf("ListSites: %v", err)
+	}
+	if gotKey != "my-secret" {
+		t.Errorf("X-GlobalFS-API-Key header: got %q, want %q", gotKey, "my-secret")
+	}
+}
+
+func TestWithAPIKey_MissingKey_Returns401(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, []client.SiteInfo{})
+	})
+	// Server requires a key, but client has none.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-GlobalFS-API-Key") != "required" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	c := client.New(srv.URL) // no api key
+
+	_, err := c.ListSites(context.Background())
+	if err == nil {
+		t.Fatal("expected error when API key is missing")
+	}
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 APIError, got: %v", err)
+	}
+}
+
+func TestWithAPIKey_SetsHeaderOnAllMethods(t *testing.T) {
+	const key = "test-key-123"
+	var gotKeys []string
+	var mu sync.Mutex
+
+	mux := http.NewServeMux()
+	capture := func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotKeys = append(gotKeys, r.Header.Get("X-GlobalFS-API-Key"))
+		mu.Unlock()
+	}
+	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		capture(w, r)
+		writeJSON(w, http.StatusOK, []client.SiteInfo{})
+	})
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		capture(w, r)
+		w.WriteHeader(http.StatusCreated)
+	})
+	mux.HandleFunc("GET /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		capture(w, r)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data"))
+	})
+	mux.HandleFunc("DELETE /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		capture(w, r)
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	c := newServerWithKey(t, key, mux)
+	ctx := context.Background()
+
+	c.ListSites(ctx)
+	c.PutObject(ctx, "k", []byte("v"))
+	c.GetObject(ctx, "k")
+	c.DeleteObject(ctx, "k")
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i, got := range gotKeys {
+		if got != key {
+			t.Errorf("call %d: X-GlobalFS-API-Key = %q, want %q", i, got, key)
+		}
+	}
+	if len(gotKeys) != 4 {
+		t.Errorf("expected 4 requests, got %d", len(gotKeys))
 	}
 }
