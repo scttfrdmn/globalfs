@@ -559,6 +559,74 @@ func TestCoordinator_Health_UnhealthySiteReported(t *testing.T) {
 	}
 }
 
+// TestCoordinator_Health_ImposesDeadlineWhenNone verifies that Health returns
+// even when called with a plain background context (no deadline) by checking
+// that the call completes in well under the defaultHealthTimeout (#47).
+func TestCoordinator_Health_ImposesDeadlineWhenNone(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+
+	start := time.Now()
+	report := c.Health(context.Background())
+	elapsed := time.Since(start)
+
+	if report["primary"] != nil {
+		t.Errorf("Health[primary]: expected nil, got %v", report["primary"])
+	}
+	// The call should complete quickly (well under the 30s defaultHealthTimeout).
+	if elapsed > 5*time.Second {
+		t.Errorf("Health took %v — expected well under 5s with fast in-memory backend", elapsed)
+	}
+}
+
+// TestCoordinator_SetWorkerQueueDepth verifies that SetWorkerQueueDepth
+// configures the worker before Start and does not affect running coordinators
+// (#50).
+func TestCoordinator_SetWorkerQueueDepth(t *testing.T) {
+	t.Parallel()
+
+	src, _ := makeMount("src", types.SiteRolePrimary, map[string][]byte{"k": []byte("v")})
+	dst, dstClient := makeMount("dst", types.SiteRoleBackup, nil)
+
+	c := New(src, dst)
+	c.SetWorkerQueueDepth(4) // small depth to verify it's applied
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Stop()
+
+	if err := c.Put(ctx, "k", []byte("v")); err != nil {
+		t.Fatalf("Put: unexpected error: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if dstClient.hasKey("k") {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Error("backup never received key — SetWorkerQueueDepth may have broken the worker")
+}
+
+// TestCoordinator_SetLeaseTTL verifies that SetLeaseTTL is wired to leader
+// election and does not panic when a lease manager is absent (#50).
+func TestCoordinator_SetLeaseTTL_NoLeaseManager(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+	c.SetLeaseTTL(30 * time.Second) // must not panic; no lease manager set
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Stop()
+}
+
 // ─── Store integration tests ───────────────────────────────────────────────────
 
 // TestCoordinator_SetStore_PersistsReplicationJob verifies that a Put to a

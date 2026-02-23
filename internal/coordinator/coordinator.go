@@ -58,6 +58,7 @@ type Coordinator struct {
 	leaseManager *lease.Manager     // optional; nil means single-node mode
 	leaderLease  *lease.Lease       // non-nil when this instance is the leader
 	leaderCancel context.CancelFunc // cancels the leaderCtx
+	leaseTTL     time.Duration      // 0 → defaultLeaseTTL
 
 	// Background health polling.
 	healthPollInterval time.Duration   // 0 → use defaultHealthPollInterval
@@ -78,6 +79,13 @@ type Coordinator struct {
 // defaultHealthPollInterval is the cadence for background site health checks
 // when no explicit interval has been set via SetHealthPollInterval.
 const defaultHealthPollInterval = 30 * time.Second
+
+// defaultLeaseTTL is the leader-lease TTL used when none is configured.
+const defaultLeaseTTL = 15 * time.Second
+
+// defaultHealthTimeout is the maximum duration Health waits for all goroutines
+// when the caller supplies a context without a deadline.
+const defaultHealthTimeout = 30 * time.Second
 
 // New creates a Coordinator from an ordered list of SiteMounts.
 //
@@ -150,6 +158,26 @@ func (c *Coordinator) SetHealthPollInterval(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.healthPollInterval = d
+}
+
+// SetLeaseTTL sets the TTL used when acquiring the distributed leader lease.
+// When 0 (the default), defaultLeaseTTL (15 s) is used.
+// Must be called before Start.
+func (c *Coordinator) SetLeaseTTL(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.leaseTTL = d
+}
+
+// SetWorkerQueueDepth configures the replication worker queue depth.
+// Must be called before Start; has no effect if Start has already been called.
+// Pass 0 to retain the existing depth (default 512).
+func (c *Coordinator) SetWorkerQueueDepth(depth int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if depth > 0 {
+		c.worker = replication.NewWorker(depth)
+	}
 }
 
 // SetCircuitBreaker registers a circuit breaker with the coordinator.
@@ -252,7 +280,11 @@ func (c *Coordinator) start(ctx context.Context) {
 	workerCtx := ctx
 
 	if mgr != nil {
-		l, acquired, err := mgr.TryAcquire(ctx, "coordinator/leader", 15*time.Second)
+		leaseTTL := c.leaseTTL
+		if leaseTTL <= 0 {
+			leaseTTL = defaultLeaseTTL
+		}
+		l, acquired, err := mgr.TryAcquire(ctx, "coordinator/leader", leaseTTL)
 		if err != nil {
 			log.Printf("coordinator: acquire leader lease: %v; running in standby mode", err)
 			return
@@ -368,7 +400,9 @@ func (c *Coordinator) AddSite(s *site.SiteMount) {
 	defer c.mu.Unlock()
 	c.sites = append(c.sites, s)
 	c.ns.AddSite(s)
-	c.m.SetSiteCount(len(c.sites))
+	if c.m != nil {
+		c.m.SetSiteCount(len(c.sites))
+	}
 }
 
 // RemoveSite removes the site with the given name.
@@ -384,7 +418,9 @@ func (c *Coordinator) RemoveSite(name string) {
 	}
 	c.sites = filtered
 	c.ns = namespace.New(c.sites...)
-	c.m.SetSiteCount(len(c.sites))
+	if c.m != nil {
+		c.m.SetSiteCount(len(c.sites))
+	}
 }
 
 // Sites returns a snapshot of the current site list (highest priority first).
@@ -398,7 +434,16 @@ func (c *Coordinator) Sites() []*site.SiteMount {
 
 // Health returns a per-site health report.
 // A nil error means the site is healthy; checks run concurrently.
+//
+// If ctx carries no deadline, a defaultHealthTimeout deadline is imposed so
+// that per-site goroutines cannot block indefinitely on unreachable sites.
 func (c *Coordinator) Health(ctx context.Context) map[string]error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultHealthTimeout)
+		defer cancel()
+	}
+
 	c.mu.RLock()
 	snapshot := c.snapshotSites()
 	c.mu.RUnlock()
@@ -919,8 +964,10 @@ func (c *Coordinator) drainWorkerEvents(ctx context.Context, store metadata.Stor
 						log.Printf("coordinator: delete job %q from store: %v", id, err)
 					}
 				}
-				c.m.RecordReplication(string(ev.Type))
-				c.m.SetReplicationQueueDepth(c.worker.QueueDepth())
+				if c.m != nil {
+					c.m.RecordReplication(string(ev.Type))
+					c.m.SetReplicationQueueDepth(c.worker.QueueDepth())
+				}
 			}
 		case <-ctx.Done():
 			return

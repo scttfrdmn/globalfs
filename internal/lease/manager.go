@@ -348,7 +348,11 @@ func (b *memBackend) keepAlive(ctx context.Context, leaseID int64) <-chan struct
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = b.revoke(context.Background(), leaseID)
+			// Use a bounded context so the goroutine cannot block indefinitely
+			// if revoke ever contends on the mutex or gains a real network call.
+			revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer revokeCancel()
+			_ = b.revoke(revokeCtx, leaseID)
 		case <-l.lost:
 			// Already gone; goroutine exits cleanly.
 		}

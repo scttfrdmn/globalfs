@@ -132,6 +132,18 @@ func main() {
 	m := metrics.New(prometheus.DefaultRegisterer)
 	c.SetMetrics(m)
 
+	// ── Leader lease TTL (from coordinator.lease_timeout) ─────────────────────
+	if cfg.Coordinator.LeaseTimeout > 0 {
+		c.SetLeaseTTL(cfg.Coordinator.LeaseTimeout)
+		slog.Info("leader lease TTL configured", "ttl", cfg.Coordinator.LeaseTimeout)
+	}
+
+	// ── Replication worker queue depth (from performance.max_concurrent_transfers) ─
+	if cfg.Performance.MaxConcurrentTransfers > 0 {
+		c.SetWorkerQueueDepth(cfg.Performance.MaxConcurrentTransfers)
+		slog.Info("replication worker depth configured", "depth", cfg.Performance.MaxConcurrentTransfers)
+	}
+
 	// ── Resilience: health polling ────────────────────────────────────────────
 	// Priority: explicit --health-poll-interval flag > resilience.health_poll_interval
 	// in config > built-in default (30s inside coordinator.Start).

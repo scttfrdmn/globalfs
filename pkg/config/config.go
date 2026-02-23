@@ -162,9 +162,6 @@ type SiteConfig struct {
 
 	// CargoShip configuration
 	CargoShip CargoShipConfig `yaml:"cargoship"`
-
-	// Network configuration
-	Network types.NetworkConfig `yaml:"network"`
 }
 
 // ObjectFSConfig contains ObjectFS-specific settings for a site.
@@ -201,17 +198,14 @@ func NewDefault() *Configuration {
 			MetricsPort:    9090,
 		},
 		Coordinator: types.CoordinatorConfig{
-			ListenAddr:          ":8080",
-			EtcdEndpoints:       []string{"localhost:2379"},
-			LeaseTimeout:        60 * time.Second,
-			HealthCheckInterval: 30 * time.Second,
+			ListenAddr:    ":8080",
+			EtcdEndpoints: []string{"localhost:2379"},
+			LeaseTimeout:  60 * time.Second,
 		},
 		Sites:    []SiteConfig{},
 		Policies: []types.ReplicationPolicy{},
 		Performance: types.PerformanceConfig{
 			MaxConcurrentTransfers: 8,
-			TransferChunkSize:      16 * 1024 * 1024, // 16MB
-			CacheSize:              "1GB",
 		},
 		Resilience: ResilienceConfig{
 			HealthPollInterval: 30 * time.Second,

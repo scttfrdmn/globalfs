@@ -17,7 +17,6 @@ coordinator:
     - "localhost:2380"
     - "localhost:2381"
   lease_timeout: 60s
-  health_check_interval: 30s
 
 # Site definitions
 sites:
@@ -32,9 +31,6 @@ sites:
     cargoship:
       endpoint: http://cargoship-onprem:8081
       enabled: true
-    network:
-      bandwidth: 10000000000  # 10 Gbps
-      latency: 0s
 
   # AWS cloud burst site
   - name: cloud
@@ -46,9 +42,6 @@ sites:
     cargoship:
       endpoint: http://cargoship-cloud:8081
       enabled: true
-    network:
-      bandwidth: 1000000000  # 1 Gbps
-      latency: 50ms
 
 # Replication policies
 policies:
@@ -98,8 +91,6 @@ policies:
 # Performance tuning
 performance:
   max_concurrent_transfers: 8
-  transfer_chunk_size: 16777216  # 16MB
-  cache_size: "4GB"
 
 # Resilience settings — fault tolerance for read routing
 resilience:

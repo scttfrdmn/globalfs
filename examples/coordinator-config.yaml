@@ -37,7 +37,6 @@ coordinator:
     - "localhost:2379"
 
   lease_timeout: 60s
-  health_check_interval: 30s
 
 # ── Site definitions ───────────────────────────────────────────────────────────
 #
@@ -126,5 +125,3 @@ policy:
 
 performance:
   max_concurrent_transfers: 8
-  transfer_chunk_size: 16777216  # 16 MiB
-  cache_size: "4GB"

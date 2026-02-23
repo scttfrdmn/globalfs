@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.5] - 2026-02-23
+
+### Fixed
+- `cache.Invalidate` now uses a two-pass approach (collect matching elements, then remove) to avoid the undefined Go behaviour of modifying a map during range iteration, which could silently skip entries (#45)
+- API key comparison replaced with `crypto/subtle.ConstantTimeCompare` to eliminate timing side-channel vulnerability in `X-GlobalFS-API-Key` validation (#46)
+- `Coordinator.Health` now imposes a 30-second deadline when the caller's context has no deadline, preventing per-site goroutines from blocking indefinitely on unreachable sites (#47)
+- `circuitbreaker.Breaker.State` now writes the Open → HalfOpen transition back to the internal state (matching `Allow`), so the reported state is consistent with subsequent `Allow` calls (#48)
+- `memBackend.keepAlive` goroutine uses `context.WithTimeout(5s)` for the revoke call instead of `context.Background()`, bounding the goroutine's lifetime if revoke ever contends on the lock (#49)
+- `Coordinator.AddSite`, `RemoveSite`, and `drainWorkerEvents` now guard `c.m` calls with explicit `if c.m != nil` checks rather than relying implicitly on nil-safe receivers (#51)
+
+### Changed
+- `CoordinatorConfig.HealthCheckInterval` field removed; use `resilience.health_poll_interval` (already wired since v0.1.0) (#50)
+- `NetworkConfig` type and `SiteConfig.Network` field removed; bandwidth and latency were never consumed by the coordinator daemon (#50)
+- `PerformanceConfig.TransferChunkSize` and `PerformanceConfig.CacheSize` fields removed; they were parsed but had no runtime effect (#50)
+- `CoordinatorConfig.LeaseTimeout` is now consumed: the coordinator daemon calls `SetLeaseTTL` at startup, configuring the distributed leader-lease TTL (#50)
+- `PerformanceConfig.MaxConcurrentTransfers` is now consumed: the coordinator daemon calls `SetWorkerQueueDepth` at startup, setting the replication worker queue capacity (#50)
+- `coordinator.Coordinator` gains two new configuration methods: `SetLeaseTTL(time.Duration)` and `SetWorkerQueueDepth(int)`; both must be called before `Start` (#50)
+
+---
+
 ## [0.1.4] - 2026-02-23
 
 ### Fixed

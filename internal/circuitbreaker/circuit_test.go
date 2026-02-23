@@ -246,6 +246,31 @@ func TestBreaker_StateString(t *testing.T) {
 	}
 }
 
+// TestBreaker_State_TransitionsHalfOpenBeforeAllow verifies that State writes
+// the Open → HalfOpen transition when the cooldown elapses, so that a
+// subsequent Allow call still correctly grants the probe (#48).
+func TestBreaker_State_TransitionsHalfOpenBeforeAllow(t *testing.T) {
+	t.Parallel()
+
+	b := circuitbreaker.New(1, 5*time.Millisecond)
+	b.RecordFailure("site-a")
+	time.Sleep(20 * time.Millisecond)
+
+	// Call State BEFORE Allow: must report HalfOpen and persist the transition.
+	if got := b.State("site-a"); got != circuitbreaker.StateHalfOpen {
+		t.Fatalf("State after cooldown: got %v, want HalfOpen", got)
+	}
+
+	// Allow must still grant the probe even though State already transitioned.
+	if !b.Allow("site-a") {
+		t.Error("Allow should return true for the first HalfOpen probe")
+	}
+	// A second Allow must be blocked (probe in flight).
+	if b.Allow("site-a") {
+		t.Error("second Allow should return false (probe already in flight)")
+	}
+}
+
 // TestBreaker_ConcurrentSafe verifies that concurrent Allow/RecordSuccess/
 // RecordFailure calls on the same resource do not race.
 func TestBreaker_ConcurrentSafe(t *testing.T) {

@@ -153,15 +153,18 @@ func (b *Breaker) RecordFailure(name string) {
 	}
 }
 
-// State returns the current circuit state for the named resource without
-// modifying it.  Resources that have never been seen are reported as Closed.
+// State returns the current circuit state for the named resource.
+// When the cooldown has elapsed on an Open circuit, State writes the
+// Open → HalfOpen transition so that subsequent Allow calls see a consistent
+// state (matching the behaviour of Allow itself).
+// Resources that have never been seen are reported as Closed.
 func (b *Breaker) State(name string) State {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if s, ok := b.resources[name]; ok {
-		// Re-evaluate Open → HalfOpen transition for accurate reporting.
+		// Persist Open → HalfOpen transition for consistency with Allow.
 		if s.state == StateOpen && time.Since(s.openedAt) >= b.cooldown {
-			return StateHalfOpen
+			s.state = StateHalfOpen
 		}
 		return s.state
 	}

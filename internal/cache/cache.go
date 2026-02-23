@@ -168,10 +168,16 @@ func (c *Cache) Invalidate(prefix string) {
 		return
 	}
 
+	// Two-pass: collect first, then remove.  Modifying a map during range
+	// can skip entries; collecting keys avoids that undefined behaviour.
+	var toRemove []*list.Element
 	for key, el := range c.index {
 		if strings.HasPrefix(key, prefix) {
-			c.removeElement(el)
+			toRemove = append(toRemove, el)
 		}
+	}
+	for _, el := range toRemove {
+		c.removeElement(el)
 	}
 }
 

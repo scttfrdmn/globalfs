@@ -114,30 +114,14 @@ type CoordinatorConfig struct {
 	// EtcdEndpoints are the etcd cluster endpoints.
 	EtcdEndpoints []string `json:"etcd_endpoints"`
 
-	// LeaseTimeout is the default lease timeout duration.
+	// LeaseTimeout is the TTL used when acquiring the distributed leader lease.
+	// The coordinator daemon reads this and passes it to SetLeaseTTL at startup.
 	LeaseTimeout time.Duration `json:"lease_timeout"`
-
-	// HealthCheckInterval is how often to check site health.
-	HealthCheckInterval time.Duration `json:"health_check_interval"`
-}
-
-// NetworkConfig contains network-related configuration.
-type NetworkConfig struct {
-	// Bandwidth is the available bandwidth in bytes/sec.
-	Bandwidth int64 `json:"bandwidth"`
-
-	// Latency is the average network latency to other sites.
-	Latency time.Duration `json:"latency"`
 }
 
 // PerformanceConfig contains performance tuning settings.
 type PerformanceConfig struct {
-	// MaxConcurrentTransfers limits concurrent replication jobs.
+	// MaxConcurrentTransfers sets the replication worker queue depth.
+	// The coordinator daemon reads this and passes it to SetWorkerQueueDepth at startup.
 	MaxConcurrentTransfers int `json:"max_concurrent_transfers"`
-
-	// TransferChunkSize is the size of transfer chunks in bytes.
-	TransferChunkSize int64 `json:"transfer_chunk_size"`
-
-	// CacheSize is the size of the local metadata cache.
-	CacheSize string `json:"cache_size"`
 }

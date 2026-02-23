@@ -116,6 +116,32 @@ func TestCache_InvalidateAll(t *testing.T) {
 	}
 }
 
+// TestCache_Invalidate_AllMatchingKeysRemoved verifies that all entries whose
+// key starts with the prefix are removed, not just some of them.  This is the
+// regression test for the map-modification-during-range bug (#45).
+func TestCache_Invalidate_AllMatchingKeysRemoved(t *testing.T) {
+	t.Parallel()
+	c := New(Config{})
+	const n = 20
+	for i := 0; i < n; i++ {
+		c.Put(fmt.Sprintf("pfx/%d", i), []byte("v"))
+	}
+	c.Put("other", []byte("keep"))
+	c.Invalidate("pfx/")
+
+	if c.Len() != 1 {
+		t.Errorf("expected 1 entry after Invalidate(\"pfx/\"), got %d", c.Len())
+	}
+	if _, ok := c.Get("other"); !ok {
+		t.Error("non-matching key should survive Invalidate")
+	}
+	for i := 0; i < n; i++ {
+		if _, ok := c.Get(fmt.Sprintf("pfx/%d", i)); ok {
+			t.Errorf("pfx/%d should have been invalidated", i)
+		}
+	}
+}
+
 // ── LRU eviction ─────────────────────────────────────────────────────────────
 
 func TestCache_EvictsLRUWhenBudgetExceeded(t *testing.T) {
