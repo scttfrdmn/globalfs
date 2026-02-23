@@ -428,6 +428,69 @@ func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.Obje
 	return nil, fmt.Errorf("coordinator: Head %q failed on all sites: %w", key, lastErr)
 }
 
+// ── Site information ──────────────────────────────────────────────────────────
+
+// SiteInfo is a read-only snapshot of a site's name, role, and health.
+type SiteInfo struct {
+	Name    string         `json:"name"`
+	Role    types.SiteRole `json:"role"`
+	Healthy bool           `json:"healthy"`
+	Error   string         `json:"error,omitempty"`
+}
+
+// SiteInfos returns a health-annotated snapshot of all registered sites.
+// Health checks run concurrently; the call blocks until all complete.
+func (c *Coordinator) SiteInfos(ctx context.Context) []SiteInfo {
+	c.mu.RLock()
+	snapshot := c.snapshotSites()
+	c.mu.RUnlock()
+
+	report := c.Health(ctx)
+
+	infos := make([]SiteInfo, len(snapshot))
+	for i, s := range snapshot {
+		info := SiteInfo{Name: s.Name(), Role: s.Role(), Healthy: true}
+		if err := report[s.Name()]; err != nil {
+			info.Healthy = false
+			info.Error = err.Error()
+		}
+		infos[i] = info
+	}
+	return infos
+}
+
+// Replicate enqueues a direct replication of key from fromSite to toSite,
+// bypassing the policy engine.  Both site names must be registered.
+// The job is processed asynchronously by the background worker.
+func (c *Coordinator) Replicate(ctx context.Context, key, fromSite, toSite string) error {
+	c.mu.RLock()
+	snapshot := c.snapshotSites()
+	c.mu.RUnlock()
+
+	var src, dst *site.SiteMount
+	for _, s := range snapshot {
+		switch s.Name() {
+		case fromSite:
+			src = s
+		case toSite:
+			dst = s
+		}
+	}
+	if src == nil {
+		return fmt.Errorf("coordinator: replicate: source site %q not found", fromSite)
+	}
+	if dst == nil {
+		return fmt.Errorf("coordinator: replicate: destination site %q not found", toSite)
+	}
+
+	c.worker.Enqueue(replication.ReplicationJob{
+		SourceSite: src,
+		DestSite:   dst,
+		Key:        key,
+	})
+	return nil
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 // snapshotSites returns a copy of c.sites. Caller must hold at least RLock.

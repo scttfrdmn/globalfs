@@ -127,6 +127,7 @@ func main() {
 	mux.HandleFunc("/healthz", healthzHandler(c))
 	mux.HandleFunc("/readyz", readyzHandler())
 	mux.Handle("/metrics", promhttp.Handler())
+	registerAPIRoutes(mux, ctx, c)
 
 	srv := &http.Server{
 		Addr:         addr,

@@ -3,17 +3,22 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
 BINDIR  := bin
 
-.PHONY: all build build-coordinator test lint fmt clean
+.PHONY: all build build-coordinator build-cli test lint fmt clean
 
 all: build
 
 ## build: compile all binaries
-build: build-coordinator
+build: build-coordinator build-cli
 
 ## build-coordinator: compile the globalfs-coordinator daemon
 build-coordinator:
 	@mkdir -p $(BINDIR)
 	go build $(LDFLAGS) -o $(BINDIR)/globalfs-coordinator ./cmd/coordinator
+
+## build-cli: compile the globalfs operator CLI
+build-cli:
+	@mkdir -p $(BINDIR)
+	go build $(LDFLAGS) -o $(BINDIR)/globalfs ./cmd/globalfs
 
 ## test: run all tests with the race detector
 test:
