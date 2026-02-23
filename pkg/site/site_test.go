@@ -19,6 +19,18 @@ type mockClient struct {
 	closed    bool
 }
 
+func (m *mockClient) Get(_ context.Context, key string, _, _ int64) ([]byte, error) {
+	for _, o := range m.objects {
+		if o.Key == key {
+			return make([]byte, o.Size), nil
+		}
+	}
+	return nil, errors.New("not found")
+}
+
+func (m *mockClient) Put(_ context.Context, _ string, _ []byte) error  { return nil }
+func (m *mockClient) Delete(_ context.Context, _ string) error          { return nil }
+
 func (m *mockClient) List(_ context.Context, prefix string, limit int) ([]objectfstypes.ObjectInfo, error) {
 	if m.listErr != nil {
 		return nil, m.listErr

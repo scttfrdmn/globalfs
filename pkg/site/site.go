@@ -17,6 +17,13 @@ import (
 // Expressed as an interface so that tests can supply a lightweight mock
 // instead of a real S3-backed client.
 type ObjectFSClient interface {
+	// Get retrieves the bytes for the object at key.
+	// Pass offset=0, size=0 to fetch the entire object.
+	Get(ctx context.Context, key string, offset, size int64) ([]byte, error)
+	// Put stores data under key.
+	Put(ctx context.Context, key string, data []byte) error
+	// Delete removes the object at key. Deleting a non-existent key is a no-op.
+	Delete(ctx context.Context, key string) error
 	List(ctx context.Context, prefix string, limit int) ([]objectfstypes.ObjectInfo, error)
 	Head(ctx context.Context, key string) (*objectfstypes.ObjectInfo, error)
 	Health(ctx context.Context) error
@@ -71,6 +78,22 @@ func (m *SiteMount) Name() string { return m.name }
 
 // Role returns the site's role (primary, burst, backup).
 func (m *SiteMount) Role() types.SiteRole { return m.role }
+
+// Get retrieves the full content of the object at key.
+// Pass offset=0, size=0 to fetch the entire object.
+func (m *SiteMount) Get(ctx context.Context, key string, offset, size int64) ([]byte, error) {
+	return m.client.Get(ctx, key, offset, size)
+}
+
+// Put stores data under key in this site's object store.
+func (m *SiteMount) Put(ctx context.Context, key string, data []byte) error {
+	return m.client.Put(ctx, key, data)
+}
+
+// Delete removes the object at key from this site's object store.
+func (m *SiteMount) Delete(ctx context.Context, key string) error {
+	return m.client.Delete(ctx, key)
+}
 
 // List returns up to limit ObjectInfo entries whose keys begin with prefix
 // from this site's object store.  Pass limit ≤ 0 to retrieve all matches.

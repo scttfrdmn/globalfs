@@ -1,6 +1,6 @@
 # Binaries
-globalfs
-coordinator
+/globalfs
+/coordinator
 *.exe
 *.dll
 *.so
