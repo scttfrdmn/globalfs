@@ -30,6 +30,7 @@ import (
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
+	"github.com/scttfrdmn/globalfs/internal/lease"
 	"github.com/scttfrdmn/globalfs/internal/metadata"
 	"github.com/scttfrdmn/globalfs/internal/policy"
 	"github.com/scttfrdmn/globalfs/internal/replication"
@@ -40,14 +41,17 @@ import (
 
 // Coordinator routes object operations across a prioritized set of SiteMounts.
 type Coordinator struct {
-	mu          sync.RWMutex
-	sites       []*site.SiteMount
-	ns          *namespace.Namespace
-	policy      *policy.Engine  // never nil; default = empty engine
-	worker      *replication.Worker
-	store       metadata.Store  // optional; nil means no persistence
-	storeCancel context.CancelFunc
-	storeWg     sync.WaitGroup
+	mu           sync.RWMutex
+	sites        []*site.SiteMount
+	ns           *namespace.Namespace
+	policy       *policy.Engine // never nil; default = empty engine
+	worker       *replication.Worker
+	store        metadata.Store     // optional; nil means no persistence
+	storeCancel  context.CancelFunc
+	storeWg      sync.WaitGroup
+	leaseManager *lease.Manager     // optional; nil means single-node mode
+	leaderLease  *lease.Lease       // non-nil when this instance is the leader
+	leaderCancel context.CancelFunc // cancels the leaderCtx
 }
 
 // New creates a Coordinator from an ordered list of SiteMounts.
@@ -91,44 +95,116 @@ func (c *Coordinator) SetStore(s metadata.Store) {
 	c.store = s
 }
 
+// SetLeaseManager registers a distributed lease manager.
+//
+// When set, Start attempts to acquire the "coordinator/leader" lease before
+// launching the replication worker.  If this instance is not the leader, the
+// worker is not started and the coordinator operates in standby mode (writes
+// still reach primary sites synchronously, but async replication is skipped).
+//
+// SetLeaseManager must be called before Start.
+func (c *Coordinator) SetLeaseManager(mgr *lease.Manager) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.leaseManager = mgr
+}
+
 // Start launches the background replication worker.
 // It is safe to call Start multiple times; only the first call has effect.
+//
+// If a LeaseManager has been registered via SetLeaseManager, Start attempts to
+// acquire the "coordinator/leader" lease.  Only the leader starts the worker;
+// if another instance already holds the lease this coordinator enters standby
+// mode and Start returns without launching any background goroutines.
 //
 // If a Store has been registered via SetStore, Start also recovers any pending
 // jobs from the previous run and begins draining worker events to keep the
 // store in sync.
 func (c *Coordinator) Start(ctx context.Context) {
 	c.mu.Lock()
+	mgr := c.leaseManager
 	store := c.store
 	c.mu.Unlock()
 
+	// workerCtx is cancelled when the lease is lost (if a lease manager is set).
+	workerCtx := ctx
+
+	if mgr != nil {
+		l, acquired, err := mgr.TryAcquire(ctx, "coordinator/leader", 15*time.Second)
+		if err != nil {
+			log.Printf("coordinator: acquire leader lease: %v; running in standby mode", err)
+			return
+		}
+		if !acquired {
+			log.Printf("coordinator: another instance holds the leader lease; running in standby mode")
+			return
+		}
+		log.Printf("coordinator: acquired leader lease")
+
+		leaderCtx, leaderCancel := context.WithCancel(ctx)
+		lostCh := l.KeepAlive(leaderCtx)
+
+		c.mu.Lock()
+		c.leaderLease = l
+		c.leaderCancel = leaderCancel
+		c.mu.Unlock()
+
+		// Transition to standby when the lease is lost.
+		go func() {
+			defer leaderCancel()
+			select {
+			case <-lostCh:
+				log.Printf("coordinator: lost leader lease; transitioning to standby mode")
+			case <-leaderCtx.Done():
+			}
+		}()
+
+		workerCtx = leaderCtx
+	}
+
 	if store != nil {
-		storeCtx, cancel := context.WithCancel(ctx)
+		storeCtx, cancel := context.WithCancel(workerCtx)
 		c.mu.Lock()
 		c.storeCancel = cancel
 		c.mu.Unlock()
 
-		c.recoverPendingJobs(ctx, store)
+		c.recoverPendingJobs(workerCtx, store)
 		c.storeWg.Add(1)
 		go func() {
 			defer c.storeWg.Done()
 			c.drainWorkerEvents(storeCtx, store)
 		}()
 	}
-	c.worker.Start(ctx)
+	c.worker.Start(workerCtx)
 }
 
 // Stop signals the background replication worker to stop and waits for it to
-// finish the current job.  Calling Stop before Start is safe.
+// finish the current job.  If a leader lease is held it is released so that a
+// standby coordinator can take over immediately.  Calling Stop before Start is
+// safe.
 func (c *Coordinator) Stop() {
 	c.mu.Lock()
-	cancel := c.storeCancel
+	storeCancel := c.storeCancel
+	leaderCancel := c.leaderCancel
+	l := c.leaderLease
 	c.mu.Unlock()
-	if cancel != nil {
-		cancel()
+
+	// Cancel both contexts: stops the drain goroutine and keepalive goroutine.
+	if leaderCancel != nil {
+		leaderCancel()
+	}
+	if storeCancel != nil {
+		storeCancel()
 	}
 	c.storeWg.Wait()
 	c.worker.Stop()
+
+	// Release the leader lease last so a standby can take over quickly.
+	if l != nil {
+		if err := l.Release(); err != nil {
+			log.Printf("coordinator: release leader lease: %v", err)
+		}
+	}
 }
 
 // Close stops background work and closes all sites.

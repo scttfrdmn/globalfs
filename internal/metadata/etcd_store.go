@@ -68,6 +68,13 @@ func NewEtcdStore(ctx context.Context, cfg EtcdConfig) (*EtcdStore, error) {
 	return &EtcdStore{client: cli, prefix: prefix}, nil
 }
 
+// Client returns the underlying etcd client.  The returned value must not be
+// closed by the caller; use [EtcdStore.Close] to release the connection.
+func (e *EtcdStore) Client() *clientv3.Client { return e.client }
+
+// Prefix returns the key namespace used by this store (always ends with "/").
+func (e *EtcdStore) Prefix() string { return e.prefix }
+
 // ── Key helpers ────────────────────────────────────────────────────────────────
 
 func (e *EtcdStore) siteKey(name string) string    { return e.prefix + "sites/" + name }

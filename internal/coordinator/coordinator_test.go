@@ -9,6 +9,7 @@ import (
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
+	"github.com/scttfrdmn/globalfs/internal/lease"
 	"github.com/scttfrdmn/globalfs/internal/metadata"
 	"github.com/scttfrdmn/globalfs/internal/policy"
 	"github.com/scttfrdmn/globalfs/pkg/site"
@@ -674,4 +675,132 @@ func TestCoordinator_SetStore_RecoversPendingJobs(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Error("backup: recovered job was not delivered within 3s")
+}
+
+// ─── Lease manager tests ──────────────────────────────────────────────────────
+
+// TestCoordinator_SetLeaseManager_LeaderReplicates verifies that a coordinator
+// that acquires the leader lease starts the worker and replicates to backup.
+func TestCoordinator_SetLeaseManager_LeaderReplicates(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := lease.NewMemoryManager("coord-1")
+	c := New(primary, backup)
+	c.SetLeaseManager(mgr)
+	c.Start(ctx)
+	defer c.Stop()
+
+	if err := c.Put(ctx, "data/reads.bam", []byte("genome")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Leader should start the worker; backup should receive the replication.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if backupClient.hasKey("data/reads.bam") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("leader coordinator: async replication not delivered within 2s")
+}
+
+// TestCoordinator_SetLeaseManager_StandbySkipsWorker verifies that a
+// coordinator that cannot acquire the leader lease does not start the worker.
+func TestCoordinator_SetLeaseManager_StandbySkipsWorker(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// mgr1 grabs the lease before the coordinator starts.
+	mgr1, mgr2 := lease.NewMemoryManagerPair("other-node", "coord-2")
+	preLeader, ok, err := mgr1.TryAcquire(ctx, "coordinator/leader", 30*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("pre-acquire: ok=%v err=%v", ok, err)
+	}
+	defer preLeader.Release()
+
+	// coord-2 starts with mgr2 — it will be in standby mode.
+	c := New(primary, backup)
+	c.SetLeaseManager(mgr2)
+	c.Start(ctx)
+	defer c.Stop()
+
+	// Sync write to primary should still succeed.
+	if err := c.Put(ctx, "scratch.tmp", []byte("temp")); err != nil {
+		t.Fatalf("Put (standby): %v", err)
+	}
+
+	// No async replication should happen — the worker was not started.
+	time.Sleep(300 * time.Millisecond)
+	if backupClient.hasKey("scratch.tmp") {
+		t.Error("standby coordinator should not replicate to backup")
+	}
+}
+
+// TestCoordinator_SetLeaseManager_LeaseLossStopsWorker verifies that when the
+// leader lease is lost the worker stops processing new replications.
+func TestCoordinator_SetLeaseManager_LeaseLossStopsWorker(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := lease.NewMemoryManager("coord-1")
+	c := New(primary, backup)
+	c.SetLeaseManager(mgr)
+	c.Start(ctx)
+	defer c.Stop()
+
+	// Verify the coordinator is operating as leader.
+	if err := c.Put(ctx, "before.bam", []byte("d")); err != nil {
+		t.Fatalf("Put (before lease loss): %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if backupClient.hasKey("before.bam") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !backupClient.hasKey("before.bam") {
+		t.Fatal("leader: initial replication did not arrive within 2s")
+	}
+
+	// Simulate lease loss by revoking it from outside.
+	c.mu.Lock()
+	l := c.leaderLease
+	c.mu.Unlock()
+	if l == nil {
+		t.Fatal("leaderLease not set after successful Start")
+	}
+	if err := l.Release(); err != nil {
+		t.Fatalf("Release (simulated loss): %v", err)
+	}
+
+	// Allow some time for the transition goroutine to cancel workerCtx.
+	time.Sleep(200 * time.Millisecond)
+
+	// A new Put's async half should not be delivered — worker is stopped.
+	if err := c.Put(ctx, "after.bam", []byte("d")); err != nil {
+		// Put still writes to primaries; only replication is suppressed.
+		t.Fatalf("Put after lease loss: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if backupClient.hasKey("after.bam") {
+		t.Error("coordinator should not replicate after lease loss")
+	}
 }
