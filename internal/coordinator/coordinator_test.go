@@ -119,8 +119,18 @@ func (m *memClient) hasKey(key string) bool {
 	return ok
 }
 
-func (m *memClient) Health(_ context.Context) error { return m.healthErr }
-func (m *memClient) Close() error                   { return nil }
+func (m *memClient) Health(_ context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.healthErr
+}
+func (m *memClient) Close() error { return nil }
+
+func (m *memClient) setHealthErr(err error) {
+	m.mu.Lock()
+	m.healthErr = err
+	m.mu.Unlock()
+}
 
 func makeMount(name string, role types.SiteRole, objs map[string][]byte) (*site.SiteMount, *memClient) {
 	mc := newMemClient(objs)
@@ -802,5 +812,102 @@ func TestCoordinator_SetLeaseManager_LeaseLossStopsWorker(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if backupClient.hasKey("after.bam") {
 		t.Error("coordinator should not replicate after lease loss")
+	}
+}
+
+// ─── Health polling ────────────────────────────────────────────────────────────
+
+func TestCoordinator_HealthStatus_NilBeforeFirstPoll(t *testing.T) {
+	t.Parallel()
+	// Create coordinator but do NOT call Start — cache must stay nil.
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+	report, checkedAt := c.HealthStatus()
+	if report != nil {
+		t.Errorf("expected nil report before first poll, got %v", report)
+	}
+	if !checkedAt.IsZero() {
+		t.Errorf("expected zero checkedAt before first poll, got %v", checkedAt)
+	}
+}
+
+func TestCoordinator_HealthStatus_PopulatedAfterPoll(t *testing.T) {
+	t.Parallel()
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+	// Use a very short poll interval so the test doesn't wait 30s.
+	c.SetHealthPollInterval(20 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Stop()
+
+	// Wait up to 500ms for the first poll to complete.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		report, _ := c.HealthStatus()
+		if report != nil {
+			return // success
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("HealthStatus still nil after 500ms — background poll did not run")
+}
+
+func TestCoordinator_HealthStatus_ReflectsUnhealthySite(t *testing.T) {
+	t.Parallel()
+	primary, mc := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+	c.SetHealthPollInterval(20 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+	defer c.Stop()
+
+	// Wait for first (healthy) poll.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if report, _ := c.HealthStatus(); report != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Inject an error into the client (use the mutex-protected setter).
+	mc.setHealthErr(errors.New("s3 unreachable"))
+
+	// Wait for a poll that reflects the error.
+	deadline = time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if report, _ := c.HealthStatus(); report != nil && report["primary"] != nil {
+			return // success
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("HealthStatus never reflected unhealthy site within 500ms")
+}
+
+func TestCoordinator_SetHealthPollInterval_StopsWithStop(t *testing.T) {
+	t.Parallel()
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+	c.SetHealthPollInterval(10 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Start(ctx)
+
+	// Stop should return quickly without hanging on the polling goroutine.
+	done := make(chan struct{})
+	go func() {
+		c.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// good
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() did not return within 2s — health polling goroutine may be leaked")
 	}
 }

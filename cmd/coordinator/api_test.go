@@ -31,6 +31,7 @@ type testMemClient struct {
 	delErr    error
 	headErr   error
 	listErr   error
+	healthErr error
 }
 
 func newTestMemClient(objs map[string][]byte) *testMemClient {
@@ -119,8 +120,12 @@ func (m *testMemClient) Head(_ context.Context, key string) (*objectfstypes.Obje
 	}, nil
 }
 
-func (m *testMemClient) Health(_ context.Context) error { return nil }
-func (m *testMemClient) Close() error                   { return nil }
+func (m *testMemClient) Health(_ context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.healthErr
+}
+func (m *testMemClient) Close() error { return nil }
 
 func (m *testMemClient) hasKey(key string) bool {
 	m.mu.Lock()
@@ -876,5 +881,138 @@ func TestInfoHandler_QueueDepthZero(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &info)
 	if info.ReplicationQueueDepth != 0 {
 		t.Errorf("queue depth: got %d, want 0", info.ReplicationQueueDepth)
+	}
+}
+
+func TestInfoHandler_HealthSummary_NoCacheYet(t *testing.T) {
+	// When no poll has run, health.last_checked_at should be absent and counts 0.
+	mc := newTestMemClient(nil)
+	s := site.New("primary", types.SiteRolePrimary, mc)
+	c := coordinator.New(s) // NOT started — no background poll
+	t.Cleanup(c.Stop)
+
+	req := httptest.NewRequest("GET", "/api/v1/info", nil)
+	w := httptest.NewRecorder()
+	infoHandler(c, "v1", time.Now())(w, req)
+
+	var info infoResponse
+	json.Unmarshal(w.Body.Bytes(), &info)
+	if info.Health.LastCheckedAt != nil {
+		t.Errorf("expected nil LastCheckedAt before first poll, got %v", info.Health.LastCheckedAt)
+	}
+	if info.Health.Healthy != 0 || info.Health.Unhealthy != 0 {
+		t.Errorf("expected 0/0 before first poll, got healthy=%d unhealthy=%d",
+			info.Health.Healthy, info.Health.Unhealthy)
+	}
+}
+
+func TestInfoHandler_HealthSummary_AfterPoll(t *testing.T) {
+	mc := newTestMemClient(nil)
+	s := site.New("primary", types.SiteRolePrimary, mc)
+	c := coordinator.New(s)
+	c.SetHealthPollInterval(10 * time.Millisecond)
+	c.Start(context.Background())
+	t.Cleanup(c.Stop)
+
+	// Wait for the first poll.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if report, _ := c.HealthStatus(); report != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/info", nil)
+	w := httptest.NewRecorder()
+	infoHandler(c, "v1", time.Now())(w, req)
+
+	var info infoResponse
+	json.Unmarshal(w.Body.Bytes(), &info)
+	if info.Health.LastCheckedAt == nil {
+		t.Fatal("expected non-nil LastCheckedAt after poll")
+	}
+	if info.Health.Healthy != 1 || info.Health.Unhealthy != 0 {
+		t.Errorf("expected 1 healthy, 0 unhealthy; got healthy=%d unhealthy=%d",
+			info.Health.Healthy, info.Health.Unhealthy)
+	}
+}
+
+// ── healthzHandler with cached health ─────────────────────────────────────────
+
+func TestHealthzHandler_UsesCachedHealth(t *testing.T) {
+	// Start coordinator with a fast poll so the cache is populated quickly.
+	mc := newTestMemClient(nil)
+	s := site.New("primary", types.SiteRolePrimary, mc)
+	c := coordinator.New(s)
+	c.SetHealthPollInterval(10 * time.Millisecond)
+	c.Start(context.Background())
+	t.Cleanup(c.Stop)
+
+	// Wait for at least one poll.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if r, _ := c.HealthStatus(); r != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	w := httptest.NewRecorder()
+	healthzHandler(c)(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 from cached healthy result, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "OK") {
+		t.Errorf("expected 'OK' in body, got %q", w.Body.String())
+	}
+}
+
+func TestHealthzHandler_NoCacheUsesLiveCheck(t *testing.T) {
+	// If the cache is nil, healthzHandler falls back to a live check.
+	mc := newTestMemClient(nil)
+	s := site.New("primary", types.SiteRolePrimary, mc)
+	c := coordinator.New(s) // NOT started — no cache
+	t.Cleanup(c.Stop)
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	w := httptest.NewRecorder()
+	healthzHandler(c)(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 from live check, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHealthzHandler_CacheDegradedSite(t *testing.T) {
+	// Once the cache shows an unhealthy primary, healthz should return 503.
+	mc := newTestMemClient(nil)
+	mc.healthErr = errors.New("disk full")
+	s := site.New("primary", types.SiteRolePrimary, mc)
+	c := coordinator.New(s)
+	c.SetHealthPollInterval(10 * time.Millisecond)
+	c.Start(context.Background())
+	t.Cleanup(c.Stop)
+
+	// Wait for cache to reflect the error.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if r, _ := c.HealthStatus(); r != nil && r["primary"] != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	w := httptest.NewRecorder()
+	healthzHandler(c)(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for cached degraded primary, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "DEGRADED") {
+		t.Errorf("expected 'DEGRADED' in body, got %q", w.Body.String())
 	}
 }

@@ -44,11 +44,12 @@ import (
 var version = "0.1.0-alpha"
 
 func main() {
-	configPath  := flag.String("config", "", "Path to YAML configuration file")
-	logLevelStr := flag.String("log-level", "INFO", "Log level: DEBUG, INFO, WARN, ERROR")
-	bindAddr    := flag.String("bind-addr", "", "HTTP server address (default :8090, or coordinator.listen_addr from config)")
-	apiKeyFlag  := flag.String("api-key", "", "Shared API key for X-GlobalFS-API-Key auth (env: GLOBALFS_API_KEY; empty = disabled)")
-	showVersion := flag.Bool("version", false, "Print version and exit")
+	configPath       := flag.String("config", "", "Path to YAML configuration file")
+	logLevelStr      := flag.String("log-level", "INFO", "Log level: DEBUG, INFO, WARN, ERROR")
+	bindAddr         := flag.String("bind-addr", "", "HTTP server address (default :8090, or coordinator.listen_addr from config)")
+	apiKeyFlag       := flag.String("api-key", "", "Shared API key for X-GlobalFS-API-Key auth (env: GLOBALFS_API_KEY; empty = disabled)")
+	healthPollStr    := flag.String("health-poll-interval", "30s", "Interval between background site health checks (e.g. 15s, 1m)")
+	showVersion      := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
 	// Env var overrides the flag default if the flag was not explicitly set.
@@ -116,6 +117,13 @@ func main() {
 
 	m := metrics.New(prometheus.DefaultRegisterer)
 	c.SetMetrics(m)
+
+	if pollInterval, err := time.ParseDuration(*healthPollStr); err == nil && pollInterval > 0 {
+		c.SetHealthPollInterval(pollInterval)
+		slog.Info("health polling configured", "interval", pollInterval)
+	} else if err != nil {
+		slog.Warn("invalid --health-poll-interval; using default 30s", "value", *healthPollStr, "error", err)
+	}
 
 	if len(cfg.Policy.Rules) > 0 {
 		eng, err := policy.NewFromConfig(cfg.Policy.Rules)
@@ -204,9 +212,17 @@ func main() {
 
 // healthzHandler returns 200 OK if all primary sites are healthy, 503 otherwise.
 // A coordinator with no primary sites is considered healthy (pass-through).
+//
+// It uses the background health poll cache when available, avoiding live S3
+// calls on every probe.  On first startup (before the initial poll completes)
+// it falls back to a live health check.
 func healthzHandler(c *coordinator.Coordinator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		report := c.Health(r.Context())
+		report, _ := c.HealthStatus()
+		if report == nil {
+			// Cache not yet populated — fall back to a live check.
+			report = c.Health(r.Context())
+		}
 
 		var unhealthy []string
 		for _, s := range c.Sites() {

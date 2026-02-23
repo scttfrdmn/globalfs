@@ -47,14 +47,24 @@ type Coordinator struct {
 	ns           *namespace.Namespace
 	policy       *policy.Engine  // never nil; default = empty engine
 	worker       *replication.Worker
-	store        metadata.Store  // optional; nil means no persistence
+	store        metadata.Store   // optional; nil means no persistence
 	m            *metrics.Metrics // optional; nil means no instrumentation
 	storeCancel  context.CancelFunc
 	storeWg      sync.WaitGroup
 	leaseManager *lease.Manager     // optional; nil means single-node mode
 	leaderLease  *lease.Lease       // non-nil when this instance is the leader
 	leaderCancel context.CancelFunc // cancels the leaderCtx
+
+	// Background health polling.
+	healthPollInterval time.Duration   // 0 → use defaultHealthPollInterval
+	healthCacheMu      sync.RWMutex
+	healthCache        map[string]error // nil = not yet polled
+	healthCheckedAt    time.Time
 }
+
+// defaultHealthPollInterval is the cadence for background site health checks
+// when no explicit interval has been set via SetHealthPollInterval.
+const defaultHealthPollInterval = 30 * time.Second
 
 // New creates a Coordinator from an ordered list of SiteMounts.
 //
@@ -118,6 +128,44 @@ func (c *Coordinator) SetMetrics(m *metrics.Metrics) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.m = m
+}
+
+// SetHealthPollInterval sets the interval between background site health
+// checks.  The default is 30 seconds.  Pass 0 to use the default.
+// Must be called before Start.
+func (c *Coordinator) SetHealthPollInterval(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.healthPollInterval = d
+}
+
+// HealthStatus returns the most recent cached health report and the time it
+// was collected.  Returns (nil, zero) if no background poll has run yet.
+// The returned map is a copy; it is safe to read without holding any lock.
+func (c *Coordinator) HealthStatus() (map[string]error, time.Time) {
+	c.healthCacheMu.RLock()
+	defer c.healthCacheMu.RUnlock()
+	if c.healthCache == nil {
+		return nil, time.Time{}
+	}
+	cp := make(map[string]error, len(c.healthCache))
+	for k, v := range c.healthCache {
+		cp[k] = v
+	}
+	return cp, c.healthCheckedAt
+}
+
+// runHealthPoll performs one health check of all sites and stores the result
+// in the cache.  It is called from the background polling goroutine.
+func (c *Coordinator) runHealthPoll(ctx context.Context) {
+	pollCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	report := c.Health(pollCtx)
+	now := time.Now()
+	c.healthCacheMu.Lock()
+	c.healthCache = report
+	c.healthCheckedAt = now
+	c.healthCacheMu.Unlock()
 }
 
 // Start launches the background replication worker.
@@ -188,6 +236,29 @@ func (c *Coordinator) Start(ctx context.Context) {
 		defer c.storeWg.Done()
 		c.drainWorkerEvents(drainCtx, store)
 	}()
+
+	// Launch background health polling goroutine.
+	// Uses drainCtx so it stops when Stop() is called (via storeCancel).
+	pollInterval := c.healthPollInterval
+	if pollInterval <= 0 {
+		pollInterval = defaultHealthPollInterval
+	}
+	c.storeWg.Add(1)
+	go func() {
+		defer c.storeWg.Done()
+		c.runHealthPoll(drainCtx) // immediate first check
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				c.runHealthPoll(drainCtx)
+			case <-drainCtx.Done():
+				return
+			}
+		}
+	}()
+
 	c.worker.Start(workerCtx)
 }
 

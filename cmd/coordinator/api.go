@@ -460,6 +460,13 @@ func objectHeadHandler(c *coordinator.Coordinator) http.HandlerFunc {
 
 // ── Info handler ──────────────────────────────────────────────────────────────
 
+// healthSummary is embedded in infoResponse to show the cached health state.
+type healthSummary struct {
+	Healthy       int        `json:"healthy"`
+	Unhealthy     int        `json:"unhealthy"`
+	LastCheckedAt *time.Time `json:"last_checked_at,omitempty"`
+}
+
 // infoResponse is the JSON payload for GET /api/v1/info.
 type infoResponse struct {
 	Version               string         `json:"version"`
@@ -468,6 +475,7 @@ type infoResponse struct {
 	SitesByRole           map[string]int `json:"sites_by_role"`
 	ReplicationQueueDepth int            `json:"replication_queue_depth"`
 	IsLeader              bool           `json:"is_leader"`
+	Health                healthSummary  `json:"health"`
 }
 
 // infoHandler handles GET /api/v1/info — returns coordinator runtime stats.
@@ -478,6 +486,20 @@ func infoHandler(c *coordinator.Coordinator, version string, startTime time.Time
 		for _, s := range sites {
 			byRole[string(s.Role())]++
 		}
+
+		var hs healthSummary
+		if report, checkedAt := c.HealthStatus(); report != nil {
+			t := checkedAt
+			hs.LastCheckedAt = &t
+			for _, s := range sites {
+				if err := report[s.Name()]; err != nil {
+					hs.Unhealthy++
+				} else {
+					hs.Healthy++
+				}
+			}
+		}
+
 		writeJSON(w, http.StatusOK, infoResponse{
 			Version:               version,
 			UptimeSeconds:         time.Since(startTime).Seconds(),
@@ -485,6 +507,7 @@ func infoHandler(c *coordinator.Coordinator, version string, startTime time.Time
 			SitesByRole:           byRole,
 			ReplicationQueueDepth: c.ReplicationQueueDepth(),
 			IsLeader:              c.IsLeader(),
+			Health:                hs,
 		})
 	}
 }
