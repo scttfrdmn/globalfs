@@ -9,6 +9,7 @@ import (
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
+	"github.com/scttfrdmn/globalfs/internal/policy"
 	"github.com/scttfrdmn/globalfs/pkg/site"
 	"github.com/scttfrdmn/globalfs/pkg/types"
 )
@@ -394,6 +395,124 @@ func TestCoordinator_Health_AllHealthy(t *testing.T) {
 		if err != nil {
 			t.Errorf("Health[%q]: expected nil, got %v", name, err)
 		}
+	}
+}
+
+// TestCoordinator_SetPolicy_Get_RoutesToBurst verifies that after installing a
+// policy that routes *.tmp reads to burst, Get queries the burst site first.
+func TestCoordinator_SetPolicy_Get_RoutesToBurst(t *testing.T) {
+	t.Parallel()
+
+	primaryMount, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"job.tmp": []byte("primary-data"),
+	})
+	burstMount, burstClient := makeMount("burst", types.SiteRoleBurst, map[string][]byte{
+		"job.tmp": []byte("burst-data"),
+	})
+
+	c := New(primaryMount, burstMount)
+	// Install a policy: *.tmp reads → burst only.
+	e := policy.New(policy.Rule{
+		Name:        "tmp-to-burst",
+		KeyPattern:  "*.tmp",
+		Operations:  []policy.OperationType{policy.OperationRead},
+		TargetRoles: []types.SiteRole{types.SiteRoleBurst},
+		Priority:    1,
+	})
+	c.SetPolicy(e)
+
+	data, err := c.Get(context.Background(), "job.tmp")
+	if err != nil {
+		t.Fatalf("Get: unexpected error: %v", err)
+	}
+	// Policy routes to burst; burst has "burst-data".
+	if string(data) != "burst-data" {
+		t.Errorf("Get: got %q, want burst-data (policy should route to burst)", data)
+	}
+	_ = burstClient // confirms burstMount was queried
+}
+
+// TestCoordinator_SetPolicy_Put_RoutesToBurst verifies that a write policy
+// that routes *.tmp to burst skips the primary for Put.
+func TestCoordinator_SetPolicy_Put_RoutesToBurst(t *testing.T) {
+	t.Parallel()
+
+	primaryMount, primaryClient := makeMount("primary", types.SiteRolePrimary, nil)
+	// Burst client is primary role in the context of routing but SiteRoleBurst
+	// in terms of the coordinator's sync vs async distinction — so no sync write.
+	burstMount, burstClient := makeMount("burst", types.SiteRoleBurst, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := New(primaryMount, burstMount)
+	c.Start(ctx)
+	defer c.Stop()
+
+	// Policy: *.tmp writes → burst only (primary is not in TargetRoles).
+	e := policy.New(policy.Rule{
+		Name:        "tmp-writes-burst",
+		KeyPattern:  "*.tmp",
+		Operations:  []policy.OperationType{policy.OperationWrite},
+		TargetRoles: []types.SiteRole{types.SiteRoleBurst},
+		Priority:    1,
+	})
+	c.SetPolicy(e)
+
+	if err := c.Put(ctx, "scratch.tmp", []byte("scratch")); err != nil {
+		t.Fatalf("Put: unexpected error: %v", err)
+	}
+
+	// Primary should NOT receive the write (it's not in TargetRoles).
+	if primaryClient.hasKey("scratch.tmp") {
+		t.Error("primary should not receive write (policy excludes it)")
+	}
+
+	// Burst is in TargetRoles but is non-primary role, so it gets async replication.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if burstClient.hasKey("scratch.tmp") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !burstClient.hasKey("scratch.tmp") {
+		t.Error("burst should receive replication of *.tmp write within 2s")
+	}
+}
+
+// TestCoordinator_SetPolicy_Nil_RevertsToDefault verifies that passing nil to
+// SetPolicy restores default role-based routing.
+func TestCoordinator_SetPolicy_Nil_RevertsToDefault(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"data.bam": []byte("primary-data"),
+	})
+	burst, _ := makeMount("burst", types.SiteRoleBurst, map[string][]byte{
+		"data.bam": []byte("burst-data"),
+	})
+
+	c := New(primary, burst)
+	// Install policy routing reads to burst.
+	c.SetPolicy(policy.New(policy.Rule{
+		Name:        "to-burst",
+		KeyPattern:  "*.bam",
+		Operations:  []policy.OperationType{policy.OperationRead},
+		TargetRoles: []types.SiteRole{types.SiteRoleBurst},
+		Priority:    1,
+	}))
+
+	// Revert to default.
+	c.SetPolicy(nil)
+
+	data, err := c.Get(context.Background(), "data.bam")
+	if err != nil {
+		t.Fatalf("Get: unexpected error: %v", err)
+	}
+	// Default routing: primary first.
+	if string(data) != "primary-data" {
+		t.Errorf("Get after SetPolicy(nil): got %q, want primary-data", data)
 	}
 }
 

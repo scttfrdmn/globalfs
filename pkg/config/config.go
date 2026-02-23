@@ -9,6 +9,35 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// PolicyRuleConfig defines a single routing rule in YAML configuration.
+// Operations and TargetRoles are represented as string slices for
+// human-friendly YAML; use policy.NewFromConfig to convert to typed Rules.
+type PolicyRuleConfig struct {
+	// Name is a human-readable identifier for the rule.
+	Name string `yaml:"name"`
+
+	// KeyPattern is matched against object keys (glob, prefix ending in "/",
+	// or exact match).  An empty pattern matches all keys.
+	KeyPattern string `yaml:"key_pattern"`
+
+	// Operations lists which operation types this rule applies to.
+	// Valid values: "read", "write", "delete".  Empty matches all.
+	Operations []string `yaml:"operations"`
+
+	// TargetRoles restricts routing to sites with these roles.
+	// Valid values: "primary", "backup", "burst".  Empty returns all sites.
+	TargetRoles []string `yaml:"target_roles"`
+
+	// Priority controls evaluation order.  Lower values = higher precedence.
+	Priority int `yaml:"priority"`
+}
+
+// PolicyConfig holds policy engine configuration.
+type PolicyConfig struct {
+	// Rules is the ordered list of routing rules loaded from YAML.
+	Rules []PolicyRuleConfig `yaml:"rules"`
+}
+
 // Configuration represents the complete GlobalFS configuration.
 type Configuration struct {
 	// Global settings
@@ -20,7 +49,10 @@ type Configuration struct {
 	// Sites configuration
 	Sites []SiteConfig `yaml:"sites"`
 
-	// Replication policies
+	// Policy routing rules
+	Policy PolicyConfig `yaml:"policy"`
+
+	// Replication policies (legacy placement policies; superseded by Policy)
 	Policies []types.ReplicationPolicy `yaml:"policies"`
 
 	// Performance tuning
