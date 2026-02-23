@@ -32,6 +32,7 @@ import (
 
 	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/lease"
+	"github.com/scttfrdmn/globalfs/internal/retry"
 	"github.com/scttfrdmn/globalfs/internal/metadata"
 	"github.com/scttfrdmn/globalfs/internal/metrics"
 	"github.com/scttfrdmn/globalfs/internal/policy"
@@ -64,6 +65,9 @@ type Coordinator struct {
 
 	// Circuit breaker (optional).
 	cb *circuitbreaker.Breaker // nil = disabled
+
+	// Per-site retry (optional).
+	retryConfig *retry.Config // nil = single attempt (no retry)
 }
 
 // defaultHealthPollInterval is the cadence for background site health checks
@@ -156,6 +160,23 @@ func (c *Coordinator) SetCircuitBreaker(cb *circuitbreaker.Breaker) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cb = cb
+}
+
+// SetRetryConfig registers a per-site retry configuration with the coordinator.
+//
+// When set, each site attempt in Get and Head is retried up to
+// cfg.MaxAttempts times (with exponential backoff) before the coordinator
+// records a failure in the circuit breaker and moves to the next site.
+//
+// This is intentionally not applied to Put or Delete: primary writes are
+// fail-fast by design to prevent double-write confusion.
+//
+// Pass nil to disable retries (the default: each site is tried once).
+// May be called at any time; safe for concurrent use.
+func (c *Coordinator) SetRetryConfig(cfg *retry.Config) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.retryConfig = cfg
 }
 
 // HealthStatus returns the most recent cached health report and the time it
@@ -385,7 +406,7 @@ func (c *Coordinator) Health(ctx context.Context) map[string]error {
 // are only tried as a fallback.  The first successful read is returned.
 func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 	c.mu.RLock()
-	snapshot, pol, cb := c.snapshotSites(), c.policy, c.cb
+	snapshot, pol, cb, retryCfg := c.snapshotSites(), c.policy, c.cb, c.retryConfig
 	c.mu.RUnlock()
 
 	ordered, err := pol.Route(ctx, policy.OperationRead, key, snapshot)
@@ -402,18 +423,23 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 
 	var lastErr error
 	for _, s := range ordered {
-		data, err := s.Get(ctx, key, 0, 0)
+		var data []byte
+		siteErr := doWithRetry(ctx, retryCfg, func() error {
+			var err error
+			data, err = s.Get(ctx, key, 0, 0)
+			return err
+		})
 		if cb != nil {
-			if err == nil {
+			if siteErr == nil {
 				cb.RecordSuccess(s.Name())
 			} else {
 				cb.RecordFailure(s.Name())
 			}
 		}
-		if err == nil {
+		if siteErr == nil {
 			return data, nil
 		}
-		lastErr = err
+		lastErr = siteErr
 	}
 	return nil, fmt.Errorf("coordinator: Get %q failed on all sites: %w", key, lastErr)
 }
@@ -541,7 +567,7 @@ func (c *Coordinator) List(ctx context.Context, prefix string, limit int) ([]obj
 // front (same health-aware reordering as Get).  The first hit is returned.
 func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.ObjectInfo, error) {
 	c.mu.RLock()
-	snapshot, pol, cb := c.snapshotSites(), c.policy, c.cb
+	snapshot, pol, cb, retryCfg := c.snapshotSites(), c.policy, c.cb, c.retryConfig
 	c.mu.RUnlock()
 
 	ordered, err := pol.Route(ctx, policy.OperationRead, key, snapshot)
@@ -558,18 +584,23 @@ func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.Obje
 
 	var lastErr error
 	for _, s := range ordered {
-		info, err := s.Head(ctx, key)
+		var info *objectfstypes.ObjectInfo
+		siteErr := doWithRetry(ctx, retryCfg, func() error {
+			var err error
+			info, err = s.Head(ctx, key)
+			return err
+		})
 		if cb != nil {
-			if err == nil {
+			if siteErr == nil {
 				cb.RecordSuccess(s.Name())
 			} else {
 				cb.RecordFailure(s.Name())
 			}
 		}
-		if err == nil {
+		if siteErr == nil {
 			return info, nil
 		}
-		lastErr = err
+		lastErr = siteErr
 	}
 	return nil, fmt.Errorf("coordinator: Head %q failed on all sites: %w", key, lastErr)
 }
@@ -686,6 +717,16 @@ func preferHealthySites(sites []*site.SiteMount, report map[string]error) []*sit
 		return healthy
 	}
 	return append(healthy, degraded...)
+}
+
+// doWithRetry calls fn once when cfg is nil, or delegates to retry.Do when a
+// retry configuration is set.  This keeps the call sites readable and avoids
+// a nil-pointer dereference on the config.
+func doWithRetry(ctx context.Context, cfg *retry.Config, fn func() error) error {
+	if cfg == nil {
+		return fn()
+	}
+	return retry.Do(ctx, *cfg, fn)
 }
 
 // filterByCircuitBreaker returns a filtered subset of sites whose circuits

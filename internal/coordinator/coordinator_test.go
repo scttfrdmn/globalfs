@@ -13,6 +13,7 @@ import (
 	"github.com/scttfrdmn/globalfs/internal/lease"
 	"github.com/scttfrdmn/globalfs/internal/metadata"
 	"github.com/scttfrdmn/globalfs/internal/policy"
+	"github.com/scttfrdmn/globalfs/internal/retry"
 	"github.com/scttfrdmn/globalfs/pkg/site"
 	"github.com/scttfrdmn/globalfs/pkg/types"
 )
@@ -27,6 +28,9 @@ type memClient struct {
 	getErr    error
 	putErr    error
 	delErr    error
+	// getFn, if non-nil, overrides the default Get behaviour.  Useful for
+	// simulating sequences of transient failures in retry tests.
+	getFn func(key string) ([]byte, error)
 }
 
 func newMemClient(objs map[string][]byte) *memClient {
@@ -37,6 +41,10 @@ func newMemClient(objs map[string][]byte) *memClient {
 }
 
 func (m *memClient) Get(_ context.Context, key string, _, _ int64) ([]byte, error) {
+	// getFn takes precedence over the static error/objects behaviour.
+	if m.getFn != nil {
+		return m.getFn(key)
+	}
 	if m.getErr != nil {
 		return nil, m.getErr
 	}
@@ -1302,5 +1310,191 @@ func TestFilterByCircuitBreaker_NilBreakerPassesThrough(t *testing.T) {
 	got := filterByCircuitBreaker(nil, []*site.SiteMount{s1})
 	if len(got) != 1 {
 		t.Errorf("nil cb: expected 1 site, got %d", len(got))
+	}
+}
+
+// ─── Retry tests ──────────────────────────────────────────────────────────────
+
+// TestCoordinator_Retry_NilConfigIsNoop verifies that the default (no retry
+// config) behaves identically to the pre-retry implementation.
+func TestCoordinator_Retry_NilConfigIsNoop(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"obj": []byte("content"),
+	})
+	c := New(primary)
+	// No SetRetryConfig — retryConfig is nil.
+
+	data, err := c.Get(context.Background(), "obj")
+	if err != nil {
+		t.Fatalf("Get: unexpected error: %v", err)
+	}
+	if string(data) != "content" {
+		t.Errorf("Get: got %q, want content", string(data))
+	}
+}
+
+// TestCoordinator_Retry_RecoversOnSecondAttempt verifies that a transient
+// failure on the first call succeeds on the second retry without falling back
+// to another site.
+func TestCoordinator_Retry_RecoversOnSecondAttempt(t *testing.T) {
+	t.Parallel()
+
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"obj": []byte("primary-data"),
+	})
+	backup, _ := makeMount("backup", types.SiteRoleBackup, map[string][]byte{
+		"obj": []byte("backup-data"),
+	})
+
+	calls := 0
+	primaryClient.getFn = func(key string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("transient")
+		}
+		return []byte("primary-data"), nil
+	}
+
+	c := New(primary, backup)
+	c.SetRetryConfig(&retry.Config{
+		MaxAttempts:  3,
+		InitialDelay: time.Millisecond,
+		Multiplier:   1.0,
+	})
+
+	data, err := c.Get(context.Background(), "obj")
+	if err != nil {
+		t.Fatalf("Get: unexpected error: %v", err)
+	}
+	if string(data) != "primary-data" {
+		t.Errorf("Get: got %q, want primary-data (should not fall back to backup)", string(data))
+	}
+	if calls != 2 {
+		t.Errorf("primary getFn called %d times, want 2", calls)
+	}
+}
+
+// TestCoordinator_Retry_FallsBackAfterAllRetriesExhausted verifies that the
+// coordinator moves to the next site only after all per-site retries fail.
+func TestCoordinator_Retry_FallsBackAfterAllRetriesExhausted(t *testing.T) {
+	t.Parallel()
+
+	primaryClient := &memClient{objects: map[string][]byte{}}
+	primary := site.New("primary", types.SiteRolePrimary, primaryClient)
+	backup, _ := makeMount("backup", types.SiteRoleBackup, map[string][]byte{
+		"obj": []byte("backup-data"),
+	})
+
+	primaryCalls := 0
+	primaryClient.getFn = func(_ string) ([]byte, error) {
+		primaryCalls++
+		return nil, errors.New("primary always fails")
+	}
+
+	c := New(primary, backup)
+	c.SetRetryConfig(&retry.Config{
+		MaxAttempts:  3,
+		InitialDelay: time.Millisecond,
+		Multiplier:   1.0,
+	})
+
+	data, err := c.Get(context.Background(), "obj")
+	if err != nil {
+		t.Fatalf("Get: unexpected error: %v", err)
+	}
+	if string(data) != "backup-data" {
+		t.Errorf("Get: got %q, want backup-data", string(data))
+	}
+	// Primary should have been tried MaxAttempts=3 times before giving up.
+	if primaryCalls != 3 {
+		t.Errorf("primary getFn called %d times, want 3 (MaxAttempts)", primaryCalls)
+	}
+}
+
+// TestCoordinator_Retry_CBTrippedOnlyAfterAllRetriesExhausted verifies that
+// the circuit breaker records a failure only once per site (after all retries),
+// not once per attempt.
+func TestCoordinator_Retry_CBTrippedOnlyAfterAllRetriesExhausted(t *testing.T) {
+	t.Parallel()
+
+	primaryClient := &memClient{objects: map[string][]byte{}}
+	primary := site.New("primary", types.SiteRolePrimary, primaryClient)
+	primaryClient.getFn = func(_ string) ([]byte, error) {
+		return nil, errors.New("unavailable")
+	}
+
+	cb := circuitbreaker.New(2, time.Hour) // opens after 2 recorded failures
+	c := New(primary)
+	c.SetCircuitBreaker(cb)
+	c.SetRetryConfig(&retry.Config{
+		MaxAttempts:  3, // 3 attempts per site; still only 1 RecordFailure call
+		InitialDelay: time.Millisecond,
+		Multiplier:   1.0,
+	})
+
+	// First Get: 3 retries → 1 RecordFailure → failures=1 → circuit still Closed
+	_, _ = c.Get(context.Background(), "obj")
+	if got := cb.State("primary"); got != circuitbreaker.StateClosed {
+		t.Errorf("after 1 Get (3 retries): expected Closed, got %v", got)
+	}
+
+	// Second Get: 3 retries → 1 RecordFailure → failures=2 → circuit Opens
+	_, _ = c.Get(context.Background(), "obj")
+	if got := cb.State("primary"); got != circuitbreaker.StateOpen {
+		t.Errorf("after 2 Gets (threshold=2): expected Open, got %v", got)
+	}
+}
+
+// TestCoordinator_Retry_ContextCancelledAbortsRetry verifies that context
+// cancellation during a retry wait propagates correctly.
+func TestCoordinator_Retry_ContextCancelledAbortsRetry(t *testing.T) {
+	t.Parallel()
+
+	primaryClient := &memClient{objects: map[string][]byte{}}
+	primary := site.New("primary", types.SiteRolePrimary, primaryClient)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	primaryClient.getFn = func(_ string) ([]byte, error) {
+		calls++
+		cancel() // cancel after first attempt so next retry wait is aborted
+		return nil, errors.New("unavailable")
+	}
+
+	c := New(primary)
+	c.SetRetryConfig(&retry.Config{
+		MaxAttempts:  5,
+		InitialDelay: time.Second, // long enough that cancel fires during wait
+		Multiplier:   1.0,
+	})
+
+	_, err := c.Get(ctx, "obj")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	// fn was called once; ctx cancelled during the first retry wait.
+	if calls != 1 {
+		t.Errorf("expected 1 call before cancel, got %d", calls)
+	}
+}
+
+// TestDoWithRetry_NilConfigCallsOnce verifies that doWithRetry with nil config
+// calls fn exactly once and returns its error.
+func TestDoWithRetry_NilConfigCallsOnce(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	sentinel := errors.New("err")
+	err := doWithRetry(context.Background(), nil, func() error {
+		calls++
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("expected sentinel, got %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("expected 1 call, got %d", calls)
 	}
 }
