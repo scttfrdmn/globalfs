@@ -105,11 +105,18 @@ func (c *Cache) Get(key string) ([]byte, bool) {
 // If inserting the value would exceed MaxBytes, the least-recently-used
 // entries are evicted until there is room (or MaxBytes is 0, meaning unlimited).
 // Replacing an existing entry removes the old byte count before inserting.
+// If the value is larger than MaxBytes it is silently dropped — an entry that
+// can never fit would overflow the budget and never age out naturally.
 func (c *Cache) Put(key string, data []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	newSize := int64(len(data))
+
+	// Drop entries that can never fit within the byte budget.
+	if c.cfg.MaxBytes > 0 && newSize > c.cfg.MaxBytes {
+		return
+	}
 
 	// Replace existing entry: remove old bytes first.
 	if el, ok := c.index[key]; ok {

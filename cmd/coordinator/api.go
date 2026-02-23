@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,6 +37,11 @@ import (
 
 // apiKeyHeader is the HTTP request header checked for authentication.
 const apiKeyHeader = "X-GlobalFS-API-Key"
+
+// maxObjectBodyBytes is the maximum number of bytes accepted for a PUT object
+// request body.  Requests that exceed this limit are rejected with 413 to
+// prevent memory exhaustion from unbounded reads.
+const maxObjectBodyBytes = 256 * 1024 * 1024 // 256 MiB
 
 // ── API key middleware ────────────────────────────────────────────────────────
 
@@ -355,14 +361,22 @@ func objectListHandler(c *coordinator.Coordinator) http.HandlerFunc {
 		}
 
 		objects, err := c.List(r.Context(), prefix, limit)
-		if err != nil {
+		if err != nil && len(objects) == 0 {
+			// All sites failed — no data to return.
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
 		if objects == nil {
 			objects = []objectfstypes.ObjectInfo{}
 		}
-		writeJSON(w, http.StatusOK, listObjectsResponse{
+		status := http.StatusOK
+		if err != nil {
+			// Partial results: some sites were unreachable but at least one
+			// contributed data.  Use 207 Multi-Status to signal degraded state.
+			status = http.StatusMultiStatus
+			w.Header().Set("X-GlobalFS-Partial", "true")
+		}
+		writeJSON(w, status, listObjectsResponse{
 			Prefix:  prefix,
 			Count:   len(objects),
 			Objects: objects,
@@ -401,8 +415,15 @@ func objectPutHandler(c *coordinator.Coordinator) http.HandlerFunc {
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, maxObjectBodyBytes)
 		data, err := io.ReadAll(r.Body)
 		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeError(w, http.StatusRequestEntityTooLarge,
+					fmt.Sprintf("request body exceeds maximum size of %d bytes", maxObjectBodyBytes))
+				return
+			}
 			writeError(w, http.StatusBadRequest, "read request body: "+err.Error())
 			return
 		}

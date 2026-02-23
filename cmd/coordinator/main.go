@@ -88,8 +88,17 @@ func main() {
 		addr = ":8090"
 	}
 
-	// Override log level from config if not set via flag.
-	if *logLevelStr == "INFO" && cfg.Global.LogLevel != "" {
+	// Override log level from config only when the --log-level flag was not
+	// explicitly provided on the command line.  flag.Visit visits only flags
+	// that were actually set, so this correctly handles the case where the
+	// user passes --log-level INFO explicitly (should not be overridden).
+	var logLevelExplicit bool
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "log-level" {
+			logLevelExplicit = true
+		}
+	})
+	if !logLevelExplicit && cfg.Global.LogLevel != "" {
 		setupLogger(cfg.Global.LogLevel)
 	}
 

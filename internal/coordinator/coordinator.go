@@ -54,6 +54,7 @@ type Coordinator struct {
 	m            *metrics.Metrics // optional; nil means no instrumentation
 	storeCancel  context.CancelFunc
 	storeWg      sync.WaitGroup
+	startOnce    sync.Once          // ensures Start() body runs exactly once
 	leaseManager *lease.Manager     // optional; nil means single-node mode
 	leaderLease  *lease.Lease       // non-nil when this instance is the leader
 	leaderCancel context.CancelFunc // cancels the leaderCtx
@@ -237,6 +238,11 @@ func (c *Coordinator) runHealthPoll(ctx context.Context) {
 // jobs from the previous run and begins draining worker events to keep the
 // store in sync.
 func (c *Coordinator) Start(ctx context.Context) {
+	c.startOnce.Do(func() { c.start(ctx) })
+}
+
+// start is the internal implementation of Start; called exactly once via startOnce.
+func (c *Coordinator) start(ctx context.Context) {
 	c.mu.Lock()
 	mgr := c.leaseManager
 	store := c.store

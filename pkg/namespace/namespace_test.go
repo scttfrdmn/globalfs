@@ -164,7 +164,8 @@ func TestNamespace_List_RespectsLimit(t *testing.T) {
 }
 
 // TestNamespace_List_SkipsUnavailableSite verifies that an unavailable site
-// does not block listing from healthy sites.
+// does not block listing from healthy sites, but that callers are informed of
+// the partial results via a non-nil error.
 func TestNamespace_List_SkipsUnavailableSite(t *testing.T) {
 	t.Parallel()
 
@@ -175,13 +176,15 @@ func TestNamespace_List_SkipsUnavailableSite(t *testing.T) {
 
 	ns := New(healthy, broken)
 	items, err := ns.List(context.Background(), "data/", 0)
-	if err != nil {
-		t.Fatalf("List: unexpected error: %v", err)
+	// Partial results: error must be non-nil so callers can detect the degraded state.
+	if err == nil {
+		t.Error("List: expected non-nil error when a site is unavailable (partial results)")
 	}
+	// Healthy site data must still be returned alongside the error.
 	if len(items) != 1 {
 		t.Errorf("expected 1 item from healthy site, got %d", len(items))
 	}
-	if items[0].Key != "data/file.txt" {
+	if len(items) > 0 && items[0].Key != "data/file.txt" {
 		t.Errorf("expected key data/file.txt, got %q", items[0].Key)
 	}
 }

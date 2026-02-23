@@ -171,12 +171,19 @@ func TestCache_ZeroMaxBytesIsUnlimited(t *testing.T) {
 
 func TestCache_EntryLargerThanBudget(t *testing.T) {
 	t.Parallel()
-	// Entry is 20 bytes but budget is 10.  Cache should not deadlock; entry
-	// is inserted and the cache is temporarily over budget.
+	// Entry is 20 bytes but budget is 10.  The entry can never fit within the
+	// budget so Put must drop it silently rather than inserting an entry that
+	// permanently exceeds the limit and can never age out.
 	c := New(Config{MaxBytes: 10})
 	c.Put("big", make([]byte, 20))
-	if _, ok := c.Get("big"); !ok {
-		t.Error("oversized entry should still be reachable immediately after Put")
+	if _, ok := c.Get("big"); ok {
+		t.Error("oversized entry should be dropped, not inserted")
+	}
+	if c.Len() != 0 {
+		t.Errorf("expected empty cache after dropping oversized entry, got %d entries", c.Len())
+	}
+	if c.Stats().Bytes != 0 {
+		t.Errorf("expected 0 bytes after dropping oversized entry, got %d", c.Stats().Bytes)
 	}
 }
 
