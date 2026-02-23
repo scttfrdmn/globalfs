@@ -611,3 +611,174 @@ func TestAPIKeyMiddleware_401ResponseBody(t *testing.T) {
 		t.Error("expected non-empty error field in 401 response")
 	}
 }
+
+// ── requestIDMiddleware ───────────────────────────────────────────────────────
+
+func TestRequestIDMiddleware_GeneratesIDWhenAbsent(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := requestIDMiddleware(inner)
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	id := w.Header().Get(requestIDHeader)
+	if id == "" {
+		t.Error("expected X-Request-ID to be set in response when absent from request")
+	}
+}
+
+func TestRequestIDMiddleware_EchoesIncomingID(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := requestIDMiddleware(inner)
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	req.Header.Set(requestIDHeader, "upstream-trace-42")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if got := w.Header().Get(requestIDHeader); got != "upstream-trace-42" {
+		t.Errorf("X-Request-ID: got %q, want %q", got, "upstream-trace-42")
+	}
+}
+
+func TestRequestIDMiddleware_UniqueIDsPerRequest(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := requestIDMiddleware(inner)
+
+	const n = 20
+	ids := make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		req := httptest.NewRequest("GET", "/", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		id := w.Header().Get(requestIDHeader)
+		if id == "" {
+			t.Fatalf("request %d: empty X-Request-ID", i)
+		}
+		ids[id] = true
+	}
+	if len(ids) != n {
+		t.Errorf("expected %d unique IDs, got %d unique among %d requests", n, len(ids), n)
+	}
+}
+
+func TestRequestIDMiddleware_StoresIDInContext(t *testing.T) {
+	var ctxID string
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctxID = requestIDFromCtx(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := requestIDMiddleware(inner)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set(requestIDHeader, "ctx-check-id")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if ctxID != "ctx-check-id" {
+		t.Errorf("context request ID: got %q, want %q", ctxID, "ctx-check-id")
+	}
+}
+
+func TestRequestIDMiddleware_GeneratedIDMatchesContext(t *testing.T) {
+	var ctxID string
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctxID = requestIDFromCtx(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := requestIDMiddleware(inner)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	respID := w.Header().Get(requestIDHeader)
+	if respID == "" {
+		t.Fatal("expected X-Request-ID in response")
+	}
+	if ctxID != respID {
+		t.Errorf("context ID %q does not match response header ID %q", ctxID, respID)
+	}
+}
+
+// ── loggingMiddleware ─────────────────────────────────────────────────────────
+
+func TestLoggingMiddleware_PreservesStatusCode(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	})
+	handler := loggingMiddleware(inner)
+
+	req := httptest.NewRequest("POST", "/api/v1/objects/key", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("status code: got %d, want 201", w.Code)
+	}
+}
+
+func TestLoggingMiddleware_PreservesResponseBody(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Custom", "preserved")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("hello world"))
+	})
+	handler := loggingMiddleware(inner)
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Body.String() != "hello world" {
+		t.Errorf("body: got %q, want %q", w.Body.String(), "hello world")
+	}
+	if w.Header().Get("X-Custom") != "preserved" {
+		t.Errorf("X-Custom header not preserved: got %q", w.Header().Get("X-Custom"))
+	}
+}
+
+func TestLoggingMiddleware_DefaultsTo200WhenNoWriteHeader(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("implicit 200"))
+	})
+	handler := loggingMiddleware(inner)
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("implicit 200: got %d, want 200", w.Code)
+	}
+}
+
+func TestLoggingMiddleware_ChainedWithRequestID(t *testing.T) {
+	// Verify that when the two middlewares are chained, the logger sees the
+	// request ID in the context (integration of the two middlewares).
+	var capturedID string
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedID = requestIDFromCtx(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := requestIDMiddleware(loggingMiddleware(inner))
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	req.Header.Set(requestIDHeader, "chain-test-id")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if capturedID != "chain-test-id" {
+		t.Errorf("chained middlewares: context ID = %q, want %q", capturedID, "chain-test-id")
+	}
+	if got := w.Header().Get(requestIDHeader); got != "chain-test-id" {
+		t.Errorf("response X-Request-ID = %q, want %q", got, "chain-test-id")
+	}
+}

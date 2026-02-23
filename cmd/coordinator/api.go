@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,6 +61,71 @@ func apiKeyMiddleware(key string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// ── Request ID middleware ─────────────────────────────────────────────────────
+
+// requestIDHeader is the HTTP header used to propagate the request correlation ID.
+const requestIDHeader = "X-Request-ID"
+
+// requestIDCtxKey is the unexported context key for the request ID value.
+type requestIDCtxKey struct{}
+
+// requestIDFromCtx returns the request ID stored in ctx, or "" if not set.
+func requestIDFromCtx(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDCtxKey{}).(string)
+	return id
+}
+
+// generateRequestID produces a 16-character hex string from crypto/rand.
+// Falls back to a nanosecond timestamp if entropy is unavailable.
+func generateRequestID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%016x", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%x", b)
+}
+
+// requestIDMiddleware ensures every request and response carries a correlation ID.
+//
+//   - If the incoming request already has X-Request-ID, that value is reused
+//     (allows upstream proxies and the CLI to propagate their own trace IDs).
+//   - Otherwise a new ID is generated.
+//
+// The ID is stored in the request context (use requestIDFromCtx) and echoed
+// on the response as X-Request-ID.
+func requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get(requestIDHeader)
+		if id == "" {
+			id = generateRequestID()
+		}
+		w.Header().Set(requestIDHeader, id)
+		ctx := context.WithValue(r.Context(), requestIDCtxKey{}, id)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// ── Access logging middleware ─────────────────────────────────────────────────
+
+// loggingMiddleware emits one structured log line per request after the handler
+// returns, including method, path, status code, latency, request ID, and the
+// client's remote address.
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sr := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
+		next.ServeHTTP(sr, r)
+		slog.Info("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", sr.code,
+			"duration_ms", time.Since(start).Milliseconds(),
+			"request_id", requestIDFromCtx(r.Context()),
+			"remote_addr", r.RemoteAddr,
+		)
+	})
 }
 
 // ── Request / response types ──────────────────────────────────────────────────

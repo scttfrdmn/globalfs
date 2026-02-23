@@ -141,11 +141,17 @@ func main() {
 	mux.Handle("/metrics", promhttp.Handler())
 	registerAPIRoutes(mux, ctx, c, m)
 
+	// Build middleware chain (applied innermost → outermost):
+	//   mux → apiKey (when set) → logging → requestID
+	// requestID is outermost: every response gets a correlation ID.
+	// logging wraps apiKey so auth rejections are also recorded.
 	var handler http.Handler = mux
 	if apiKey != "" {
-		handler = apiKeyMiddleware(apiKey)(mux)
+		handler = apiKeyMiddleware(apiKey)(handler)
 		slog.Info("API key authentication enabled")
 	}
+	handler = loggingMiddleware(handler)
+	handler = requestIDMiddleware(handler)
 
 	srv := &http.Server{
 		Addr:         addr,
