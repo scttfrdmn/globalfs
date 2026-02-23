@@ -596,7 +596,8 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 					CreatedAt:  time.Now(),
 				}
 				if persistErr := store.PutReplicationJob(ctx, metaJob); persistErr != nil {
-					log.Printf("coordinator: persist job %q: %v", metaJob.ID, persistErr)
+					log.Printf("coordinator: persist job %q: %v; skipping enqueue to preserve durability guarantee", metaJob.ID, persistErr)
+					continue
 				}
 			}
 			if enqErr := c.worker.Enqueue(replication.ReplicationJob{

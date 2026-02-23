@@ -765,6 +765,53 @@ func TestCoordinator_SetStore_RecoversPendingJobs(t *testing.T) {
 	t.Error("backup: recovered job was not delivered within 3s")
 }
 
+// TestCoordinator_Put_StoreFailureSkipsEnqueue verifies that when
+// PutReplicationJob returns an error the job is NOT enqueued in the worker,
+// preserving the durability guarantee that the store is the source of truth.
+// Regression test for #56.
+func TestCoordinator_Put_StoreFailureSkipsEnqueue(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := &failingPutJobStore{MemoryStore: metadata.NewMemoryStore()}
+	c := New(primary, backup)
+	c.SetStore(store)
+	c.Start(ctx)
+	defer c.Stop()
+
+	if err := c.Put(ctx, "genome.bam", []byte("data")); err != nil {
+		t.Fatalf("Put: unexpected error: %v", err)
+	}
+
+	// Give the worker time it would have needed to replicate, then assert the
+	// backup site did NOT receive the object.
+	time.Sleep(500 * time.Millisecond)
+
+	if backupClient.hasKey("genome.bam") {
+		t.Error("backup site should NOT have received the object when store.PutReplicationJob failed")
+	}
+
+	// The store itself should also have no pending jobs (PutReplicationJob failed).
+	jobs, _ := store.GetPendingJobs(ctx)
+	if len(jobs) != 0 {
+		t.Errorf("expected zero pending jobs in store, got %d", len(jobs))
+	}
+}
+
+// failingPutJobStore wraps MemoryStore and injects a PutReplicationJob failure.
+type failingPutJobStore struct {
+	*metadata.MemoryStore
+}
+
+func (f *failingPutJobStore) PutReplicationJob(_ context.Context, _ *metadata.ReplicationJob) error {
+	return errors.New("simulated storage failure")
+}
+
 // ─── Lease manager tests ──────────────────────────────────────────────────────
 
 // TestCoordinator_SetLeaseManager_LeaderReplicates verifies that a coordinator

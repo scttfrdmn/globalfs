@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.8] - 2026-02-23
+
+### Fixed
+- `coordinator.Put` now skips `worker.Enqueue` when `store.PutReplicationJob` fails, preserving the durability guarantee that the metadata store is the authoritative source of truth before any replication work is scheduled (#56)
+
+---
+
 ## [0.1.7] - 2026-02-23
 
 ### Fixed
