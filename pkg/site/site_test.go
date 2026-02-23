@@ -69,6 +69,16 @@ func objectInfo(key string, size int64) objectfstypes.ObjectInfo {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
+func TestNew_NilClientPanics(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for nil client, but no panic occurred")
+		}
+	}()
+	New("site1", types.SiteRolePrimary, nil)
+}
+
 func TestSiteMount_NameAndRole(t *testing.T) {
 	t.Parallel()
 	m := New("onprem", types.SiteRolePrimary, &mockClient{})

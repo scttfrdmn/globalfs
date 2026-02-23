@@ -43,8 +43,11 @@ type SiteMount struct {
 }
 
 // New creates a SiteMount backed by the given client.
-// client must not be nil.
+// Panics if client is nil.
 func New(name string, role types.SiteRole, client ObjectFSClient) *SiteMount {
+	if client == nil {
+		panic("site.New: client must not be nil")
+	}
 	return &SiteMount{
 		name:   name,
 		role:   role,

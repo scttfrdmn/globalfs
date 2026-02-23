@@ -33,10 +33,11 @@ import (
 
 // SiteInfo describes a registered GlobalFS site as returned by the coordinator.
 type SiteInfo struct {
-	Name    string `json:"name"`
-	Role    string `json:"role"`
-	Healthy bool   `json:"healthy"`
-	Error   string `json:"error,omitempty"`
+	Name         string `json:"name"`
+	Role         string `json:"role"`
+	Healthy      bool   `json:"healthy"`
+	Error        string `json:"error,omitempty"`
+	CircuitState string `json:"circuit_state,omitempty"`
 }
 
 // AddSiteRequest is the payload for registering a new site.

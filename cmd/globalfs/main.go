@@ -47,7 +47,9 @@ import (
 )
 
 // version is set via -ldflags at build time (see Makefile).
-var version = "0.1.0"
+// Falls back to "dev" so that `go run` / `go build` without the Makefile
+// never reports a real release version.
+var version = "dev"
 
 // coordinatorAddr, apiKey, and jsonOutput are global flags inherited by all subcommands.
 var (
@@ -112,33 +114,15 @@ func buildSiteCmd() *cobra.Command {
 
 // site list ───────────────────────────────────────────────────────────────────
 
-// siteInfo mirrors coordinator.SiteInfo for JSON decoding.
-type siteInfo struct {
-	Name         string `json:"name"`
-	Role         string `json:"role"`
-	Healthy      bool   `json:"healthy"`
-	Error        string `json:"error,omitempty"`
-	CircuitState string `json:"circuit_state,omitempty"`
-}
-
 func buildSiteListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List registered sites and their health",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			resp, err := apiGet("/api/v1/sites")
+			c := newClient()
+			sites, err := c.ListSites(context.Background())
 			if err != nil {
 				return err
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				return fmtAPIError(resp)
-			}
-
-			var sites []siteInfo
-			if err := json.NewDecoder(resp.Body).Decode(&sites); err != nil {
-				return fmt.Errorf("decode response: %w", err)
 			}
 
 			if jsonOutput {
@@ -209,26 +193,16 @@ func buildSiteAddCmd() *cobra.Command {
 				role = "primary"
 			}
 
-			body := map[string]string{
-				"name":        name,
-				"role":        role,
-				"s3_bucket":   bucket,
-				"s3_region":   region,
-				"s3_endpoint": endpoint,
-			}
-			resp, err := apiPost("/api/v1/sites", body)
+			c := newClient()
+			added, err := c.AddSite(context.Background(), client.AddSiteRequest{
+				Name:       name,
+				Role:       role,
+				S3Bucket:   bucket,
+				S3Region:   region,
+				S3Endpoint: endpoint,
+			})
 			if err != nil {
 				return err
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusCreated {
-				return fmtAPIError(resp)
-			}
-
-			var added siteInfo
-			if err := json.NewDecoder(resp.Body).Decode(&added); err != nil {
-				return fmt.Errorf("decode response: %w", err)
 			}
 
 			if jsonOutput {
@@ -256,21 +230,14 @@ func buildSiteRemoveCmd() *cobra.Command {
 				return fmt.Errorf("--name is required")
 			}
 
-			resp, err := apiDelete(fmt.Sprintf("/api/v1/sites/%s", url.PathEscape(name)))
-			if err != nil {
+			c := newClient()
+			if err := c.RemoveSite(context.Background(), name); err != nil {
 				return err
 			}
-			defer resp.Body.Close()
-
-			switch resp.StatusCode {
-			case http.StatusNoContent:
-				if !jsonOutput {
-					fmt.Fprintf(cmd.OutOrStdout(), "Site %q deregistered.\n", name)
-				}
-				return nil
-			default:
-				return fmtAPIError(resp)
+			if !jsonOutput {
+				fmt.Fprintf(cmd.OutOrStdout(), "Site %q deregistered.\n", name)
 			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "Site name to remove (required)")
@@ -634,13 +601,6 @@ func buildConfigInitCmd() *cobra.Command {
 
 // ── replicate ─────────────────────────────────────────────────────────────────
 
-type replicateResponse struct {
-	Status string `json:"status"`
-	Key    string `json:"key"`
-	From   string `json:"from"`
-	To     string `json:"to"`
-}
-
 func buildReplicateCmd() *cobra.Command {
 	var (
 		key  string
@@ -661,20 +621,12 @@ func buildReplicateCmd() *cobra.Command {
 				return fmt.Errorf("--to is required")
 			}
 
-			body := map[string]string{"key": key, "from": from, "to": to}
-			resp, err := apiPost("/api/v1/replicate", body)
+			c := newClient()
+			result, err := c.Replicate(context.Background(), client.ReplicateRequest{
+				Key: key, From: from, To: to,
+			})
 			if err != nil {
 				return err
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusAccepted {
-				return fmtAPIError(resp)
-			}
-
-			var result replicateResponse
-			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-				return fmt.Errorf("decode response: %w", err)
 			}
 
 			if jsonOutput {
@@ -885,37 +837,6 @@ func apiGet(path string) (*http.Response, error) {
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("GET %s: %w", path, err)
-	}
-	return resp, nil
-}
-
-func apiPost(path string, body any) (*http.Response, error) {
-	data, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-	req, err := http.NewRequest(http.MethodPost, apiURL(path), bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("POST %s: %w", path, err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	setAuthHeader(req)
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("POST %s: %w", path, err)
-	}
-	return resp, nil
-}
-
-func apiDelete(path string) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodDelete, apiURL(path), nil)
-	if err != nil {
-		return nil, fmt.Errorf("DELETE %s: %w", path, err)
-	}
-	setAuthHeader(req)
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("DELETE %s: %w", path, err)
 	}
 	return resp, nil
 }

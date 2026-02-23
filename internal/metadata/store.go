@@ -72,9 +72,6 @@ type ReplicationJob struct {
 	// Size is the expected object size in bytes (0 = unknown).
 	Size int64 `json:"size"`
 
-	// Priority is reserved for future priority-queue ordering.
-	Priority int `json:"priority"`
-
 	// CreatedAt is when the job was persisted.
 	CreatedAt time.Time `json:"created_at"`
 }

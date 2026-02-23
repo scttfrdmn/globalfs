@@ -118,7 +118,7 @@ func TestSiteList_TableOutput(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]siteInfo{
+		json.NewEncoder(w).Encode([]client.SiteInfo{
 			{Name: "primary", Role: "primary", Healthy: true},
 			{Name: "backup", Role: "backup", Healthy: false, Error: "timeout"},
 		})
@@ -141,7 +141,7 @@ func TestSiteList_JSONOutput(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]siteInfo{
+		json.NewEncoder(w).Encode([]client.SiteInfo{
 			{Name: "s1", Role: "primary", Healthy: true},
 		})
 	})
@@ -151,7 +151,7 @@ func TestSiteList_JSONOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("site list --json: %v", err)
 	}
-	var sites []siteInfo
+	var sites []client.SiteInfo
 	if err := json.Unmarshal([]byte(out), &sites); err != nil {
 		t.Fatalf("unmarshal: %v (output: %q)", err, out)
 	}
@@ -166,7 +166,7 @@ func TestSiteList_WithCircuitState(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]siteInfo{
+		json.NewEncoder(w).Encode([]client.SiteInfo{
 			{Name: "primary", Role: "primary", Healthy: true, CircuitState: "closed"},
 			{Name: "burst", Role: "burst", Healthy: true, CircuitState: "open"},
 		})
@@ -194,7 +194,7 @@ func TestSiteList_NoCircuitState(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]siteInfo{
+		json.NewEncoder(w).Encode([]client.SiteInfo{
 			{Name: "primary", Role: "primary", Healthy: true},
 		})
 	})
@@ -251,7 +251,7 @@ func TestReplicate_OK(t *testing.T) {
 		json.NewDecoder(r.Body).Decode(&req)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(replicateResponse{
+		json.NewEncoder(w).Encode(client.ReplicateResponse{
 			Status: "accepted",
 			Key:    req["key"],
 			From:   req["from"],

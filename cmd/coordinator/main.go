@@ -44,7 +44,9 @@ import (
 )
 
 // version is set via -ldflags at build time (see Makefile).
-var version = "0.1.0"
+// Falls back to "dev" so that `go run` / `go build` without the Makefile
+// never reports a real release version.
+var version = "dev"
 
 func main() {
 	configPath       := flag.String("config", "", "Path to YAML configuration file")
@@ -248,10 +250,12 @@ func main() {
 	handler = requestIDMiddleware(handler)
 
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      handler,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,  // mitigate Slowloris slow-header attacks
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second, // cap keep-alive lifetime
 	}
 
 	go func() {

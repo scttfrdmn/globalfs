@@ -60,9 +60,6 @@ type ReplicationJob struct {
 	// Size is the expected object size in bytes (0 = unknown; informational only).
 	Size int64
 
-	// Priority is reserved for future priority-queue ordering.
-	// Lower values indicate higher priority.  Currently unused.
-	Priority int
 }
 
 // ReplicationEvent is emitted for each job lifecycle transition.
