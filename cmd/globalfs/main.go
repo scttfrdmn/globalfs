@@ -567,6 +567,22 @@ performance:
   max_concurrent_transfers: 8
   transfer_chunk_size: 16777216  # 16 MiB
   cache_size: "1GB"
+
+# Resilience — fault tolerance for site routing
+resilience:
+  health_poll_interval: 30s   # background health check cadence
+
+  circuit_breaker:
+    enabled: false            # set true to isolate failing sites automatically
+    threshold: 5              # consecutive failures before circuit opens
+    cooldown: 30s             # wait before probe after circuit opens
+
+  retry:
+    enabled: false            # set true to retry transient read failures
+    max_attempts: 3           # total attempts per site (1 = no retry)
+    initial_delay: 100ms      # pause before first retry
+    max_delay: 2s             # cap on inter-retry pause
+    multiplier: 2.0           # exponential scale factor
 `
 
 func buildConfigInitCmd() *cobra.Command {

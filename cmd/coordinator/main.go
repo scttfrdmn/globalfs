@@ -32,9 +32,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/coordinator"
 	"github.com/scttfrdmn/globalfs/internal/metrics"
 	"github.com/scttfrdmn/globalfs/internal/policy"
+	"github.com/scttfrdmn/globalfs/internal/retry"
 	"github.com/scttfrdmn/globalfs/pkg/config"
 	"github.com/scttfrdmn/globalfs/pkg/site"
 	"github.com/scttfrdmn/globalfs/pkg/types"
@@ -48,7 +50,7 @@ func main() {
 	logLevelStr      := flag.String("log-level", "INFO", "Log level: DEBUG, INFO, WARN, ERROR")
 	bindAddr         := flag.String("bind-addr", "", "HTTP server address (default :8090, or coordinator.listen_addr from config)")
 	apiKeyFlag       := flag.String("api-key", "", "Shared API key for X-GlobalFS-API-Key auth (env: GLOBALFS_API_KEY; empty = disabled)")
-	healthPollStr    := flag.String("health-poll-interval", "30s", "Interval between background site health checks (e.g. 15s, 1m)")
+	healthPollStr    := flag.String("health-poll-interval", "", "Interval between background site health checks (e.g. 15s, 1m); overrides config")
 	showVersion      := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -118,11 +120,68 @@ func main() {
 	m := metrics.New(prometheus.DefaultRegisterer)
 	c.SetMetrics(m)
 
-	if pollInterval, err := time.ParseDuration(*healthPollStr); err == nil && pollInterval > 0 {
-		c.SetHealthPollInterval(pollInterval)
-		slog.Info("health polling configured", "interval", pollInterval)
-	} else if err != nil {
-		slog.Warn("invalid --health-poll-interval; using default 30s", "value", *healthPollStr, "error", err)
+	// ── Resilience: health polling ────────────────────────────────────────────
+	// Priority: explicit --health-poll-interval flag > resilience.health_poll_interval
+	// in config > built-in default (30s inside coordinator.Start).
+	healthPoll := cfg.Resilience.HealthPollInterval
+	if *healthPollStr != "" {
+		if d, err := time.ParseDuration(*healthPollStr); err == nil && d > 0 {
+			healthPoll = d
+		} else if err != nil {
+			slog.Warn("invalid --health-poll-interval; ignoring", "value", *healthPollStr, "error", err)
+		}
+	}
+	if healthPoll > 0 {
+		c.SetHealthPollInterval(healthPoll)
+		slog.Info("health polling configured", "interval", healthPoll)
+	}
+
+	// ── Resilience: circuit breaker ───────────────────────────────────────────
+	if cfg.Resilience.CircuitBreaker.Enabled {
+		cbCfg := cfg.Resilience.CircuitBreaker
+		threshold := cbCfg.Threshold
+		if threshold <= 0 {
+			threshold = 5
+		}
+		cooldown := cbCfg.Cooldown
+		if cooldown <= 0 {
+			cooldown = 30 * time.Second
+		}
+		cb := circuitbreaker.New(threshold, cooldown)
+		c.SetCircuitBreaker(cb)
+		slog.Info("circuit breaker enabled", "threshold", threshold, "cooldown", cooldown)
+	}
+
+	// ── Resilience: retry ─────────────────────────────────────────────────────
+	if cfg.Resilience.Retry.Enabled {
+		retryCfg := cfg.Resilience.Retry
+		maxAttempts := retryCfg.MaxAttempts
+		if maxAttempts <= 0 {
+			maxAttempts = 3
+		}
+		initialDelay := retryCfg.InitialDelay
+		if initialDelay <= 0 {
+			initialDelay = 100 * time.Millisecond
+		}
+		maxDelay := retryCfg.MaxDelay
+		if maxDelay <= 0 {
+			maxDelay = 2 * time.Second
+		}
+		multiplier := retryCfg.Multiplier
+		if multiplier < 1.0 {
+			multiplier = 2.0
+		}
+		c.SetRetryConfig(&retry.Config{
+			MaxAttempts:  maxAttempts,
+			InitialDelay: initialDelay,
+			MaxDelay:     maxDelay,
+			Multiplier:   multiplier,
+		})
+		slog.Info("retry configured",
+			"max_attempts", maxAttempts,
+			"initial_delay", initialDelay,
+			"max_delay", maxDelay,
+			"multiplier", multiplier)
 	}
 
 	if len(cfg.Policy.Rules) > 0 {

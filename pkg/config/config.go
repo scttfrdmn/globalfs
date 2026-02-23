@@ -38,6 +38,54 @@ type PolicyConfig struct {
 	Rules []PolicyRuleConfig `yaml:"rules"`
 }
 
+// CircuitBreakerConfig configures the per-site circuit breaker.
+// When enabled, sites are isolated automatically after consecutive failures.
+type CircuitBreakerConfig struct {
+	// Enabled activates circuit breaking.  Default false.
+	Enabled bool `yaml:"enabled"`
+
+	// Threshold is the number of consecutive failures before a circuit opens.
+	// Must be ≥ 1.  Default 5.
+	Threshold int `yaml:"threshold"`
+
+	// Cooldown is the time the circuit stays open before a probe is allowed.
+	// Default 30s.
+	Cooldown time.Duration `yaml:"cooldown"`
+}
+
+// RetryConfig configures per-site retry with exponential backoff.
+// Applied to read operations (Get, Head) only; writes fail fast by design.
+type RetryConfig struct {
+	// Enabled activates retry logic.  Default false.
+	Enabled bool `yaml:"enabled"`
+
+	// MaxAttempts is the total number of calls per site (1 = no retry).
+	// Default 3.
+	MaxAttempts int `yaml:"max_attempts"`
+
+	// InitialDelay is the pause before the first retry.  Default 100ms.
+	InitialDelay time.Duration `yaml:"initial_delay"`
+
+	// MaxDelay caps the inter-retry pause.  Default 2s.
+	MaxDelay time.Duration `yaml:"max_delay"`
+
+	// Multiplier scales the delay after each retry.  Default 2.0.
+	Multiplier float64 `yaml:"multiplier"`
+}
+
+// ResilienceConfig groups fault-tolerance and health-monitoring settings.
+type ResilienceConfig struct {
+	// HealthPollInterval sets the background site health check cadence.
+	// Overrides the --health-poll-interval flag when set.  Default 30s.
+	HealthPollInterval time.Duration `yaml:"health_poll_interval"`
+
+	// CircuitBreaker configures automatic site isolation on failure.
+	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
+
+	// Retry configures per-site retry with exponential backoff.
+	Retry RetryConfig `yaml:"retry"`
+}
+
 // Configuration represents the complete GlobalFS configuration.
 type Configuration struct {
 	// Global settings
@@ -57,6 +105,10 @@ type Configuration struct {
 
 	// Performance tuning
 	Performance types.PerformanceConfig `yaml:"performance"`
+
+	// Resilience configures fault tolerance: health polling, circuit breaker,
+	// and per-site retry.
+	Resilience ResilienceConfig `yaml:"resilience"`
 }
 
 // GlobalConfig contains global settings.
@@ -140,6 +192,21 @@ func NewDefault() *Configuration {
 			MaxConcurrentTransfers: 8,
 			TransferChunkSize:      16 * 1024 * 1024, // 16MB
 			CacheSize:              "1GB",
+		},
+		Resilience: ResilienceConfig{
+			HealthPollInterval: 30 * time.Second,
+			CircuitBreaker: CircuitBreakerConfig{
+				Enabled:   false,
+				Threshold: 5,
+				Cooldown:  30 * time.Second,
+			},
+			Retry: RetryConfig{
+				Enabled:      false,
+				MaxAttempts:  3,
+				InitialDelay: 100 * time.Millisecond,
+				MaxDelay:     2 * time.Second,
+				Multiplier:   2.0,
+			},
 		},
 	}
 }

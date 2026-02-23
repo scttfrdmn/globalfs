@@ -100,3 +100,23 @@ performance:
   max_concurrent_transfers: 8
   transfer_chunk_size: 16777216  # 16MB
   cache_size: "4GB"
+
+# Resilience settings — fault tolerance for read routing
+resilience:
+  # health_poll_interval sets the background site health check cadence.
+  # Overrides the --health-poll-interval daemon flag when set.
+  health_poll_interval: 30s
+
+  # circuit_breaker isolates failing sites automatically.
+  circuit_breaker:
+    enabled: true
+    threshold: 5     # consecutive failures before the circuit opens
+    cooldown: 30s    # time before a probe is allowed after opening
+
+  # retry retries transient read failures per-site before falling back.
+  retry:
+    enabled: true
+    max_attempts: 3       # total attempts per site (1 = no retry)
+    initial_delay: 100ms  # pause before first retry
+    max_delay: 2s         # cap on inter-retry pause
+    multiplier: 2.0       # exponential scale factor
