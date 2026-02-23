@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -62,7 +63,9 @@ func NewEtcdStore(ctx context.Context, cfg EtcdConfig) (*EtcdStore, error) {
 	pingCtx, cancel := context.WithTimeout(ctx, cfg.DialTimeout)
 	defer cancel()
 	if _, err := cli.Status(pingCtx, cfg.Endpoints[0]); err != nil {
-		_ = cli.Close()
+		if closeErr := cli.Close(); closeErr != nil {
+			slog.Warn("etcd: close client after failed ping", "endpoint", cfg.Endpoints[0], "err", closeErr)
+		}
 		return nil, fmt.Errorf("etcd: ping %q: %w", cfg.Endpoints[0], err)
 	}
 

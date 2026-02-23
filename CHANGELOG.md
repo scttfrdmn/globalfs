@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.7] - 2026-02-23
+
+### Fixed
+- `NewEtcdStore` now logs a `slog.Warn` when `cli.Close()` fails on the ping-failure path instead of silently discarding the error with `_ = cli.Close()` (#55)
+
+---
+
 ## [0.1.6] - 2026-02-23
 
 ### Fixed
