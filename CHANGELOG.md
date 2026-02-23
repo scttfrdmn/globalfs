@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.3] - 2026-02-23
+
+### Fixed
+- `site.New()` now panics immediately when `client` is nil instead of deferring to a nil-pointer dereference on first use (#35)
+- HTTP server gains `ReadHeaderTimeout: 5s` and `IdleTimeout: 60s` to mitigate Slowloris slow-header attacks and cap keep-alive lifetime (#36)
+
+### Changed
+- Version fallback changed from `"0.1.0"` to `"dev"` in both binaries so ad-hoc `go build` / `go run` builds are never mistaken for a released version (#34)
+- `site list`, `site add`, `site remove`, and `replicate` CLI commands migrated from raw HTTP helpers to `pkg/client.Client` methods; `CircuitState` added to `client.SiteInfo` (#38)
+
+### Removed
+- Dead types removed from `pkg/types`: `SyncMode` + constants, `LeaseType` + constants, `Lease`, `SiteInfo`, `HealthMetrics`, `FileMetadata` (#37)
+- Unused `Priority` field removed from `internal/metadata.ReplicationJob` and `internal/replication.ReplicationJob` (#37)
+- Duplicate raw HTTP helpers `apiPost` and `apiDelete` removed from the CLI after client migration (#38)
+
+---
+
+## [0.1.2] - 2026-02-23
+
+### Fixed
+- `config.Validate()` now rejects invalid `log_level` values and validates `resilience` and `cache` fields when the respective feature is enabled (#30)
+- `MemoryStore.notify()` is now called after releasing the write lock, eliminating the deadlock risk when watcher consumers call back into store methods; `safeWatchSend` guards the narrow close-after-snapshot race (#32)
+- `coordinator.Put` now persists the replication job to the store *before* enqueueing it in the worker, closing a race where a fast worker could complete and `DeleteJob` could run before `PutReplicationJob` (#32)
+- etcd `Watch` now checks `resp.Err()` and logs compaction/reconnect errors so missed events are surfaced rather than silently dropped (#33)
+
+### Added
+- Unit tests for `addSiteHandler`, `removeSiteHandler`, and `replicateHandler` in the coordinator HTTP API (#31)
+- Unit tests for all new `config.Validate()` paths — 10 new cases (#30)
+
+---
+
+## [0.1.1] - 2026-02-23
+
+### Fixed
+- `cache.Cache` no longer evicts entries when a new value would fit within the remaining budget, only when it would exceed it (#25)
+- `Coordinator.Start()` is now guarded by `sync.Once` so calling it multiple times does not launch duplicate background goroutines (#26)
+- `objectPutHandler` enforces a 32 MiB request-body limit via `http.MaxBytesReader`, returning `413 Request Entity Too Large` on oversized uploads (#27)
+- `setupLogger` is now called before config parsing so the `--log-level` flag takes effect for all startup log lines (#28)
+- `namespace.Namespace.List` returns a non-nil error alongside partial results when one or more sites fail, and the HTTP handler responds with `207 Multi-Status` in that case (#29)
+
+---
+
 ## [0.1.0] - 2026-02-22
 
 First production-ready release of the GlobalFS coordinator.
