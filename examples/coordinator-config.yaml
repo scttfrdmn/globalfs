@@ -1,0 +1,130 @@
+# GlobalFS Coordinator Configuration
+#
+# Start the coordinator daemon with:
+#   globalfs-coordinator --config coordinator-config.yaml
+#
+# The daemon exposes:
+#   GET /healthz   — 200 if all primary sites are reachable
+#   GET /readyz    — 200 once the coordinator is running
+#   GET /metrics   — Prometheus metrics
+#
+# All ObjectFS sites must be backed by an accessible S3 bucket.
+# AWS credentials are read from the standard credential chain
+# (environment variables, ~/.aws/credentials, EC2 instance role, etc.).
+
+# ── Global settings ────────────────────────────────────────────────────────────
+
+global:
+  # Human-readable cluster name (used in logs and metrics labels).
+  cluster_name: "hpc-globalfs"
+
+  # Log verbosity: DEBUG, INFO, WARN, ERROR.
+  log_level: "INFO"
+
+  # Set metrics_enabled: false to disable Prometheus instrumentation.
+  metrics_enabled: true
+
+# ── Coordinator settings ───────────────────────────────────────────────────────
+
+coordinator:
+  # HTTP bind address for /healthz, /readyz, and /metrics.
+  # Can be overridden at runtime with --bind-addr.
+  listen_addr: ":8090"
+
+  # etcd endpoints for distributed metadata (used by the lease manager).
+  # Leave empty for single-node / in-memory-only mode.
+  etcd_endpoints:
+    - "localhost:2379"
+
+  lease_timeout: 60s
+  health_check_interval: 30s
+
+# ── Site definitions ───────────────────────────────────────────────────────────
+#
+# Roles:
+#   primary  — on-premises or authoritative site; writes are synchronous
+#   backup   — disaster-recovery replica; async replication
+#   burst    — cloud overflow for elastic HPC workloads; async replication
+
+sites:
+  # On-premises primary site backed by MinIO
+  - name: onprem
+    role: primary
+    objectfs:
+      mount_point: /mnt/objectfs-onprem      # local ObjectFS mount path
+      s3_bucket: hpc-data-onprem
+      s3_region: us-west-2
+      s3_endpoint: http://minio.local:9000   # omit for AWS S3
+    cargoship:
+      endpoint: http://cargoship-onprem:8081
+      enabled: true
+
+  # AWS S3 cloud burst site
+  - name: cloud
+    role: burst
+    objectfs:
+      mount_point: /mnt/objectfs-cloud
+      s3_bucket: hpc-data-cloud-us-west-2
+      s3_region: us-west-2
+    cargoship:
+      endpoint: http://cargoship-cloud:8081
+      enabled: true
+
+  # Off-site backup replica (e.g. a second AWS region)
+  - name: backup
+    role: backup
+    objectfs:
+      mount_point: /mnt/objectfs-backup
+      s3_bucket: hpc-data-backup-us-east-1
+      s3_region: us-east-1
+    cargoship:
+      endpoint: ""
+      enabled: false
+
+# ── Policy routing rules ───────────────────────────────────────────────────────
+#
+# Rules are evaluated in ascending priority order (lower number = first).
+# The first matching rule wins.
+#
+# key_pattern supports:
+#   exact match     "data/genome.bam"
+#   glob            "*.bam"  or  "results/*"
+#   recursive prefix "genomes/"   (trailing / = everything under that path)
+#   empty           ""            (matches all keys)
+#
+# operations: read, write, delete  (empty = all)
+# target_roles: primary, backup, burst  (empty = all sites, default order)
+
+policy:
+  rules:
+    # Scratch files stay on burst only — never written to primary or backup.
+    - name: scratch-to-burst
+      key_pattern: "scratch/"
+      operations: [write, read, delete]
+      target_roles: [burst]
+      priority: 10
+
+    # Reference genomes are read-only from primary (authoritative copy).
+    - name: reference-genomes-read-primary
+      key_pattern: "reference/"
+      operations: [read]
+      target_roles: [primary]
+      priority: 20
+
+    # Output results: write to burst first; async replication handles the rest.
+    - name: results-to-burst
+      key_pattern: "results/"
+      operations: [write]
+      target_roles: [burst]
+      priority: 30
+
+    # Everything else: default routing (primary → backup → burst).
+    # An empty rule is not required — the engine falls back to default order
+    # automatically when no rule matches.
+
+# ── Performance tuning ─────────────────────────────────────────────────────────
+
+performance:
+  max_concurrent_transfers: 8
+  transfer_chunk_size: 16777216  # 16 MiB
+  cache_size: "4GB"
