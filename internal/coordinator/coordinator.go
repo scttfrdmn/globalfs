@@ -30,6 +30,7 @@ import (
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
+	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/lease"
 	"github.com/scttfrdmn/globalfs/internal/metadata"
 	"github.com/scttfrdmn/globalfs/internal/metrics"
@@ -60,6 +61,9 @@ type Coordinator struct {
 	healthCacheMu      sync.RWMutex
 	healthCache        map[string]error // nil = not yet polled
 	healthCheckedAt    time.Time
+
+	// Circuit breaker (optional).
+	cb *circuitbreaker.Breaker // nil = disabled
 }
 
 // defaultHealthPollInterval is the cadence for background site health checks
@@ -137,6 +141,21 @@ func (c *Coordinator) SetHealthPollInterval(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.healthPollInterval = d
+}
+
+// SetCircuitBreaker registers a circuit breaker with the coordinator.
+//
+// When set, sites whose circuit is open are skipped during read routing (Get,
+// Head).  Write operations (Put, Delete) always target their designated sites
+// but record success/failure to keep the breaker state current.
+//
+// If all circuits are open the breaker is bypassed so callers are never
+// completely blocked by a stale circuit state.  Pass nil to disable circuit
+// breaking.  May be called at any time; safe for concurrent use.
+func (c *Coordinator) SetCircuitBreaker(cb *circuitbreaker.Breaker) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cb = cb
 }
 
 // HealthStatus returns the most recent cached health report and the time it
@@ -366,7 +385,7 @@ func (c *Coordinator) Health(ctx context.Context) map[string]error {
 // are only tried as a fallback.  The first successful read is returned.
 func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 	c.mu.RLock()
-	snapshot, pol := c.snapshotSites(), c.policy
+	snapshot, pol, cb := c.snapshotSites(), c.policy, c.cb
 	c.mu.RUnlock()
 
 	ordered, err := pol.Route(ctx, policy.OperationRead, key, snapshot)
@@ -379,10 +398,18 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 
 	healthReport, _ := c.HealthStatus()
 	ordered = preferHealthySites(ordered, healthReport)
+	ordered = filterByCircuitBreaker(cb, ordered)
 
 	var lastErr error
 	for _, s := range ordered {
 		data, err := s.Get(ctx, key, 0, 0)
+		if cb != nil {
+			if err == nil {
+				cb.RecordSuccess(s.Name())
+			} else {
+				cb.RecordFailure(s.Name())
+			}
+		}
 		if err == nil {
 			return data, nil
 		}
@@ -403,7 +430,7 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 // target so data is durably stored before Put returns.
 func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	c.mu.RLock()
-	snapshot, pol, store := c.snapshotSites(), c.policy, c.store
+	snapshot, pol, store, cb := c.snapshotSites(), c.policy, c.store, c.cb
 	c.mu.RUnlock()
 
 	routed, err := pol.Route(ctx, policy.OperationWrite, key, snapshot)
@@ -423,7 +450,13 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 
 	for _, s := range primaries {
 		if err := s.Put(ctx, key, data); err != nil {
+			if cb != nil {
+				cb.RecordFailure(s.Name())
+			}
 			return fmt.Errorf("coordinator: Put %q to %q: %w", key, s.Name(), err)
+		}
+		if cb != nil {
+			cb.RecordSuccess(s.Name())
 		}
 	}
 
@@ -462,7 +495,7 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 // Non-primary deletes are best-effort: errors are logged but not returned.
 func (c *Coordinator) Delete(ctx context.Context, key string) error {
 	c.mu.RLock()
-	snapshot, pol := c.snapshotSites(), c.policy
+	snapshot, pol, cb := c.snapshotSites(), c.policy, c.cb
 	c.mu.RUnlock()
 
 	routed, err := pol.Route(ctx, policy.OperationDelete, key, snapshot)
@@ -474,12 +507,23 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 
 	for _, s := range primaries {
 		if err := s.Delete(ctx, key); err != nil {
+			if cb != nil {
+				cb.RecordFailure(s.Name())
+			}
 			return fmt.Errorf("coordinator: Delete %q from primary %q: %w", key, s.Name(), err)
+		}
+		if cb != nil {
+			cb.RecordSuccess(s.Name())
 		}
 	}
 	for _, s := range others {
 		if err := s.Delete(ctx, key); err != nil {
+			if cb != nil {
+				cb.RecordFailure(s.Name())
+			}
 			log.Printf("coordinator: Delete %q from non-primary %q: %v", key, s.Name(), err)
+		} else if cb != nil {
+			cb.RecordSuccess(s.Name())
 		}
 	}
 	return nil
@@ -497,7 +541,7 @@ func (c *Coordinator) List(ctx context.Context, prefix string, limit int) ([]obj
 // front (same health-aware reordering as Get).  The first hit is returned.
 func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.ObjectInfo, error) {
 	c.mu.RLock()
-	snapshot, pol := c.snapshotSites(), c.policy
+	snapshot, pol, cb := c.snapshotSites(), c.policy, c.cb
 	c.mu.RUnlock()
 
 	ordered, err := pol.Route(ctx, policy.OperationRead, key, snapshot)
@@ -510,10 +554,18 @@ func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.Obje
 
 	healthReport, _ := c.HealthStatus()
 	ordered = preferHealthySites(ordered, healthReport)
+	ordered = filterByCircuitBreaker(cb, ordered)
 
 	var lastErr error
 	for _, s := range ordered {
 		info, err := s.Head(ctx, key)
+		if cb != nil {
+			if err == nil {
+				cb.RecordSuccess(s.Name())
+			} else {
+				cb.RecordFailure(s.Name())
+			}
+		}
 		if err == nil {
 			return info, nil
 		}
@@ -634,6 +686,29 @@ func preferHealthySites(sites []*site.SiteMount, report map[string]error) []*sit
 		return healthy
 	}
 	return append(healthy, degraded...)
+}
+
+// filterByCircuitBreaker returns a filtered subset of sites whose circuits
+// are not open.  For HalfOpen sites, Allow is called which marks them as
+// probing so only one probe is in flight at a time.
+//
+// If cb is nil, or if every site's circuit is open, the original slice is
+// returned unchanged so callers are never completely blocked by stale state.
+func filterByCircuitBreaker(cb *circuitbreaker.Breaker, sites []*site.SiteMount) []*site.SiteMount {
+	if cb == nil {
+		return sites
+	}
+	allowed := make([]*site.SiteMount, 0, len(sites))
+	for _, s := range sites {
+		if cb.Allow(s.Name()) {
+			allowed = append(allowed, s)
+		}
+	}
+	if len(allowed) == 0 {
+		// All circuits open — fall back to all sites to avoid blocking callers.
+		return sites
+	}
+	return allowed
 }
 
 // partitionByRole splits sites into primary-role and non-primary slices,

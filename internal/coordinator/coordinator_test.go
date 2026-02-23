@@ -9,6 +9,7 @@ import (
 
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
+	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/lease"
 	"github.com/scttfrdmn/globalfs/internal/metadata"
 	"github.com/scttfrdmn/globalfs/internal/policy"
@@ -1099,4 +1100,207 @@ func siteNames(sites []*site.SiteMount) []string {
 		names[i] = s.Name()
 	}
 	return names
+}
+
+// ─── Circuit breaker tests ────────────────────────────────────────────────────
+
+// TestCoordinator_CircuitBreaker_SkipsOpenCircuit verifies that Get skips a
+// site whose circuit is open and succeeds via the next available site.
+func TestCoordinator_CircuitBreaker_SkipsOpenCircuit(t *testing.T) {
+	t.Parallel()
+
+	primaryClient := &memClient{getErr: errors.New("primary down"), objects: map[string][]byte{}}
+	primary := site.New("primary", types.SiteRolePrimary, primaryClient)
+	backup, _ := makeMount("backup", types.SiteRoleBackup, map[string][]byte{
+		"obj": []byte("backup-data"),
+	})
+
+	cb := circuitbreaker.New(1, time.Hour) // opens after 1 failure
+	// Manually open the primary circuit to simulate a prior failure.
+	cb.RecordFailure("primary")
+
+	c := New(primary, backup)
+	c.SetCircuitBreaker(cb)
+
+	data, err := c.Get(context.Background(), "obj")
+	if err != nil {
+		t.Fatalf("Get: unexpected error: %v", err)
+	}
+	if string(data) != "backup-data" {
+		t.Errorf("Get: got %q, want backup-data", string(data))
+	}
+}
+
+// TestCoordinator_CircuitBreaker_FallbackWhenAllOpen verifies that Get still
+// succeeds when all circuits are open (breaker bypassed as fallback).
+func TestCoordinator_CircuitBreaker_FallbackWhenAllOpen(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"obj": []byte("data"),
+	})
+
+	cb := circuitbreaker.New(1, time.Hour)
+	cb.RecordFailure("primary") // open the only circuit
+
+	c := New(primary)
+	c.SetCircuitBreaker(cb)
+
+	// Even with all circuits open, Get should fall back and succeed.
+	data, err := c.Get(context.Background(), "obj")
+	if err != nil {
+		t.Fatalf("Get (all-open fallback): unexpected error: %v", err)
+	}
+	if string(data) != "data" {
+		t.Errorf("Get (all-open fallback): got %q, want data", string(data))
+	}
+}
+
+// TestCoordinator_CircuitBreaker_RecordsFailures verifies that failed Get
+// operations trip the circuit after threshold consecutive failures.
+func TestCoordinator_CircuitBreaker_RecordsFailures(t *testing.T) {
+	t.Parallel()
+
+	primaryClient := &memClient{getErr: errors.New("unavailable"), objects: map[string][]byte{}}
+	primary := site.New("primary", types.SiteRolePrimary, primaryClient)
+
+	cb := circuitbreaker.New(3, time.Hour)
+	c := New(primary)
+	c.SetCircuitBreaker(cb)
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		_, _ = c.Get(ctx, "key") // each call records a failure
+	}
+
+	if got := cb.State("primary"); got != circuitbreaker.StateOpen {
+		t.Errorf("expected circuit Open after 3 failures, got %v", got)
+	}
+}
+
+// TestCoordinator_CircuitBreaker_RecordsSuccesses verifies that a successful
+// Get records success and keeps the circuit closed.
+func TestCoordinator_CircuitBreaker_RecordsSuccesses(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"obj": []byte("content"),
+	})
+
+	cb := circuitbreaker.New(3, time.Hour)
+	// Warm up with failures just below threshold.
+	cb.RecordFailure("primary")
+	cb.RecordFailure("primary")
+
+	c := New(primary)
+	c.SetCircuitBreaker(cb)
+
+	_, err := c.Get(context.Background(), "obj")
+	if err != nil {
+		t.Fatalf("Get: unexpected error: %v", err)
+	}
+
+	// Success should have reset the failure counter; circuit stays Closed.
+	if got := cb.State("primary"); got != circuitbreaker.StateClosed {
+		t.Errorf("expected circuit Closed after success, got %v", got)
+	}
+}
+
+// TestCoordinator_CircuitBreaker_PutRecordsFailure verifies that a failed Put
+// to a primary site records a failure in the circuit breaker.
+func TestCoordinator_CircuitBreaker_PutRecordsFailure(t *testing.T) {
+	t.Parallel()
+
+	primaryClient := &memClient{putErr: errors.New("write error"), objects: map[string][]byte{}}
+	primary := site.New("primary", types.SiteRolePrimary, primaryClient)
+
+	cb := circuitbreaker.New(1, time.Hour)
+	c := New(primary)
+	c.SetCircuitBreaker(cb)
+
+	_ = c.Put(context.Background(), "key", []byte("data"))
+
+	if got := cb.State("primary"); got != circuitbreaker.StateOpen {
+		t.Errorf("expected circuit Open after Put failure, got %v", got)
+	}
+}
+
+// TestCoordinator_CircuitBreaker_NilIsNoop verifies that a nil circuit breaker
+// (the default) does not affect coordinator behaviour.
+func TestCoordinator_CircuitBreaker_NilIsNoop(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"k": []byte("v"),
+	})
+	c := New(primary)
+	// No SetCircuitBreaker — cb is nil.
+
+	data, err := c.Get(context.Background(), "k")
+	if err != nil {
+		t.Fatalf("Get: unexpected error: %v", err)
+	}
+	if string(data) != "v" {
+		t.Errorf("Get: got %q, want v", string(data))
+	}
+}
+
+// TestFilterByCircuitBreaker_AllowsClosedSites verifies the helper allows all
+// sites when no circuits are open.
+func TestFilterByCircuitBreaker_AllowsClosedSites(t *testing.T) {
+	t.Parallel()
+
+	s1, _ := makeMount("a", types.SiteRolePrimary, nil)
+	s2, _ := makeMount("b", types.SiteRoleBackup, nil)
+	cb := circuitbreaker.New(1, time.Hour)
+
+	got := filterByCircuitBreaker(cb, []*site.SiteMount{s1, s2})
+	if len(got) != 2 {
+		t.Errorf("expected 2 sites, got %d", len(got))
+	}
+}
+
+// TestFilterByCircuitBreaker_FiltersOpenCircuit verifies the helper removes
+// open-circuit sites and preserves closed ones.
+func TestFilterByCircuitBreaker_FiltersOpenCircuit(t *testing.T) {
+	t.Parallel()
+
+	s1, _ := makeMount("a", types.SiteRolePrimary, nil)
+	s2, _ := makeMount("b", types.SiteRoleBackup, nil)
+	cb := circuitbreaker.New(1, time.Hour)
+	cb.RecordFailure("a") // open circuit for "a"
+
+	got := filterByCircuitBreaker(cb, []*site.SiteMount{s1, s2})
+	if len(got) != 1 || got[0].Name() != "b" {
+		t.Errorf("expected only site-b, got %v", siteNames(got))
+	}
+}
+
+// TestFilterByCircuitBreaker_FallbackWhenAllOpen verifies the helper returns
+// the original slice when all circuits are open.
+func TestFilterByCircuitBreaker_FallbackWhenAllOpen(t *testing.T) {
+	t.Parallel()
+
+	s1, _ := makeMount("a", types.SiteRolePrimary, nil)
+	s2, _ := makeMount("b", types.SiteRoleBackup, nil)
+	cb := circuitbreaker.New(1, time.Hour)
+	cb.RecordFailure("a")
+	cb.RecordFailure("b")
+
+	got := filterByCircuitBreaker(cb, []*site.SiteMount{s1, s2})
+	if len(got) != 2 {
+		t.Errorf("all-open fallback: expected 2 sites, got %d", len(got))
+	}
+}
+
+// TestFilterByCircuitBreaker_NilBreakerPassesThrough verifies the helper is a
+// no-op when cb is nil.
+func TestFilterByCircuitBreaker_NilBreakerPassesThrough(t *testing.T) {
+	t.Parallel()
+
+	s1, _ := makeMount("a", types.SiteRolePrimary, nil)
+	got := filterByCircuitBreaker(nil, []*site.SiteMount{s1})
+	if len(got) != 1 {
+		t.Errorf("nil cb: expected 1 site, got %d", len(got))
+	}
 }
