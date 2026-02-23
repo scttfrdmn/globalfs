@@ -29,9 +29,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/scttfrdmn/globalfs/internal/coordinator"
+	"github.com/scttfrdmn/globalfs/internal/metrics"
 	"github.com/scttfrdmn/globalfs/internal/policy"
 	"github.com/scttfrdmn/globalfs/pkg/config"
 	"github.com/scttfrdmn/globalfs/pkg/site"
@@ -105,6 +107,9 @@ func main() {
 
 	c := coordinator.New(mounts...)
 
+	m := metrics.New(prometheus.DefaultRegisterer)
+	c.SetMetrics(m)
+
 	if len(cfg.Policy.Rules) > 0 {
 		eng, err := policy.NewFromConfig(cfg.Policy.Rules)
 		if err != nil {
@@ -127,7 +132,7 @@ func main() {
 	mux.HandleFunc("/healthz", healthzHandler(c))
 	mux.HandleFunc("/readyz", readyzHandler())
 	mux.Handle("/metrics", promhttp.Handler())
-	registerAPIRoutes(mux, ctx, c)
+	registerAPIRoutes(mux, ctx, c, m)
 
 	srv := &http.Server{
 		Addr:         addr,

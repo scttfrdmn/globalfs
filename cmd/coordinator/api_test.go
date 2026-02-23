@@ -418,7 +418,7 @@ func TestObjectHead_CoordinatorError(t *testing.T) {
 func TestObjectAPI_FullRoundtrip(t *testing.T) {
 	c, _ := makeTestCoordinator(t, nil)
 	mux := http.NewServeMux()
-	registerAPIRoutes(mux, context.Background(), c)
+	registerAPIRoutes(mux, context.Background(), c, nil)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 

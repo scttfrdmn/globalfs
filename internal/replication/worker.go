@@ -122,6 +122,11 @@ func (w *Worker) Events() <-chan ReplicationEvent {
 	return w.events
 }
 
+// QueueDepth returns the number of jobs currently waiting in the queue.
+func (w *Worker) QueueDepth() int {
+	return len(w.queue)
+}
+
 // Enqueue adds a job to the work queue.
 // If the queue is full the job is dropped and a warning is logged.
 // Enqueue is safe to call before Start.

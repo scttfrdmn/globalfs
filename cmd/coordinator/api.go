@@ -26,6 +26,7 @@ import (
 	objectfstypes "github.com/objectfs/objectfs/pkg/types"
 
 	"github.com/scttfrdmn/globalfs/internal/coordinator"
+	"github.com/scttfrdmn/globalfs/internal/metrics"
 	"github.com/scttfrdmn/globalfs/pkg/config"
 	"github.com/scttfrdmn/globalfs/pkg/site"
 	"github.com/scttfrdmn/globalfs/pkg/types"
@@ -360,17 +361,47 @@ func objectHeadHandler(c *coordinator.Coordinator) http.HandlerFunc {
 	}
 }
 
+// ── Metrics middleware ────────────────────────────────────────────────────────
+
+// statusRecorder wraps http.ResponseWriter to capture the HTTP status code
+// written by a handler so it can be forwarded to metrics.
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.code = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+// withObjectMetrics wraps a handler to record operation duration and status.
+// m may be nil (calls are no-ops when metrics are not configured).
+func withObjectMetrics(operation string, m *metrics.Metrics, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sr := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
+		next(sr, r)
+		status := "ok"
+		if sr.code >= 400 {
+			status = "error"
+		}
+		m.RecordOperation(operation, status, time.Since(start))
+	}
+}
+
 // registerAPIRoutes registers all /api/v1/* endpoints on mux.
 // daemonCtx is the coordinator's parent context, used for S3 connection setup.
-func registerAPIRoutes(mux *http.ServeMux, daemonCtx context.Context, c *coordinator.Coordinator) {
+// m may be nil; when non-nil, object handler latency and status are recorded.
+func registerAPIRoutes(mux *http.ServeMux, daemonCtx context.Context, c *coordinator.Coordinator, m *metrics.Metrics) {
 	mux.HandleFunc("GET /api/v1/sites", sitesListHandler(c))
 	mux.HandleFunc("POST /api/v1/sites", addSiteHandler(daemonCtx, c))
 	mux.HandleFunc("DELETE /api/v1/sites/{name}", removeSiteHandler(c))
 	mux.HandleFunc("POST /api/v1/replicate", replicateHandler(c))
 
-	mux.HandleFunc("GET /api/v1/objects", objectListHandler(c))
-	mux.HandleFunc("GET /api/v1/objects/{key...}", objectGetHandler(c))
-	mux.HandleFunc("PUT /api/v1/objects/{key...}", objectPutHandler(c))
-	mux.HandleFunc("DELETE /api/v1/objects/{key...}", objectDeleteHandler(c))
-	mux.HandleFunc("HEAD /api/v1/objects/{key...}", objectHeadHandler(c))
+	mux.HandleFunc("GET /api/v1/objects", withObjectMetrics("list", m, objectListHandler(c)))
+	mux.HandleFunc("GET /api/v1/objects/{key...}", withObjectMetrics("get", m, objectGetHandler(c)))
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", withObjectMetrics("put", m, objectPutHandler(c)))
+	mux.HandleFunc("DELETE /api/v1/objects/{key...}", withObjectMetrics("delete", m, objectDeleteHandler(c)))
+	mux.HandleFunc("HEAD /api/v1/objects/{key...}", withObjectMetrics("head", m, objectHeadHandler(c)))
 }

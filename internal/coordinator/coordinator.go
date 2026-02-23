@@ -32,6 +32,7 @@ import (
 
 	"github.com/scttfrdmn/globalfs/internal/lease"
 	"github.com/scttfrdmn/globalfs/internal/metadata"
+	"github.com/scttfrdmn/globalfs/internal/metrics"
 	"github.com/scttfrdmn/globalfs/internal/policy"
 	"github.com/scttfrdmn/globalfs/internal/replication"
 	"github.com/scttfrdmn/globalfs/pkg/namespace"
@@ -44,9 +45,10 @@ type Coordinator struct {
 	mu           sync.RWMutex
 	sites        []*site.SiteMount
 	ns           *namespace.Namespace
-	policy       *policy.Engine // never nil; default = empty engine
+	policy       *policy.Engine  // never nil; default = empty engine
 	worker       *replication.Worker
-	store        metadata.Store     // optional; nil means no persistence
+	store        metadata.Store  // optional; nil means no persistence
+	m            *metrics.Metrics // optional; nil means no instrumentation
 	storeCancel  context.CancelFunc
 	storeWg      sync.WaitGroup
 	leaseManager *lease.Manager     // optional; nil means single-node mode
@@ -109,6 +111,15 @@ func (c *Coordinator) SetLeaseManager(mgr *lease.Manager) {
 	c.leaseManager = mgr
 }
 
+// SetMetrics registers a Metrics instance with the coordinator.
+// When set, site-count and replication event metrics are emitted automatically.
+// SetMetrics must be called before Start to instrument replication events.
+func (c *Coordinator) SetMetrics(m *metrics.Metrics) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m = m
+}
+
 // Start launches the background replication worker.
 // It is safe to call Start multiple times; only the first call has effect.
 //
@@ -162,19 +173,21 @@ func (c *Coordinator) Start(ctx context.Context) {
 		workerCtx = leaderCtx
 	}
 
-	if store != nil {
-		storeCtx, cancel := context.WithCancel(workerCtx)
-		c.mu.Lock()
-		c.storeCancel = cancel
-		c.mu.Unlock()
+	// Always drain worker events — needed for metrics even when store is nil.
+	// drainCancel is stored so Stop() can terminate this goroutine.
+	drainCtx, drainCancel := context.WithCancel(workerCtx)
+	c.mu.Lock()
+	c.storeCancel = drainCancel
+	c.mu.Unlock()
 
+	if store != nil {
 		c.recoverPendingJobs(workerCtx, store)
-		c.storeWg.Add(1)
-		go func() {
-			defer c.storeWg.Done()
-			c.drainWorkerEvents(storeCtx, store)
-		}()
 	}
+	c.storeWg.Add(1)
+	go func() {
+		defer c.storeWg.Done()
+		c.drainWorkerEvents(drainCtx, store)
+	}()
 	c.worker.Start(workerCtx)
 }
 
@@ -221,6 +234,7 @@ func (c *Coordinator) AddSite(s *site.SiteMount) {
 	defer c.mu.Unlock()
 	c.sites = append(c.sites, s)
 	c.ns.AddSite(s)
+	c.m.SetSiteCount(len(c.sites))
 }
 
 // RemoveSite removes the site with the given name.
@@ -236,6 +250,7 @@ func (c *Coordinator) RemoveSite(name string) {
 	}
 	c.sites = filtered
 	c.ns = namespace.New(c.sites...)
+	c.m.SetSiteCount(len(c.sites))
 }
 
 // Sites returns a snapshot of the current site list (highest priority first).
@@ -550,7 +565,8 @@ func (c *Coordinator) recoverPendingJobs(ctx context.Context, store metadata.Sto
 	}
 }
 
-// drainWorkerEvents removes completed and failed replication jobs from the store.
+// drainWorkerEvents processes replication job events.
+// It removes completed/failed jobs from the store (when set) and updates metrics.
 // Runs in a goroutine until ctx is cancelled.
 func (c *Coordinator) drainWorkerEvents(ctx context.Context, store metadata.Store) {
 	for {
@@ -560,10 +576,14 @@ func (c *Coordinator) drainWorkerEvents(ctx context.Context, store metadata.Stor
 				return
 			}
 			if ev.Type == replication.EventCompleted || ev.Type == replication.EventFailed {
-				id := makeJobID(ev.Job.SourceSite.Name(), ev.Job.DestSite.Name(), ev.Job.Key)
-				if err := store.DeleteJob(ctx, id); err != nil {
-					log.Printf("coordinator: delete job %q from store: %v", id, err)
+				if store != nil {
+					id := makeJobID(ev.Job.SourceSite.Name(), ev.Job.DestSite.Name(), ev.Job.Key)
+					if err := store.DeleteJob(ctx, id); err != nil {
+						log.Printf("coordinator: delete job %q from store: %v", id, err)
+					}
 				}
+				c.m.RecordReplication(string(ev.Type))
+				c.m.SetReplicationQueueDepth(c.worker.QueueDepth())
 			}
 		case <-ctx.Done():
 			return
