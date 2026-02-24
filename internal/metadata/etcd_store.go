@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"log/slog"
 	"strings"
 	"time"
@@ -195,7 +194,7 @@ func (e *EtcdStore) Watch(ctx context.Context, prefix string) (<-chan WatchEvent
 			// occurred during the gap, so log and continue — the channel
 			// remains open and future responses are still processed.
 			if err := resp.Err(); err != nil {
-				log.Printf("etcd: watch %q: response error (events may have been missed): %v", watchKey, err)
+				slog.Warn("etcd: watch response error (events may have been missed)", "key", watchKey, "error", err)
 				continue
 			}
 			for _, ev := range resp.Events {

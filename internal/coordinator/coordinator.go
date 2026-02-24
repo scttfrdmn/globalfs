@@ -24,7 +24,7 @@ package coordinator
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -86,6 +86,15 @@ const defaultLeaseTTL = 15 * time.Second
 // defaultHealthTimeout is the maximum duration Health waits for all goroutines
 // when the caller supplies a context without a deadline.
 const defaultHealthTimeout = 30 * time.Second
+
+// ── Metrics helpers ───────────────────────────────────────────────────────────
+// These wrappers centralise the nil check so call sites stay clean.
+
+func (c *Coordinator) metricsCacheHit()            { if c.m != nil { c.m.RecordCacheHit() } }
+func (c *Coordinator) metricsCacheMiss()           { if c.m != nil { c.m.RecordCacheMiss() } }
+func (c *Coordinator) metricsCacheEviction()       { if c.m != nil { c.m.RecordCacheEviction() } }
+func (c *Coordinator) metricsCacheBytes(n int64)   { if c.m != nil { c.m.SetCacheBytes(n) } }
+func (c *Coordinator) metricsSiteCount(n int)      { if c.m != nil { c.m.SetSiteCount(n) } }
 
 // New creates a Coordinator from an ordered list of SiteMounts.
 //
@@ -287,14 +296,14 @@ func (c *Coordinator) start(ctx context.Context) {
 		}
 		l, acquired, err := mgr.TryAcquire(ctx, "coordinator/leader", leaseTTL)
 		if err != nil {
-			log.Printf("coordinator: acquire leader lease: %v; running in standby mode", err)
+			slog.Warn("coordinator: acquire leader lease; running in standby mode", "error", err)
 			return
 		}
 		if !acquired {
-			log.Printf("coordinator: another instance holds the leader lease; running in standby mode")
+			slog.Info("coordinator: another instance holds the leader lease; running in standby mode")
 			return
 		}
-		log.Printf("coordinator: acquired leader lease")
+		slog.Info("coordinator: acquired leader lease")
 
 		leaderCtx, leaderCancel := context.WithCancel(ctx)
 		lostCh := l.KeepAlive(leaderCtx)
@@ -309,7 +318,7 @@ func (c *Coordinator) start(ctx context.Context) {
 			defer leaderCancel()
 			select {
 			case <-lostCh:
-				log.Printf("coordinator: lost leader lease; transitioning to standby mode")
+				slog.Warn("coordinator: lost leader lease; transitioning to standby mode")
 			case <-leaderCtx.Done():
 			}
 		}()
@@ -382,7 +391,7 @@ func (c *Coordinator) Stop() {
 	// Release the leader lease last so a standby can take over quickly.
 	if l != nil {
 		if err := l.Release(); err != nil {
-			log.Printf("coordinator: release leader lease: %v", err)
+			slog.Warn("coordinator: release leader lease", "error", err)
 		}
 	}
 }
@@ -401,9 +410,7 @@ func (c *Coordinator) AddSite(s *site.SiteMount) {
 	defer c.mu.Unlock()
 	c.sites = append(c.sites, s)
 	c.ns.AddSite(s)
-	if c.m != nil {
-		c.m.SetSiteCount(len(c.sites))
-	}
+	c.metricsSiteCount(len(c.sites))
 }
 
 // RemoveSite removes the site with the given name.
@@ -428,13 +435,11 @@ func (c *Coordinator) RemoveSite(name string) bool {
 	}
 	c.sites = filtered
 	c.ns = namespace.New(c.sites...)
-	if c.m != nil {
-		c.m.SetSiteCount(len(c.sites))
-	}
+	c.metricsSiteCount(len(c.sites))
 	c.mu.Unlock()
 
 	if err := removed.Close(); err != nil {
-		log.Printf("coordinator: RemoveSite %q: close: %v", name, err)
+		slog.Warn("coordinator: RemoveSite close", "site", name, "error", err)
 	}
 	return true
 }
@@ -494,21 +499,17 @@ func (c *Coordinator) Health(ctx context.Context) map[string]error {
 // are only tried as a fallback.  The first successful read is returned.
 func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 	c.mu.RLock()
-	snapshot, pol, cb, retryCfg, oc, m := c.snapshotSites(), c.policy, c.cb, c.retryConfig, c.objCache, c.m
+	snapshot, pol, cb, retryCfg, oc := c.snapshotSites(), c.policy, c.cb, c.retryConfig, c.objCache
 	c.mu.RUnlock()
 
 	// Cache read-through: serve from cache when available.
 	if oc != nil {
 		if cached, ok := oc.Get(key); ok {
-			if m != nil {
-				m.RecordCacheHit()
-				m.SetCacheBytes(oc.Stats().Bytes)
-			}
+			c.metricsCacheHit()
+			c.metricsCacheBytes(oc.Stats().Bytes)
 			return cached, nil
 		}
-		if m != nil {
-			m.RecordCacheMiss()
-		}
+		c.metricsCacheMiss()
 	}
 
 	ordered, err := pol.Route(policy.OperationRead, key, snapshot)
@@ -542,11 +543,9 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 			// Populate cache on successful site fetch.
 			if oc != nil {
 				evicted := oc.PutAndRecordEvictions(key, data)
-				if m != nil {
-					m.SetCacheBytes(oc.Stats().Bytes)
-					for i := int64(0); i < evicted; i++ {
-						m.RecordCacheEviction()
-					}
+				c.metricsCacheBytes(oc.Stats().Bytes)
+				for i := int64(0); i < evicted; i++ {
+					c.metricsCacheEviction()
 				}
 			}
 			return data, nil
@@ -568,7 +567,7 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 // target so data is durably stored before Put returns.
 func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	c.mu.RLock()
-	snapshot, pol, store, cb, oc, m := c.snapshotSites(), c.policy, c.store, c.cb, c.objCache, c.m
+	snapshot, pol, store, cb, oc := c.snapshotSites(), c.policy, c.store, c.cb, c.objCache
 	c.mu.RUnlock()
 
 	routed, err := pol.Route(policy.OperationWrite, key, snapshot)
@@ -618,7 +617,7 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 					CreatedAt:  time.Now(),
 				}
 				if persistErr := store.PutReplicationJob(ctx, metaJob); persistErr != nil {
-					log.Printf("coordinator: persist job %q: %v; skipping enqueue to preserve durability guarantee", metaJob.ID, persistErr)
+					slog.Error("coordinator: persist job; skipping enqueue to preserve durability guarantee", "job_id", metaJob.ID, "error", persistErr)
 					continue
 				}
 			}
@@ -628,7 +627,7 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 				Key:        key,
 				Size:       int64(len(data)),
 			}); enqErr != nil {
-				log.Printf("coordinator: Put %q: enqueue async replication to %q: %v", key, s.Name(), enqErr)
+				slog.Warn("coordinator: Put enqueue async replication", "key", key, "dest", s.Name(), "error", enqErr)
 			}
 		}
 	}
@@ -636,9 +635,7 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	// Invalidate the cache so the next Get fetches the freshly-written value.
 	if oc != nil {
 		oc.Delete(key)
-		if m != nil {
-			m.SetCacheBytes(oc.Stats().Bytes)
-		}
+		c.metricsCacheBytes(oc.Stats().Bytes)
 	}
 	return nil
 }
@@ -650,7 +647,7 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 // The cache entry for key is invalidated regardless of per-site outcome.
 func (c *Coordinator) Delete(ctx context.Context, key string) error {
 	c.mu.RLock()
-	snapshot, pol, cb, oc, m := c.snapshotSites(), c.policy, c.cb, c.objCache, c.m
+	snapshot, pol, cb, oc := c.snapshotSites(), c.policy, c.cb, c.objCache
 	c.mu.RUnlock()
 
 	routed, err := pol.Route(policy.OperationDelete, key, snapshot)
@@ -676,7 +673,7 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 			if cb != nil {
 				cb.RecordFailure(s.Name())
 			}
-			log.Printf("coordinator: Delete %q from non-primary %q: %v", key, s.Name(), err)
+			slog.Warn("coordinator: Delete from non-primary site", "key", key, "site", s.Name(), "error", err)
 		} else if cb != nil {
 			cb.RecordSuccess(s.Name())
 		}
@@ -685,9 +682,7 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 	// Invalidate the cache entry whether or not site deletes succeeded.
 	if oc != nil {
 		oc.Delete(key)
-		if m != nil {
-			m.SetCacheBytes(oc.Stats().Bytes)
-		}
+		c.metricsCacheBytes(oc.Stats().Bytes)
 	}
 	return nil
 }
@@ -943,7 +938,7 @@ func makeJobID(sourceSite, destSite, key string) string {
 func (c *Coordinator) recoverPendingJobs(ctx context.Context, store metadata.Store) {
 	jobs, err := store.GetPendingJobs(ctx)
 	if err != nil {
-		log.Printf("coordinator: recover pending jobs: %v", err)
+		slog.Error("coordinator: recover pending jobs", "error", err)
 		return
 	}
 
@@ -958,7 +953,7 @@ func (c *Coordinator) recoverPendingJobs(ctx context.Context, store metadata.Sto
 		src, srcOK := siteMap[j.SourceSite]
 		dst, dstOK := siteMap[j.DestSite]
 		if !srcOK || !dstOK {
-			log.Printf("coordinator: skip recovered job %q (site missing)", j.ID)
+			slog.Warn("coordinator: skip recovered job (site missing)", "job_id", j.ID)
 			continue
 		}
 		if err := c.worker.Enqueue(replication.ReplicationJob{
@@ -967,7 +962,7 @@ func (c *Coordinator) recoverPendingJobs(ctx context.Context, store metadata.Sto
 			Key:        j.Key,
 			Size:       j.Size,
 		}); err != nil {
-			log.Printf("coordinator: recover job %q: %v", j.ID, err)
+			slog.Warn("coordinator: recover job enqueue", "job_id", j.ID, "error", err)
 		}
 	}
 }
@@ -993,7 +988,7 @@ func (c *Coordinator) drainWorkerEvents(ctx context.Context, store metadata.Stor
 					err := store.DeleteJob(deleteCtx, id)
 					deleteCancel()
 					if err != nil {
-						log.Printf("coordinator: delete job %q from store: %v", id, err)
+						slog.Warn("coordinator: delete job from store", "job_id", id, "error", err)
 					}
 				}
 				if c.m != nil {

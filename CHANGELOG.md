@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.12] - 2026-02-24
+
+### Fixed
+- `pkg/config/config.go`: `Validate` now rejects a site config where `cargoship.enabled: true` but `cargoship.endpoint` is blank, surfacing the misconfiguration at startup rather than at runtime (#68)
+- `cmd/coordinator/api.go`: `withObjectMetrics` now explicitly checks `m != nil` before instrumenting; previously relied on nil-safe receiver methods, which was fragile (#71)
+- `cmd/coordinator/main.go`: shutdown errors from `srv.Shutdown` and `c.Close` are now logged at `slog.Error` level and cause the process to exit with code 1, so orchestrators detect failed shutdowns (#69)
+
+### Changed
+- `internal/coordinator/coordinator.go`, `internal/replication/worker.go`, `internal/metadata/etcd_store.go`: remaining `log.Printf` calls migrated to structured `slog.Info`/`slog.Warn`/`slog.Error` — zero `"log"` imports remain in non-main packages (#67)
+- `internal/coordinator/coordinator.go`: inline `if c.m != nil { c.m.RecordXxx() }` guards replaced with private wrapper methods (`metricsCacheHit`, `metricsCacheMiss`, `metricsCacheEviction`, `metricsCacheBytes`, `metricsSiteCount`) that centralise the nil check (#70)
+
+---
+
 ## [0.1.11] - 2026-02-23
 
 ### Fixed

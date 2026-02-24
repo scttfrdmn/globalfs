@@ -435,6 +435,36 @@ func TestValidate_Valid_ResilienceAndCache(t *testing.T) {
 	}
 }
 
+func TestValidate_CargoShip_EnabledWithoutEndpoint(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Sites[0].CargoShip.Enabled = true
+	cfg.Sites[0].CargoShip.Endpoint = ""
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for cargoship.enabled=true with blank endpoint, got nil")
+	}
+}
+
+func TestValidate_CargoShip_EnabledWithEndpoint(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Sites[0].CargoShip.Enabled = true
+	cfg.Sites[0].CargoShip.Endpoint = "http://cargoship.example.com:8080"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid CargoShip config should pass validation: %v", err)
+	}
+}
+
+func TestValidate_CargoShip_DisabledWithoutEndpoint(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Sites[0].CargoShip.Enabled = false
+	cfg.Sites[0].CargoShip.Endpoint = ""
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("disabled CargoShip without endpoint should pass validation: %v", err)
+	}
+}
+
 // writeTempFile writes content to a temp file and returns its path.
 // The file is removed when the test completes.
 func writeTempFile(t *testing.T, content string) string {

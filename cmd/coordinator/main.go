@@ -288,18 +288,25 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
+	exitCode := 0
+
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Warn("HTTP server shutdown error", "error", err)
+		slog.Error("HTTP server shutdown error", "error", err)
+		exitCode = 1
 	}
 
 	// Cancel the main context so the replication worker exits its loop,
 	// then stop the coordinator (waits for the current job to finish).
 	cancel()
 	if err := c.Close(); err != nil {
-		slog.Warn("error closing coordinator", "error", err)
+		slog.Error("error closing coordinator", "error", err)
+		exitCode = 1
 	}
 
 	slog.Info("coordinator stopped")
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────

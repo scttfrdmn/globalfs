@@ -599,9 +599,13 @@ func (sr *statusRecorder) WriteHeader(code int) {
 }
 
 // withObjectMetrics wraps a handler to record operation duration and status.
-// m may be nil (calls are no-ops when metrics are not configured).
+// m may be nil; when nil the handler is called without instrumentation.
 func withObjectMetrics(operation string, m *metrics.Metrics, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if m == nil {
+			next(w, r)
+			return
+		}
 		start := time.Now()
 		sr := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
 		next(sr, r)

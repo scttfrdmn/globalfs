@@ -1368,3 +1368,23 @@ func TestSitesList_WithCircuitBreaker_Open(t *testing.T) {
 	}
 }
 
+// TestWithObjectMetrics_NilMetrics verifies that withObjectMetrics calls the
+// next handler without panicking when m is nil.
+func TestWithObjectMetrics_NilMetrics(t *testing.T) {
+	t.Parallel()
+	called := false
+	handler := withObjectMetrics("get", nil, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	handler(w, r)
+	if !called {
+		t.Error("next handler was not called")
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("status: got %d, want %d", w.Code, http.StatusOK)
+	}
+}
+

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/scttfrdmn/globalfs/pkg/types"
@@ -309,6 +310,11 @@ func (c *Configuration) Validate() error {
 		}
 		if site.ObjectFS.S3Region == "" {
 			return fmt.Errorf("sites[%d].objectfs.s3_region is required", i)
+		}
+
+		// Validate CargoShip config
+		if site.CargoShip.Enabled && strings.TrimSpace(site.CargoShip.Endpoint) == "" {
+			return fmt.Errorf("sites[%d] (%q): cargoship.endpoint must not be empty when cargoship.enabled is true", i, site.Name)
 		}
 	}
 

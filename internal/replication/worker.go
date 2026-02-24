@@ -26,7 +26,7 @@ package replication
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"sync"
 	"time"
@@ -201,9 +201,10 @@ func (w *Worker) processJob(ctx context.Context, job ReplicationJob) {
 
 		if err := transfer(ctx, job); err != nil {
 			lastErr = err
-			log.Printf("replication: attempt %d/%d key=%q %q→%q: %v",
-				attempt, MaxRetries, job.Key,
-				job.SourceSite.Name(), job.DestSite.Name(), err)
+			slog.Warn("replication: transfer attempt failed",
+				"attempt", attempt, "max_retries", MaxRetries,
+				"key", job.Key, "src", job.SourceSite.Name(), "dst", job.DestSite.Name(),
+				"error", err)
 			continue
 		}
 
@@ -223,8 +224,7 @@ func (w *Worker) emit(ev ReplicationEvent) {
 	select {
 	case w.events <- ev:
 	default:
-		log.Printf("replication: events channel full; dropping %s event for key=%q",
-			ev.Type, ev.Job.Key)
+		slog.Warn("replication: events channel full; dropping event", "type", ev.Type, "key", ev.Job.Key)
 	}
 }
 
