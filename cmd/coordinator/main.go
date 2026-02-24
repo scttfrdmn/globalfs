@@ -295,13 +295,8 @@ func main() {
 	// Cancel the main context so the replication worker exits its loop,
 	// then stop the coordinator (waits for the current job to finish).
 	cancel()
-	c.Stop()
-
-	// Close all site connections.
-	for _, m := range mounts {
-		if err := m.Close(); err != nil {
-			slog.Warn("error closing site", "name", m.Name(), "error", err)
-		}
+	if err := c.Close(); err != nil {
+		slog.Warn("error closing coordinator", "error", err)
 	}
 
 	slog.Info("coordinator stopped")

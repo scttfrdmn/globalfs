@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.10] - 2026-02-23
+
+### Fixed
+- `internal/coordinator/coordinator.go`: `drainWorkerEvents` now uses `context.WithTimeout(context.Background(), 5s)` for `store.DeleteJob` calls instead of the already-cancelled shutdown context — prevents orphaned job records in the metadata store on coordinator shutdown (#61, carried from earlier audit)
+- `internal/metadata/etcd_store.go`: `NewEtcdStore` now returns a clear error when `cfg.Endpoints` is empty instead of panicking with an index-out-of-range accessing `cfg.Endpoints[0]` (#61)
+- `internal/coordinator/coordinator.go`: `RemoveSite` now closes the removed site's S3 client after releasing the mutex, preventing connection-pool leaks when sites are deregistered at runtime (#62)
+- `cmd/coordinator/api.go`: `replicateHandler` now returns HTTP 503 Service Unavailable when the replication queue is full, instead of HTTP 400 Bad Request — queue-full is a server capacity condition, not a client error (#63)
+- `internal/replication/worker.go`: `Worker.Stop()` now uses `sync.Once` (`closeOnce`) to close the `done` channel, eliminating a race condition where two concurrent `Stop()` callers could both observe the channel open and both attempt to close it (#64)
+- `cmd/coordinator/main.go`: shutdown now calls `c.Close()` instead of `c.Stop()` followed by a manual loop over the startup mounts — `Close()` calls `ns.Close()` which covers all sites including those registered dynamically via `POST /api/v1/sites`, closing previously-leaked connections (#65)
+- `cmd/coordinator/api.go`: `objectGetHandler` now checks the error returned by `w.Write(data)` and logs a warning on failure, making client disconnects visible in logs (#66)
+
+---
+
 ## [0.1.9] - 2026-02-23
 
 ### Fixed

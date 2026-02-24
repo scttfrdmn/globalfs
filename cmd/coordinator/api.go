@@ -332,7 +332,11 @@ func replicateHandler(c *coordinator.Coordinator) http.HandlerFunc {
 		}
 
 		if err := c.Replicate(r.Context(), req.Key, req.From, req.To); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "queue full") {
+				status = http.StatusServiceUnavailable
+			}
+			writeError(w, status, err.Error())
 			return
 		}
 
@@ -434,7 +438,9 @@ func objectGetHandler(c *coordinator.Coordinator) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		w.WriteHeader(http.StatusOK)
-		w.Write(data)
+		if _, err := w.Write(data); err != nil {
+			slog.Warn("api: write response body", "key", key, "error", err)
+		}
 	}
 }
 

@@ -51,6 +51,10 @@ func NewEtcdStore(ctx context.Context, cfg EtcdConfig) (*EtcdStore, error) {
 		prefix += "/"
 	}
 
+	if len(cfg.Endpoints) == 0 {
+		return nil, fmt.Errorf("etcd: at least one endpoint is required")
+	}
+
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   cfg.Endpoints,
 		DialTimeout: cfg.DialTimeout,

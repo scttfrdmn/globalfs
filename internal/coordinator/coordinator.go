@@ -412,21 +412,29 @@ func (c *Coordinator) AddSite(s *site.SiteMount) {
 // Returning a bool allows callers to distinguish "not found" from "removed"
 // atomically, eliminating the TOCTOU race in the HTTP handler (#58).
 func (c *Coordinator) RemoveSite(name string) bool {
+	var removed *site.SiteMount
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	filtered := make([]*site.SiteMount, 0, len(c.sites))
 	for _, s := range c.sites {
-		if s.Name() != name {
+		if s.Name() == name {
+			removed = s
+		} else {
 			filtered = append(filtered, s)
 		}
 	}
-	if len(filtered) == len(c.sites) {
-		return false // not found
+	if removed == nil {
+		c.mu.Unlock()
+		return false
 	}
 	c.sites = filtered
 	c.ns = namespace.New(c.sites...)
 	if c.m != nil {
 		c.m.SetSiteCount(len(c.sites))
+	}
+	c.mu.Unlock()
+
+	if err := removed.Close(); err != nil {
+		log.Printf("coordinator: RemoveSite %q: close: %v", name, err)
 	}
 	return true
 }
@@ -967,7 +975,14 @@ func (c *Coordinator) drainWorkerEvents(ctx context.Context, store metadata.Stor
 			if ev.Type == replication.EventCompleted || ev.Type == replication.EventFailed {
 				if store != nil {
 					id := makeJobID(ev.Job.SourceSite.Name(), ev.Job.DestSite.Name(), ev.Job.Key)
-					if err := store.DeleteJob(ctx, id); err != nil {
+					// Use a fresh context: ctx may already be cancelled if
+					// Stop() fired while this event was being processed.
+					// A cancelled ctx would leave the job in the store and
+					// cause it to be re-enqueued on the next restart (#61).
+					deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					err := store.DeleteJob(deleteCtx, id)
+					deleteCancel()
+					if err != nil {
 						log.Printf("coordinator: delete job %q from store: %v", id, err)
 					}
 				}

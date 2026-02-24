@@ -88,9 +88,10 @@ type Worker struct {
 	queue  chan ReplicationJob
 	events chan ReplicationEvent
 
-	wg   sync.WaitGroup
-	done chan struct{}
-	once sync.Once
+	wg        sync.WaitGroup
+	done      chan struct{}
+	once      sync.Once
+	closeOnce sync.Once
 
 	// baseBackoff controls the initial retry delay.  Defaults to
 	// defaultBaseBackoff; may be overridden in tests.
@@ -150,11 +151,7 @@ func (w *Worker) Start(ctx context.Context) {
 // Calling Stop before Start is safe.  Calling Stop multiple times is safe.
 func (w *Worker) Stop() {
 	w.once.Do(func() {}) // prevent any future Start
-	select {
-	case <-w.done:
-	default:
-		close(w.done)
-	}
+	w.closeOnce.Do(func() { close(w.done) })
 	w.wg.Wait()
 }
 
