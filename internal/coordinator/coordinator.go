@@ -23,6 +23,8 @@ package coordinator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -606,7 +608,21 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	// PutReplicationJob runs, leaving a phantom entry in the store.
 	if len(primaries) > 0 {
 		src := primaries[0]
+		// Compute content hash once for coordinator-level dedup below.
+		rawHash := sha256.Sum256(data)
+		contentHash := hex.EncodeToString(rawHash[:])
 		for _, s := range others {
+			// Coordinator-level dedup: skip enqueue if the destination already
+			// holds the exact same content, as recorded by a previous transfer.
+			if store != nil {
+				if rec, _ := store.GetReplicatedObject(ctx, s.Name(), key); rec != nil {
+					if rec.ContentHash == contentHash {
+						slog.Debug("coordinator: skipping replication, dest already has content",
+							"key", key, "dest", s.Name())
+						continue
+					}
+				}
+			}
 			if store != nil {
 				metaJob := &metadata.ReplicationJob{
 					ID:         makeJobID(src.Name(), s.Name(), key),
@@ -989,6 +1005,21 @@ func (c *Coordinator) drainWorkerEvents(ctx context.Context, store metadata.Stor
 					deleteCancel()
 					if err != nil {
 						slog.Warn("coordinator: delete job from store", "job_id", id, "error", err)
+					}
+				}
+				// Record content hash on successful transfer for future
+				// coordinator-level dedup.
+				if store != nil && ev.Type == replication.EventCompleted && ev.ContentHash != "" {
+					recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					recErr := store.PutReplicatedObject(recCtx, &metadata.ReplicatedObject{
+						Site:         ev.Job.DestSite.Name(),
+						Key:          ev.Job.Key,
+						ContentHash:  ev.ContentHash,
+						ReplicatedAt: time.Now(),
+					})
+					recCancel()
+					if recErr != nil {
+						slog.Warn("coordinator: record replicated object", "key", ev.Job.Key, "error", recErr)
 					}
 				}
 				if c.m != nil {

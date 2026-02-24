@@ -25,6 +25,8 @@ package replication
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"math"
@@ -64,10 +66,11 @@ type ReplicationJob struct {
 
 // ReplicationEvent is emitted for each job lifecycle transition.
 type ReplicationEvent struct {
-	Job     ReplicationJob
-	Type    EventType
-	Attempt int
-	Err     error // non-nil only for EventFailed
+	Job         ReplicationJob
+	Type        EventType
+	Attempt     int
+	Err         error  // non-nil only for EventFailed
+	ContentHash string // SHA-256 hex; set on EventCompleted, empty otherwise
 }
 
 const (
@@ -199,7 +202,8 @@ func (w *Worker) processJob(ctx context.Context, job ReplicationJob) {
 			}
 		}
 
-		if err := transfer(ctx, job); err != nil {
+		contentHash, err := transfer(ctx, job)
+		if err != nil {
 			lastErr = err
 			slog.Warn("replication: transfer attempt failed",
 				"attempt", attempt, "max_retries", MaxRetries,
@@ -208,7 +212,7 @@ func (w *Worker) processJob(ctx context.Context, job ReplicationJob) {
 			continue
 		}
 
-		w.emit(ReplicationEvent{Job: job, Type: EventCompleted, Attempt: attempt})
+		w.emit(ReplicationEvent{Job: job, Type: EventCompleted, Attempt: attempt, ContentHash: contentHash})
 		return
 	}
 
@@ -229,17 +233,40 @@ func (w *Worker) emit(ev ReplicationEvent) {
 }
 
 // transfer performs the actual byte movement: GET from source, PUT to dest.
+// Returns the SHA-256 hex of the transferred content and any error.
 //
-// v0.1.0: simple GET → PUT over the SiteMount interface.
+// Fast path: if both sites expose ObjectInfo.Checksum (set by ObjectFS ≥ v0.10.0)
+// and the checksums match, the transfer is skipped as the destination already
+// holds identical content.  Backward compatible: if either checksum is empty
+// the fast path is skipped and the full GET → PUT proceeds.
+//
+// v0.1.0 slow path: simple GET → PUT over the SiteMount interface.
 // Future: replace with CargoShip streaming archive pipeline for large-scale,
 // compressed inter-site transfers (tracked in globalfs #3 follow-on).
-func transfer(ctx context.Context, job ReplicationJob) error {
+func transfer(ctx context.Context, job ReplicationJob) (string, error) {
+	// Fast path: compare checksums before transferring.
+	srcInfo, srcErr := job.SourceSite.Head(ctx, job.Key)
+	if srcErr == nil && srcInfo != nil && srcInfo.Checksum != "" {
+		destInfo, destErr := job.DestSite.Head(ctx, job.Key)
+		if destErr == nil && destInfo != nil && destInfo.Checksum == srcInfo.Checksum {
+			slog.Info("replication: skipping transfer, dest already has matching content",
+				"key", job.Key,
+				"checksum", srcInfo.Checksum[:8]+"...",
+				"dest", job.DestSite.Name())
+			return srcInfo.Checksum, nil
+		}
+	}
+
+	// Slow path: full GET → PUT.
 	data, err := job.SourceSite.Get(ctx, job.Key, 0, 0)
 	if err != nil {
-		return fmt.Errorf("get from %q: %w", job.SourceSite.Name(), err)
+		return "", fmt.Errorf("get from %q: %w", job.SourceSite.Name(), err)
 	}
 	if err := job.DestSite.Put(ctx, job.Key, data); err != nil {
-		return fmt.Errorf("put to %q: %w", job.DestSite.Name(), err)
+		return "", fmt.Errorf("put to %q: %w", job.DestSite.Name(), err)
 	}
-	return nil
+
+	// Compute content hash from transferred bytes.
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:]), nil
 }

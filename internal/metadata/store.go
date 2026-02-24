@@ -99,6 +99,17 @@ type WatchEvent struct {
 	Value []byte
 }
 
+// ReplicatedObject records the last-known content hash for a (site, key) pair.
+// It is used for coordinator-level deduplication: if the destination already
+// holds the exact content (matching SHA-256), replication can be skipped before
+// a job is even enqueued.
+type ReplicatedObject struct {
+	Site         string    `json:"site"`
+	Key          string    `json:"key"`
+	ContentHash  string    `json:"content_hash"`  // SHA-256 hex of uncompressed content
+	ReplicatedAt time.Time `json:"replicated_at"`
+}
+
 // Store is the persistence interface for GlobalFS coordinator state.
 //
 // All methods accept a context; callers should pass contexts with appropriate
@@ -131,6 +142,17 @@ type Store interface {
 	// DeleteJob removes the job with the given ID.
 	// Deleting a non-existent job is a no-op.
 	DeleteJob(ctx context.Context, id string) error
+
+	// ── Replicated object index ───────────────────────────────────────────
+
+	// PutReplicatedObject records (or updates) the content hash for a
+	// (site, key) pair.  Used to skip redundant replication at the
+	// coordinator level.
+	PutReplicatedObject(ctx context.Context, obj *ReplicatedObject) error
+
+	// GetReplicatedObject returns the last-recorded ReplicatedObject for the
+	// given (site, key) pair.  Returns a non-nil error when no record exists.
+	GetReplicatedObject(ctx context.Context, site, key string) (*ReplicatedObject, error)
 
 	// ── Watch ─────────────────────────────────────────────────────────────
 

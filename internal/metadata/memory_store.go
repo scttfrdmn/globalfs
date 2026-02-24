@@ -14,10 +14,11 @@ import (
 // State is not persisted across process restarts.  MemoryStore is suitable
 // for unit tests and single-node deployments that do not require durability.
 type MemoryStore struct {
-	mu       sync.RWMutex
-	sites    map[string]*SiteRecord
-	jobs     map[string]*ReplicationJob
-	watchers []*memWatcher
+	mu          sync.RWMutex
+	sites       map[string]*SiteRecord
+	jobs        map[string]*ReplicationJob
+	replicated  map[string]*ReplicatedObject // key: site+":"+objectKey
+	watchers    []*memWatcher
 }
 
 // memWatcher holds a single Watch subscription.
@@ -29,8 +30,9 @@ type memWatcher struct {
 // NewMemoryStore creates an empty MemoryStore.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		sites: make(map[string]*SiteRecord),
-		jobs:  make(map[string]*ReplicationJob),
+		sites:      make(map[string]*SiteRecord),
+		jobs:       make(map[string]*ReplicationJob),
+		replicated: make(map[string]*ReplicatedObject),
 	}
 }
 
@@ -122,6 +124,33 @@ func (m *MemoryStore) DeleteJob(_ context.Context, id string) error {
 	m.mu.Unlock()
 	m.notify("jobs/"+id, WatchEventDelete, nil)
 	return nil
+}
+
+// ── Replicated object index ────────────────────────────────────────────────────
+
+// replicatedKey returns the internal map key for a (site, objectKey) pair.
+func replicatedKey(site, key string) string { return site + ":" + key }
+
+// PutReplicatedObject stores or updates the content hash record for (obj.Site, obj.Key).
+func (m *MemoryStore) PutReplicatedObject(_ context.Context, obj *ReplicatedObject) error {
+	cp := *obj
+	m.mu.Lock()
+	m.replicated[replicatedKey(obj.Site, obj.Key)] = &cp
+	m.mu.Unlock()
+	return nil
+}
+
+// GetReplicatedObject returns the recorded ReplicatedObject for (site, key).
+// Returns an error when no record exists.
+func (m *MemoryStore) GetReplicatedObject(_ context.Context, site, key string) (*ReplicatedObject, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	r, ok := m.replicated[replicatedKey(site, key)]
+	if !ok {
+		return nil, fmt.Errorf("metadata: replicated object not found: site=%q key=%q", site, key)
+	}
+	cp := *r
+	return &cp, nil
 }
 
 // ── Watch ──────────────────────────────────────────────────────────────────────

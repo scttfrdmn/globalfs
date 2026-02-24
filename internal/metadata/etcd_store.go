@@ -84,10 +84,12 @@ func (e *EtcdStore) Prefix() string { return e.prefix }
 
 // ── Key helpers ────────────────────────────────────────────────────────────────
 
-func (e *EtcdStore) siteKey(name string) string    { return e.prefix + "sites/" + name }
-func (e *EtcdStore) sitesPrefix() string           { return e.prefix + "sites/" }
-func (e *EtcdStore) jobKey(id string) string       { return e.prefix + "jobs/" + id }
-func (e *EtcdStore) jobsPrefix() string            { return e.prefix + "jobs/" }
+func (e *EtcdStore) siteKey(name string) string              { return e.prefix + "sites/" + name }
+func (e *EtcdStore) sitesPrefix() string                     { return e.prefix + "sites/" }
+func (e *EtcdStore) jobKey(id string) string                 { return e.prefix + "jobs/" + id }
+func (e *EtcdStore) jobsPrefix() string                      { return e.prefix + "jobs/" }
+func (e *EtcdStore) replicatedKey(site, key string) string   { return e.prefix + "replicated/" + site + "/" + key }
+func (e *EtcdStore) replicatedPrefix() string                { return e.prefix + "replicated/" }
 
 // ── Site registry ──────────────────────────────────────────────────────────────
 
@@ -173,6 +175,35 @@ func (e *EtcdStore) GetPendingJobs(ctx context.Context) ([]*ReplicationJob, erro
 func (e *EtcdStore) DeleteJob(ctx context.Context, id string) error {
 	_, err := e.client.Delete(ctx, e.jobKey(id))
 	return err
+}
+
+// ── Replicated object index ────────────────────────────────────────────────────
+
+// PutReplicatedObject stores the content hash record for (obj.Site, obj.Key).
+func (e *EtcdStore) PutReplicatedObject(ctx context.Context, obj *ReplicatedObject) error {
+	data, err := json.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("etcd: marshal replicated object site=%q key=%q: %w", obj.Site, obj.Key, err)
+	}
+	_, err = e.client.Put(ctx, e.replicatedKey(obj.Site, obj.Key), string(data))
+	return err
+}
+
+// GetReplicatedObject retrieves the content hash record for (site, key).
+// Returns an error when no record exists.
+func (e *EtcdStore) GetReplicatedObject(ctx context.Context, site, key string) (*ReplicatedObject, error) {
+	resp, err := e.client.Get(ctx, e.replicatedKey(site, key))
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Kvs) == 0 {
+		return nil, fmt.Errorf("etcd: replicated object not found: site=%q key=%q", site, key)
+	}
+	var obj ReplicatedObject
+	if err := json.Unmarshal(resp.Kvs[0].Value, &obj); err != nil {
+		return nil, fmt.Errorf("etcd: unmarshal replicated object: %w", err)
+	}
+	return &obj, nil
 }
 
 // ── Watch ──────────────────────────────────────────────────────────────────────

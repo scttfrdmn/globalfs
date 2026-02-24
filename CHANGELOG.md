@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+## [0.2.0] - 2026-02-23
+
+### Added
+- `internal/replication/worker.go`: `ReplicationEvent.ContentHash` field (SHA-256 hex) — set to the transferred content's hash on `EventCompleted`, empty otherwise; enables callers to track what was actually replicated (#131)
+- `internal/replication/worker.go`: `transfer()` fast path — if both source and destination expose `ObjectInfo.Checksum` (populated by ObjectFS ≥ v0.10.0) and they match, the full GET → PUT is skipped; backward compatible (empty checksum falls back to GET → PUT) (#131)
+- `internal/metadata/store.go`: `ReplicatedObject` struct and two new `Store` interface methods — `PutReplicatedObject` / `GetReplicatedObject` — persist last-known content hash per (site, key) pair for coordinator-level dedup (#132)
+- `internal/metadata/memory_store.go`, `etcd_store.go`: Implement `PutReplicatedObject` / `GetReplicatedObject`; etcd key pattern: `{prefix}replicated/{site}/{key}` (#132)
+- `internal/coordinator/coordinator.go`: `drainWorkerEvents` records `ReplicatedObject` in the store on every `EventCompleted` with a non-empty `ContentHash` (#132)
+- `internal/coordinator/coordinator.go`: `Put()` performs coordinator-level dedup before enqueue — skips replication to a destination if `GetReplicatedObject` confirms the current content hash is already present; saves a full GET+PUT round-trip for idempotent retries of large files (#132)
+
+### Changed
+- GlobalFS now depends on objectfs v0.10.0 (adds parallel range GETs and content SHA-256 metadata)
+
+---
+
 ## [0.1.12] - 2026-02-24
 
 ### Fixed
