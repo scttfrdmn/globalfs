@@ -3,7 +3,7 @@ module github.com/scttfrdmn/globalfs
 go 1.26.0
 
 require (
-	github.com/objectfs/objectfs v0.9.0
+	github.com/objectfs/objectfs v0.10.0
 	github.com/prometheus/client_golang v1.22.0
 	github.com/spf13/cobra v1.10.2
 	go.etcd.io/etcd/client/v3 v3.6.8
