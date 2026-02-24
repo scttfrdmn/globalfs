@@ -343,8 +343,13 @@ func (c *Client) ListObjects(ctx context.Context, prefix string, limit int) ([]O
 	}
 	defer resp.Body.Close()
 
-	if err := checkStatus(resp, http.StatusOK); err != nil {
-		return nil, err
+	// The coordinator returns 200 on full success and 207 Multi-Status when
+	// results are partial (some sites unavailable).  Both carry a valid JSON
+	// body; treat both as success so callers receive whatever data is available.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusMultiStatus {
+		if err := checkStatus(resp, http.StatusOK); err != nil {
+			return nil, err
+		}
 	}
 
 	var envelope listObjectsResponse

@@ -72,7 +72,11 @@ func (n *Namespace) List(ctx context.Context, prefix string, limit int) ([]objec
 	var siteErrs []error
 
 	for _, s := range sites {
-		items, err := s.List(ctx, prefix, 0)
+		// Pass the caller's limit to each site so that per-site listing is
+		// bounded.  Deduplication may reduce the result below limit, but
+		// fetching all objects (limit=0) when the caller only needs a small
+		// count is a DoS risk for large buckets (#57).
+		items, err := s.List(ctx, prefix, limit)
 		if err != nil {
 			siteErrs = append(siteErrs, fmt.Errorf("site %q: %w", s.Name(), err))
 			continue

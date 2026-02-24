@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.9] - 2026-02-23
+
+### Fixed
+- `pkg/client/client.go`: `ListObjects` now accepts HTTP 207 Multi-Status in addition to 200 OK — previously any 207 response was treated as an error, discarding valid partial results from federated list operations (#57)
+- `pkg/namespace/namespace.go`: `List` now passes the caller-supplied `limit` to each per-site `List` call instead of hardcoded `0` — passing `0` caused all objects to be fetched from every site before truncating, wasting bandwidth and risking OOM for large namespaces (#58)
+- `internal/coordinator/coordinator.go`: `RemoveSite` now returns a `bool` (found/removed); `removeSiteHandler` uses the bool directly, eliminating the TOCTOU window between the prior `Sites()` pre-check and the remove call (#59)
+- `internal/coordinator/coordinator.go`: `start()` now reads `leaseTTL` and `healthPollInterval` under `c.mu` and uses local copies, eliminating a data race where both fields could be modified by setters concurrently (#60)
+
+---
+
 ## [0.1.8] - 2026-02-23
 
 ### Fixed

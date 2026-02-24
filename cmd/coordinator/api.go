@@ -291,20 +291,13 @@ func removeSiteHandler(c *coordinator.Coordinator) http.HandlerFunc {
 			return
 		}
 
-		// Verify the site exists.
-		var found bool
-		for _, s := range c.Sites() {
-			if s.Name() == name {
-				found = true
-				break
-			}
-		}
-		if !found {
+		// RemoveSite atomically checks existence and removes the site,
+		// eliminating the TOCTOU race between a separate Sites() snapshot
+		// and a subsequent RemoveSite call (#58).
+		if !c.RemoveSite(name) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("site %q not found", name))
 			return
 		}
-
-		c.RemoveSite(name)
 		slog.Info("api: site removed", "name", name)
 		w.WriteHeader(http.StatusNoContent)
 	}

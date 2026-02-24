@@ -274,13 +274,14 @@ func (c *Coordinator) start(ctx context.Context) {
 	c.mu.Lock()
 	mgr := c.leaseManager
 	store := c.store
+	leaseTTL := c.leaseTTL
+	pollInterval := c.healthPollInterval
 	c.mu.Unlock()
 
 	// workerCtx is cancelled when the lease is lost (if a lease manager is set).
 	workerCtx := ctx
 
 	if mgr != nil {
-		leaseTTL := c.leaseTTL
 		if leaseTTL <= 0 {
 			leaseTTL = defaultLeaseTTL
 		}
@@ -334,7 +335,7 @@ func (c *Coordinator) start(ctx context.Context) {
 
 	// Launch background health polling goroutine.
 	// Uses drainCtx so it stops when Stop() is called (via storeCancel).
-	pollInterval := c.healthPollInterval
+	// pollInterval was read from c.healthPollInterval under c.mu at the top.
 	if pollInterval <= 0 {
 		pollInterval = defaultHealthPollInterval
 	}
@@ -407,7 +408,10 @@ func (c *Coordinator) AddSite(s *site.SiteMount) {
 
 // RemoveSite removes the site with the given name.
 // If no site with that name exists, this is a no-op.
-func (c *Coordinator) RemoveSite(name string) {
+// RemoveSite removes the named site and reports whether it was found.
+// Returning a bool allows callers to distinguish "not found" from "removed"
+// atomically, eliminating the TOCTOU race in the HTTP handler (#58).
+func (c *Coordinator) RemoveSite(name string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	filtered := make([]*site.SiteMount, 0, len(c.sites))
@@ -416,11 +420,15 @@ func (c *Coordinator) RemoveSite(name string) {
 			filtered = append(filtered, s)
 		}
 	}
+	if len(filtered) == len(c.sites) {
+		return false // not found
+	}
 	c.sites = filtered
 	c.ns = namespace.New(c.sites...)
 	if c.m != nil {
 		c.m.SetSiteCount(len(c.sites))
 	}
+	return true
 }
 
 // Sites returns a snapshot of the current site list (highest priority first).
