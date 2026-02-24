@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.11] - 2026-02-23
+
+### Fixed
+- `internal/coordinator/coordinator.go`: `Put` enqueue-failure log now includes key and destination site name for easier diagnosis — was `"coordinator: %v"`, now `"coordinator: Put %q: enqueue async replication to %q: %v"` (#40)
+- `internal/coordinator/coordinator.go`: `Get`, `Put`, and `Delete` cache-metric calls now wrapped in explicit `if m != nil` guards — metrics receiver methods are already nil-safe, but the guard makes intent clear at the call site (#51)
+- `cmd/coordinator/main.go`: `MaxConcurrentTransfers` was already wired to `SetWorkerQueueDepth` in the `Start` setup block; closing stale issue (#50)
+
+---
+
 ## [0.1.10] - 2026-02-23
 
 ### Fixed

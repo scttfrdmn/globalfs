@@ -500,11 +500,15 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 	// Cache read-through: serve from cache when available.
 	if oc != nil {
 		if cached, ok := oc.Get(key); ok {
-			m.RecordCacheHit()
-			m.SetCacheBytes(oc.Stats().Bytes)
+			if m != nil {
+				m.RecordCacheHit()
+				m.SetCacheBytes(oc.Stats().Bytes)
+			}
 			return cached, nil
 		}
-		m.RecordCacheMiss()
+		if m != nil {
+			m.RecordCacheMiss()
+		}
 	}
 
 	ordered, err := pol.Route(policy.OperationRead, key, snapshot)
@@ -538,9 +542,11 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 			// Populate cache on successful site fetch.
 			if oc != nil {
 				evicted := oc.PutAndRecordEvictions(key, data)
-				m.SetCacheBytes(oc.Stats().Bytes)
-				for i := int64(0); i < evicted; i++ {
-					m.RecordCacheEviction()
+				if m != nil {
+					m.SetCacheBytes(oc.Stats().Bytes)
+					for i := int64(0); i < evicted; i++ {
+						m.RecordCacheEviction()
+					}
 				}
 			}
 			return data, nil
@@ -622,7 +628,7 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 				Key:        key,
 				Size:       int64(len(data)),
 			}); enqErr != nil {
-				log.Printf("coordinator: %v", enqErr)
+				log.Printf("coordinator: Put %q: enqueue async replication to %q: %v", key, s.Name(), enqErr)
 			}
 		}
 	}
@@ -630,7 +636,9 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	// Invalidate the cache so the next Get fetches the freshly-written value.
 	if oc != nil {
 		oc.Delete(key)
-		m.SetCacheBytes(oc.Stats().Bytes)
+		if m != nil {
+			m.SetCacheBytes(oc.Stats().Bytes)
+		}
 	}
 	return nil
 }
@@ -677,7 +685,9 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 	// Invalidate the cache entry whether or not site deletes succeeded.
 	if oc != nil {
 		oc.Delete(key)
-		m.SetCacheBytes(oc.Stats().Bytes)
+		if m != nil {
+			m.SetCacheBytes(oc.Stats().Bytes)
+		}
 	}
 	return nil
 }
