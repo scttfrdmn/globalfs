@@ -490,6 +490,58 @@ func sitesListHandler(c *coordinator.Coordinator) http.HandlerFunc {
 	}
 }
 
+// siteNameTaken reports whether a site with this name is already registered.
+//
+// This is an advisory pre-check only, and it races by construction: two
+// concurrent requests for one name can both see false.  Its job is to avoid the
+// pointless HeadBucket that site.NewFromConfig performs — a duplicate request
+// otherwise pays a full network round trip, and the coordinator signs an
+// outbound request with its own credentials, before learning the name is taken
+// (#131).  The decision that actually holds is AddSiteUnique's, which does the
+// check and the append under one lock hold.
+func siteNameTaken(c *coordinator.Coordinator, name string) bool {
+	for _, s := range c.Sites() {
+		if s.Name() == name {
+			return true
+		}
+	}
+	return false
+}
+
+// duplicateSiteMessage is the 409 body for a name that is already registered.
+// It names no more than the caller already knows: that the name is taken.
+const duplicateSiteMessage = "a site with that name is already registered"
+
+// registerSite adds mount to the coordinator, closing mount if it is rejected.
+//
+// AddSiteUnique, not AddSite: site names are the only handle RemoveSite,
+// Replicate and the health report have on a site, so two sites answering to one
+// name is an ambiguity none of them can resolve (#80).  The check and the append
+// happen under a single lock hold inside AddSiteUnique, which is what makes this
+// — and not addSiteHandler's cheap pre-check — the authoritative decision.
+//
+// Closing the rejected mount is this function's reason for existing.
+// AddSiteUnique deliberately leaves a rejected site open, on the grounds that
+// whoever constructed it decides its fate; here the mount is unreachable the
+// moment it is rejected, so not closing it leaks the S3 connection pool
+// site.NewFromConfig opened — #80's leak arriving by a new route (#131).  A close
+// error is logged and not returned: the registration outcome is what the caller
+// must act on, and a failed close cannot be retried by anyone.
+//
+// It is a function rather than inline handler code so the reject-and-close path
+// is reachable from a test.  Everything in the handler above it needs a real S3
+// endpoint to get as far as a *site.SiteMount; this takes one directly.
+func registerSite(c *coordinator.Coordinator, mount *site.SiteMount) error {
+	err := c.AddSiteUnique(mount)
+	if err == nil {
+		return nil
+	}
+	if cerr := mount.Close(); cerr != nil {
+		slog.Warn("api: add site: close rejected site", "name", mount.Name(), "error", cerr)
+	}
+	return err
+}
+
 // addSiteHandler handles POST /api/v1/sites — register a new site at runtime.
 //
 // sec constrains which s3_endpoint values are accepted; see validateS3Endpoint.
@@ -524,6 +576,16 @@ func addSiteHandler(daemonCtx context.Context, c *coordinator.Coordinator, sec c
 		case types.SiteRolePrimary, types.SiteRoleBackup, types.SiteRoleBurst:
 		default:
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid role %q (primary|backup|burst)", req.Role))
+			return
+		}
+
+		// Reject a name that is already taken before resolving or connecting to
+		// anything.  Advisory and racy — see siteNameTaken — but it is what keeps a
+		// duplicate request from costing a DNS lookup and a signed HeadBucket
+		// against a caller-supplied endpoint for a request that cannot succeed
+		// (#131).  AddSiteUnique below is the check that decides.
+		if siteNameTaken(c, req.Name) {
+			writeError(w, http.StatusConflict, duplicateSiteMessage)
 			return
 		}
 
@@ -569,7 +631,22 @@ func addSiteHandler(daemonCtx context.Context, c *coordinator.Coordinator, sec c
 			return
 		}
 
-		c.AddSite(mount)
+		// registerSite closes the mount if it is rejected; see its doc comment for
+		// why the close belongs to this side of the boundary (#131).
+		if err := registerSite(c, mount); err != nil {
+			if errors.Is(err, coordinator.ErrDuplicateSite) {
+				slog.Warn("api: add site: duplicate name",
+					"name", req.Name,
+					"request_id", requestIDFromCtx(r.Context()),
+					"remote_addr", r.RemoteAddr,
+				)
+				writeError(w, http.StatusConflict, duplicateSiteMessage)
+				return
+			}
+			slog.Error("api: add site failed", "name", req.Name, "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to add site")
+			return
+		}
 		slog.Info("api: site added", "name", req.Name, "role", req.Role)
 
 		writeJSON(w, http.StatusCreated, coordinator.SiteInfo{

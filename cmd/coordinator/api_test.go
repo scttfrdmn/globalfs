@@ -48,6 +48,10 @@ type testMemClient struct {
 	// and stays full, which is the only way to reach ErrReplicationNotQueued from
 	// a handler test (#130).
 	putGate chan struct{}
+
+	// closes counts Close calls, so a test can assert that a site whose
+	// registration was rejected had its connection pool released (#131).
+	closes int
 }
 
 func newTestMemClient(objs map[string][]byte) *testMemClient {
@@ -161,7 +165,19 @@ func (m *testMemClient) Health(_ context.Context) error {
 	defer m.mu.Unlock()
 	return m.healthErr
 }
-func (m *testMemClient) Close() error { return nil }
+func (m *testMemClient) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closes++
+	return nil
+}
+
+// closeCount returns how many times Close has been called on this client.
+func (m *testMemClient) closeCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closes
+}
 
 func (m *testMemClient) hasKey(key string) bool {
 	m.mu.Lock()
@@ -1257,6 +1273,160 @@ func TestAddSite_InvalidJSON(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("invalid JSON: expected 400, got %d", w.Code)
+	}
+}
+
+// ── addSiteHandler: duplicate site name (#131) ─────────────────────────────────
+
+// TestAddSite_DuplicateName_Returns409 is the #131 assertion at the handler
+// boundary: a POST naming an already-registered site must be refused, and refused
+// before it costs a DNS lookup and a signed HeadBucket against the caller's
+// endpoint.
+//
+// The victim listener is the proof of the second half.  Pre-fix the handler
+// reached site.NewFromConfig — and so an outbound request — before it would have
+// discovered the name was taken; the assertion is a request count of zero, the
+// same shape TestAddSite_EndpointRejected_NoSignedRequestSent uses for #76.  It
+// is allowlisted so that only the SSRF address checks are out of the way and the
+// duplicate check is what is being measured.
+func TestAddSite_DuplicateName_Returns409(t *testing.T) {
+	var mu sync.Mutex
+	var received int
+
+	victim := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		received++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer victim.Close()
+
+	// makeTestCoordinator registers exactly one site, named "primary".
+	c, _ := makeTestCoordinator(t, nil)
+
+	host, _, err := net.SplitHostPort(strings.TrimPrefix(victim.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split victim addr: %v", err)
+	}
+	sec := config.SecurityConfig{AllowedEndpointHosts: []string{host}}
+
+	body := `{"name":"primary","s3_bucket":"bucket","s3_region":"us-east-1","s3_endpoint":"` + victim.URL + `"}`
+	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	addSiteHandler(context.Background(), c, sec)(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("duplicate site name: got %d, want 409 — two sites sharing a name is a "+
+			"state no operation can address unambiguously (#131): %s", w.Code, w.Body.String())
+	}
+
+	// Exactly one site retained: not zero (the existing one must survive a
+	// rejected duplicate) and not two.
+	if got := len(c.Sites()); got != 1 {
+		t.Errorf("coordinator holds %d sites after a rejected duplicate, want 1", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if received != 0 {
+		t.Errorf("the handler sent %d request(s) to the endpoint for a POST that cannot "+
+			"succeed; the name check has to come before the connect (#131)", received)
+	}
+}
+
+// TestRegisterSite_RejectedMountIsClosed covers the part of #131 the handler
+// cannot reach in a test: everything above registerSite needs a real S3 endpoint
+// to produce a *site.SiteMount at all.
+//
+// AddSiteUnique deliberately does not close a site it rejects, so if this side
+// does not either, the connection pool site.NewFromConfig opened is leaked — #80's
+// leak arriving on a new path.  The assertion is therefore a close count, not a
+// status code.
+func TestRegisterSite_RejectedMountIsClosed(t *testing.T) {
+	c, firstClient := makeTestCoordinator(t, nil)
+
+	dupClient := newTestMemClient(nil)
+	dup := site.New("primary", types.SiteRolePrimary, dupClient)
+
+	err := registerSite(c, dup)
+	if err == nil {
+		t.Fatal("registerSite accepted a duplicate name")
+	}
+	if !errors.Is(err, coordinator.ErrDuplicateSite) {
+		t.Errorf("error does not wrap ErrDuplicateSite, so the handler cannot map it to 409: %v", err)
+	}
+	if got := dupClient.closeCount(); got != 1 {
+		t.Errorf("rejected mount closed %d times, want 1 — an unclosed mount leaks the "+
+			"S3 connection pool NewFromConfig opened (#80/#131)", got)
+	}
+	// The site that was already registered must not be disturbed.
+	if got := firstClient.closeCount(); got != 0 {
+		t.Errorf("the retained site was closed %d times; only the rejected mount may be closed", got)
+	}
+	if got := len(c.Sites()); got != 1 {
+		t.Errorf("coordinator holds %d sites, want 1", got)
+	}
+}
+
+// TestRegisterSite_AcceptedMountIsNotClosed is the other half: a successful
+// registration must not close the site it just handed to the coordinator.  A
+// close-on-every-path implementation would pass the test above and leave the
+// coordinator holding a site whose client is shut.
+func TestRegisterSite_AcceptedMountIsNotClosed(t *testing.T) {
+	c, _ := makeTestCoordinator(t, nil)
+
+	mc := newTestMemClient(nil)
+	if err := registerSite(c, site.New("burst", types.SiteRoleBurst, mc)); err != nil {
+		t.Fatalf("registerSite: %v", err)
+	}
+	if got := mc.closeCount(); got != 0 {
+		t.Errorf("accepted mount was closed %d times; the coordinator now owns a dead client", got)
+	}
+	if got := len(c.Sites()); got != 2 {
+		t.Errorf("coordinator holds %d sites, want 2", got)
+	}
+}
+
+// TestAddSite_ConcurrentDuplicates_OnlyOneWins pins the reason the cheap
+// pre-check is not the authoritative one.  siteNameTaken races by construction:
+// every request here can observe an unused name before any of them registers it,
+// so if AddSiteUnique were not the deciding check this would leave several sites
+// answering to one name.
+func TestAddSite_ConcurrentDuplicates_OnlyOneWins(t *testing.T) {
+	c, _ := makeTestCoordinator(t, nil)
+
+	const n = 16
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	accepted := 0
+	closed := 0
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mc := newTestMemClient(nil)
+			err := registerSite(c, site.New("contended", types.SiteRoleBackup, mc))
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				accepted++
+			}
+			closed += mc.closeCount()
+		}()
+	}
+	wg.Wait()
+
+	if accepted != 1 {
+		t.Errorf("%d of %d concurrent registrations of one name were accepted, want 1", accepted, n)
+	}
+	if closed != n-1 {
+		t.Errorf("%d rejected mounts were closed, want %d — every rejection leaks a "+
+			"connection pool otherwise", closed, n-1)
+	}
+	// One pre-existing "primary" plus exactly one "contended".
+	if got := len(c.Sites()); got != 2 {
+		t.Errorf("coordinator holds %d sites, want 2", got)
 	}
 }
 
