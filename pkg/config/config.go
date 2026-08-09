@@ -189,6 +189,30 @@ type CargoShipConfig struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+// The coordinator's port is defined once, here, and every other default is
+// derived from it by string concatenation at compile time.  Before #81 the
+// daemon default (":8080", in NewDefault below) and the CLI default
+// ("http://localhost:8090", in cmd/globalfs) were independent literals, so
+// starting the coordinator without a config file left every CLI command
+// talking to a closed port.  Restating the literal in two packages is the
+// defect; the constants below are the fix, and TestDefaultPorts_DaemonAndCLIAgree
+// keeps them honest.
+const (
+	// DefaultListenPort is the coordinator daemon's HTTP port.  Change it here
+	// and both DefaultListenAddr and DefaultCoordinatorURL follow.
+	DefaultListenPort = "8090"
+
+	// DefaultListenAddr is the coordinator daemon's default HTTP bind address,
+	// used by NewDefault and as the last resort in cmd/coordinator when neither
+	// --bind-addr nor coordinator.listen_addr is set.
+	DefaultListenAddr = ":" + DefaultListenPort
+
+	// DefaultCoordinatorURL is the CLI's default --coordinator-addr value
+	// (env: GLOBALFS_COORDINATOR).  It points at a coordinator running on this
+	// host with DefaultListenAddr.
+	DefaultCoordinatorURL = "http://localhost:" + DefaultListenPort
+)
+
 // NewDefault returns a default configuration.
 func NewDefault() *Configuration {
 	return &Configuration{
@@ -199,7 +223,7 @@ func NewDefault() *Configuration {
 			MetricsPort:    9090,
 		},
 		Coordinator: types.CoordinatorConfig{
-			ListenAddr:    ":8080",
+			ListenAddr:    DefaultListenAddr,
 			EtcdEndpoints: []string{"localhost:2379"},
 			LeaseTimeout:  60 * time.Second,
 		},

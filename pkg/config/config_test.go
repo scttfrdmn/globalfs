@@ -1,6 +1,8 @@
 package config_test
 
 import (
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -586,6 +588,75 @@ func TestShippedConfigsAreValid(t *testing.T) {
 			}
 			if err := cfg.Validate(); err != nil {
 				t.Errorf("Validate: %v", err)
+			}
+		})
+	}
+}
+
+// TestDefaultPorts_DaemonAndCLIAgree is the regression test for #81: the daemon
+// default (NewDefault().Coordinator.ListenAddr) was ":8080" while the CLI default
+// (cmd/globalfs, --coordinator-addr) was "http://localhost:8090", so a coordinator
+// started with no config file listened on a port no CLI command ever dialled.
+//
+// Changing the ":8080" literal alone would have left the same failure mode one
+// refactor away, so both defaults now derive from DefaultListenPort. This test
+// asserts the derivation still holds: if someone reintroduces a bare literal in
+// either place, the port comparison below fails.
+func TestDefaultPorts_DaemonAndCLIAgree(t *testing.T) {
+	t.Parallel()
+
+	// The daemon default must come from the shared constant, not a literal.
+	if got := config.NewDefault().Coordinator.ListenAddr; got != config.DefaultListenAddr {
+		t.Errorf("NewDefault().Coordinator.ListenAddr = %q, want %q", got, config.DefaultListenAddr)
+	}
+
+	// The daemon listen address must be a host:port that net.Listen accepts, and
+	// its port is the one a client has to dial.
+	_, daemonPort, err := net.SplitHostPort(config.DefaultListenAddr)
+	if err != nil {
+		t.Fatalf("DefaultListenAddr %q is not a valid host:port: %v", config.DefaultListenAddr, err)
+	}
+
+	// The CLI default must be an absolute http URL pointing at that same port.
+	u, err := url.Parse(config.DefaultCoordinatorURL)
+	if err != nil {
+		t.Fatalf("DefaultCoordinatorURL %q does not parse: %v", config.DefaultCoordinatorURL, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		t.Errorf("DefaultCoordinatorURL scheme = %q, want http or https", u.Scheme)
+	}
+	if u.Port() != daemonPort {
+		t.Errorf("CLI default dials port %q but the daemon listens on %q (%q vs %q) — "+
+			"the out-of-the-box experience is broken (#81)",
+			u.Port(), daemonPort, config.DefaultCoordinatorURL, config.DefaultListenAddr)
+	}
+}
+
+// TestShippedConfigs_ListenAddrMatchesDefault keeps the YAML files users copy in
+// agreement with the compiled-in default. config.example.yaml said ":8080" while
+// examples/coordinator-config.yaml and the `config init` template said ":8090";
+// copying the former produced the #81 failure even with an explicit config file.
+func TestShippedConfigs_ListenAddrMatchesDefault(t *testing.T) {
+	t.Parallel()
+
+	// Relative to pkg/config/, where this test runs.
+	shipped := []string{
+		"../../config.example.yaml",
+		"../../examples/coordinator-config.yaml",
+	}
+
+	for _, path := range shipped {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			t.Parallel()
+
+			cfg := config.NewDefault()
+			if err := cfg.LoadFromFile(path); err != nil {
+				t.Fatalf("LoadFromFile: %v", err)
+			}
+			if got := cfg.Coordinator.ListenAddr; got != config.DefaultListenAddr {
+				t.Errorf("coordinator.listen_addr = %q, want %q — a user who copies this "+
+					"file gets a coordinator the CLI default cannot reach (#81)",
+					got, config.DefaultListenAddr)
 			}
 		})
 	}

@@ -87,7 +87,7 @@ func main() {
 		addr = cfg.Coordinator.ListenAddr
 	}
 	if addr == "" {
-		addr = ":8090"
+		addr = config.DefaultListenAddr
 	}
 
 	// Override log level from config only when the --log-level flag was not

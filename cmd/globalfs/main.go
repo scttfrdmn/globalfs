@@ -77,7 +77,7 @@ func buildRoot() *cobra.Command {
 	root.PersistentFlags().StringVar(
 		&coordinatorAddr,
 		"coordinator-addr",
-		envOrDefault("GLOBALFS_COORDINATOR", "http://localhost:8090"),
+		envOrDefault("GLOBALFS_COORDINATOR", config.DefaultCoordinatorURL),
 		"Coordinator HTTP address (env: GLOBALFS_COORDINATOR)",
 	)
 	root.PersistentFlags().StringVar(

@@ -11,7 +11,7 @@ global:
 
 # Coordinator settings
 coordinator:
-  listen_addr: ":8080"
+  listen_addr: ":8090"
   etcd_endpoints:
     - "localhost:2379"
     - "localhost:2380"
