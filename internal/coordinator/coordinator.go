@@ -1354,6 +1354,26 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 		others = others[1:]
 	}
 
+	// Invalidate the cache on every path out of Put, not only the success path.
+	//
+	// Primaries are written sequentially and the first failure returns
+	// immediately, so a Put that reports an error may still have mutated an
+	// earlier primary.  When the invalidation lived at the end of the function
+	// the error path skipped it and readers kept being served the pre-Put value
+	// from cache — with the default TTL of 0, for as long as the process ran
+	// (#91).  A defer taken here, before the first site is touched, covers the
+	// early returns below by construction rather than by remembering to.
+	//
+	// Invalidating more than strictly necessary is the safe direction: a
+	// spurious invalidation costs one cache miss, a missed one serves stale data
+	// indefinitely.
+	if oc != nil {
+		defer func() {
+			oc.Delete(key)
+			c.metricsCacheBytes(oc.Stats().Bytes)
+		}()
+	}
+
 	for _, s := range primaries {
 		if err := s.Put(ctx, key, data); err != nil {
 			recordSiteResult(cb, s.Name(), err)
@@ -1431,14 +1451,6 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 				}
 			}
 		}
-	}
-
-	// Invalidate the cache so the next Get fetches the freshly-written value.
-	// Done before the partial-success return: the primary write happened, so a
-	// cached copy of the old value is stale either way.
-	if oc != nil {
-		oc.Delete(key)
-		c.metricsCacheBytes(oc.Stats().Bytes)
 	}
 
 	if len(notQueued) > 0 {
