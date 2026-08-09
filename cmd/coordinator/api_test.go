@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -41,6 +42,12 @@ type testMemClient struct {
 	// payload large enough to be slow on its own merits (#75). Set before the
 	// client is handed to a coordinator; not mutated afterwards.
 	getDelay time.Duration
+
+	// putGate, when non-nil, parks every Put until it is closed.  Used to hold the
+	// single replication worker inside a transfer so the replication queue fills
+	// and stays full, which is the only way to reach ErrReplicationNotQueued from
+	// a handler test (#130).
+	putGate chan struct{}
 }
 
 func newTestMemClient(objs map[string][]byte) *testMemClient {
@@ -69,6 +76,12 @@ func (m *testMemClient) Get(_ context.Context, key string, _, _ int64) ([]byte, 
 }
 
 func (m *testMemClient) Put(_ context.Context, key string, data []byte) error {
+	m.mu.Lock()
+	gate := m.putGate
+	m.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	if m.putErr != nil {
 		return m.putErr
 	}
@@ -78,6 +91,17 @@ func (m *testMemClient) Put(_ context.Context, key string, data []byte) error {
 	copy(cp, data)
 	m.objects[key] = cp
 	return nil
+}
+
+// blockPuts parks every subsequent Put on this client.  The returned release
+// function is safe to call more than once.
+func (m *testMemClient) blockPuts() (release func()) {
+	gate := make(chan struct{})
+	m.mu.Lock()
+	m.putGate = gate
+	m.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }
 }
 
 func (m *testMemClient) Delete(_ context.Context, key string) error {
@@ -144,6 +168,13 @@ func (m *testMemClient) hasKey(key string) bool {
 	defer m.mu.Unlock()
 	_, ok := m.objects[key]
 	return ok
+}
+
+// keyCount returns how many objects this client holds.
+func (m *testMemClient) keyCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.objects)
 }
 
 // ── Test coordinator factory ──────────────────────────────────────────────────
@@ -333,6 +364,131 @@ func TestObjectPut_CoordinatorError(t *testing.T) {
 	objectPutHandler(c)(w, req)
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("expected 502, got %d", w.Code)
+	}
+}
+
+// ── objectPutHandler: replication queue saturated (#130) ──────────────────────
+
+// makeSaturatedReplicationCoordinator returns a coordinator whose replication
+// queue is permanently full: a primary that accepts writes, a backup whose Put
+// never returns, and a worker queue of depth 1 that the parked worker therefore
+// never drains.  Put's backpressure budget is set short so the handler does not
+// wait the default 2 s.
+//
+// The two cleanups are registered in this order deliberately.  t.Cleanup runs
+// LIFO, so release runs before Stop — Stop against a worker parked inside Put
+// hangs the test rather than failing it (#83).
+func makeSaturatedReplicationCoordinator(t *testing.T) (*coordinator.Coordinator, *testMemClient) {
+	t.Helper()
+
+	primaryClient := newTestMemClient(nil)
+	backupClient := newTestMemClient(nil)
+	release := backupClient.blockPuts()
+
+	c := coordinator.New(
+		site.New("primary", types.SiteRolePrimary, primaryClient),
+		site.New("backup", types.SiteRoleBackup, backupClient),
+	)
+	c.SetWorkerQueueDepth(1)
+	c.SetEnqueueBackpressure(20 * time.Millisecond)
+	c.Start(context.Background())
+	t.Cleanup(c.Stop)
+	t.Cleanup(release)
+
+	return c, primaryClient
+}
+
+// TestObjectPut_ReplicationNotQueued_Returns202 is the #130 assertion: a write
+// whose bytes are durable on the primary but whose replication could not be
+// queued is a partial success, and answering 502 tells a caller to retry a write
+// that already committed while making a queue backlog look like an outage.
+func TestObjectPut_ReplicationNotQueued_Returns202(t *testing.T) {
+	c, primaryClient := makeSaturatedReplicationCoordinator(t)
+
+	// The first PUT is queued (depth 1) and the worker picks it up and parks in
+	// the backup's Put, so the queue is full from the second onwards.  Loop until
+	// one PUT is refused rather than assuming which: the worker may not have
+	// dequeued the first job yet.
+	var w *httptest.ResponseRecorder
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("data/obj-%02d", i)
+		req := httptest.NewRequest("PUT", "/api/v1/objects/"+key,
+			bytes.NewReader([]byte("payload")))
+		req.SetPathValue("key", key)
+		rec := httptest.NewRecorder()
+		objectPutHandler(c)(rec, req)
+		if rec.Code != http.StatusCreated {
+			w = rec
+			break
+		}
+	}
+	if w == nil {
+		t.Fatal("no PUT hit a full replication queue after 10 attempts; " +
+			"the queue is being drained and the test cannot observe #130")
+	}
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("replication queue full: got %d, want 202 — a write stored on every "+
+			"primary is a partial success, not a gateway failure (#130): %s",
+			w.Code, w.Body.String())
+	}
+
+	// The condition has to be readable without parsing the body, in the way the
+	// 207 list path uses X-GlobalFS-Partial.
+	if got := w.Header().Get("X-GlobalFS-Replication"); got != "pending" {
+		t.Errorf("X-GlobalFS-Replication = %q, want %q", got, "pending")
+	}
+
+	// The body must not be an errorResponse: a client keying off {"error":...} to
+	// decide whether the request failed would read this success as a failure,
+	// which is the same defect moved from the status code into the body.
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("202 body is not JSON: %v (%s)", err, w.Body.String())
+	}
+	if _, ok := body["error"]; ok {
+		t.Errorf("202 body carries an \"error\" field: %s", w.Body.String())
+	}
+	for _, field := range []string{"key", "status", "detail"} {
+		if _, ok := body[field]; !ok {
+			t.Errorf("202 body is missing %q: %s", field, w.Body.String())
+		}
+	}
+	// The detail must name what is incomplete, since that is what an operator acts
+	// on and the coordinator's message already carries the destinations.
+	if detail, _ := body["detail"].(string); !strings.Contains(detail, "backup") {
+		t.Errorf("202 detail does not name the un-queued destination: %q", detail)
+	}
+
+	// The whole justification for 202 is that the bytes are on the primary.  If
+	// they are not, 202 would be the lie 201 used to be.
+	if primaryClient.keyCount() == 0 {
+		t.Error("no object reached the primary; a 202 here would be as wrong as the old 201")
+	}
+}
+
+// TestObjectPut_PrimaryFailureStillReturns502 pins the other side of the branch:
+// only ErrReplicationNotQueued becomes a 202.  A primary write that genuinely
+// failed has stored nothing and must stay a 502, or #130's fix converts every
+// write failure into a reported success.
+func TestObjectPut_PrimaryFailureStillReturns502(t *testing.T) {
+	c, mc := makeTestCoordinator(t, nil)
+	mc.putErr = errors.New("disk full")
+
+	req := httptest.NewRequest("PUT", "/api/v1/objects/data/x",
+		bytes.NewReader([]byte("payload")))
+	req.SetPathValue("key", "data/x")
+	w := httptest.NewRecorder()
+	objectPutHandler(c)(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("primary write failure: got %d, want 502: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-GlobalFS-Replication"); got != "" {
+		t.Errorf("X-GlobalFS-Replication set to %q on a failed write", got)
+	}
+	if !strings.Contains(w.Body.String(), "error") {
+		t.Errorf("502 body is not an error envelope: %s", w.Body.String())
 	}
 }
 

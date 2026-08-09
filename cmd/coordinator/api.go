@@ -281,6 +281,41 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+// objectPutPartialResponse is the body of a 202 from PUT /api/v1/objects/{key...}:
+// the object is stored on every primary and readable, but replication to one or
+// more secondaries could not be queued (#130).
+//
+// It is deliberately not an errorResponse.  A 202 is not an error, and a client
+// that keys off `{"error": ...}` to decide whether a request failed would read
+// this success as a failure — which is the mistake the whole issue is about,
+// moved from the status code into the body.
+//
+// Detail carries the coordinator's own message, which names the destinations that
+// got no job.  They are not broken out into a field because the only way to
+// obtain them here is to parse a formatted error string, and a parser of another
+// package's %v output is a silent breakage waiting for the next edit to that
+// format.  Exposing them structurally needs a typed error from
+// internal/coordinator; until then Detail is verbatim and the header below is the
+// part a machine should read.
+type objectPutPartialResponse struct {
+	Key    string `json:"key"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+}
+
+// replicationHeader marks a response whose write is stored but not fully
+// replicated, so the condition is visible without parsing the body — the same
+// role X-GlobalFS-Partial plays for the 207 on the list path (#33/#104).
+//
+// A header is what a proxy, an access log, or a metrics pipeline can act on; a
+// 202 alone is ambiguous (replicateHandler returns one for an ordinary success)
+// and a JSON field requires reading a body those layers do not have.
+const replicationHeader = "X-GlobalFS-Replication"
+
+// replicationPending is the replicationHeader value for a stored-but-unreplicated
+// write.
+const replicationPending = "pending"
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -860,6 +895,32 @@ func objectPutHandler(c *coordinator.Coordinator) http.HandlerFunc {
 		}
 
 		if err := c.Put(r.Context(), key, data); err != nil {
+			// ErrReplicationNotQueued is a partial success, not a failure: the bytes
+			// are durably on every primary in the routed set and the object is
+			// readable immediately, and only replication to the named secondaries
+			// was not queued.  Reporting that as 502 tells a caller following normal
+			// practice to retry a write that already committed, and makes a queue
+			// backlog look like an outage to anything alerting on 5xx (#130).
+			//
+			// 202 Accepted, because the request was accepted and acted on with
+			// processing outstanding.  Retrying the identical PUT is safe — the
+			// primary write is idempotent and the coordinator skips destinations
+			// that already hold the content hash — so a client that treats 202 as
+			// "retry later" is also correct, just redundant.
+			if errors.Is(err, coordinator.ErrReplicationNotQueued) {
+				slog.Warn("api: object stored but replication not queued",
+					"key", key,
+					"bytes", len(data),
+					"request_id", requestIDFromCtx(r.Context()),
+					"error", err)
+				w.Header().Set(replicationHeader, replicationPending)
+				writeJSON(w, http.StatusAccepted, objectPutPartialResponse{
+					Key:    key,
+					Status: "stored; replication incomplete",
+					Detail: err.Error(),
+				})
+				return
+			}
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
