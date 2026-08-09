@@ -23,8 +23,152 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pkg/config`: `TestLoad_TypesStructsBindFromYAML` and
   `TestShippedConfigsAreValid` — regression cover for the YAML binding defect
   below. Both fail on the pre-fix tree
+- `pkg/config/config.go`: `SecurityConfig` (`security.allow_private_endpoints`,
+  `security.allowed_endpoint_hosts`) — the escape hatch for the S3 endpoint
+  validation below. Private address space is rejected unless explicitly
+  permitted; loopback and link-local require a host on the exact-match
+  allowlist (#76)
+- `internal/coordinator/coordinator.go`: `ErrNotFound`, wrapping
+  `objectfssdk.ErrNotFound`, returned by `Get`/`Head` when every routed site
+  reports the key absent. `errors.Is` matches either sentinel. Not yet mapped to
+  a 404 by the HTTP layer — that is #110 (#77)
+- `internal/coordinator/coordinator.go`: `AddSiteUnique` and `ErrDuplicateSite`
+  — checks the name and appends under a single lock hold, so racing callers
+  cannot both claim one name. `AddSite` is retained for config load, which
+  rejects duplicates earlier. No HTTP caller yet; the 409 mapping is a
+  follow-up (#80)
+- `internal/coordinator/coordinator.go`: `ErrReplicationNotQueued` and
+  `SetEnqueueBackpressure`, plus `globalfs_replication_dropped_total` in
+  `internal/metrics` — a monotonic counter, because the queue-depth gauge
+  returns to zero once a backlog clears and leaves no evidence it existed (#79)
+
+### Security
+- `cmd/coordinator/api.go`, `main.go`: path traversal crossed the authorization
+  boundary. `validateObjectKey` rejects `..`, but `http.ServeMux` path-cleans
+  the target and answers `307` *before* it selects a handler, so the validator
+  never saw a literal `..`: `DELETE /api/v1/objects/../sites/primary` returned
+  `307 Location=/api/v1/sites/primary`, and Go's HTTP client replays both the
+  method and the `X-GlobalFS-API-Key` header on a 307 — so `pkg/client`
+  following that redirect deregistered a site and reported success. A reverse
+  proxy permitting `/api/v1/objects/` and denying `/api/v1/sites/` was bypassed
+  the same way, seeing only the object path. Fixed with a `rejectUnsafePath`
+  middleware that inspects `r.URL.EscapedPath()` before the mux can dispatch,
+  rejecting with 400 rather than cleaning — cleaning would leave a traversal
+  silently succeeding as a delete of a different key. Each segment is unescaped
+  exactly once, so an encoded separator (`%2F%2E%2E%2F`) is caught while a
+  legitimate literal `%2E` in a key (arriving as `%252E`) still routes. The
+  guard sits inside the API-key check, so an unauthenticated probe gets 401 and
+  cannot use the 400 as an oracle. `validateObjectKey` is kept as a second
+  layer for callers that invoke handlers directly (#73)
+- `cmd/coordinator/api.go`: `POST /api/v1/sites` signed a request to any host
+  the caller named. `s3_endpoint` went unvalidated into a `HeadBucket`, so the
+  coordinator sent its own credentials' SigV4 `Authorization` header to an
+  attacker-chosen address — including `169.254.169.254` — and the 502 body
+  echoed the transport error, distinguishing an open port from a closed one and
+  making the endpoint a port scanner with an oracle. `validateS3Endpoint` now
+  runs before any client is constructed: http/https origin only, no userinfo,
+  no path or query, then every resolved address is checked, so a hostname
+  pointing at internal space is caught too and one public A record does not
+  license a second private one. The 502 body is now a constant string, with
+  detail logged for the operator instead. **Known gap:** the interval between
+  resolving and dialling is a DNS-rebinding window. Closing it requires pinning
+  the connection to the checked address via a `DialContext` hook, and the
+  objectfs SDK exposes no transport option — tracked upstream (#76)
 
 ### Fixed
+- `internal/replication/worker.go`: `srcInfo.Checksum[:8]` sliced an unvalidated
+  string to shorten a **log line**, so a checksum under 8 characters panicked
+  with `slice bounds out of range [:8] with length 2` — and with no `recover`
+  anywhere in the worker or coordinator, that log line killed the whole daemon.
+  Replaced with a length-checked `shortChecksum`. Two `recover` layers added on
+  top, because a malformed log argument taking down a daemon is a failure of
+  containment rather than of that one line: `safeTransfer` converts a transfer
+  panic into an ordinary attempt error so the existing retry and `EventFailed`
+  path handles it, and `runJob` is a last-resort backstop that emits
+  `EventFailed` before returning. That emission is load-bearing — the
+  coordinator deletes a persisted job only on a terminal event, so a silent
+  recover would strand the job and re-enqueue it on every restart. A recovered
+  panic is logged at Error with its stack (#72)
+- `pkg/client/client.go`: `GetObject` was `return io.ReadAll(resp.Body)`, so a
+  read that failed mid-body returned partial content next to the error and the
+  CLI, having checked `err` at a different layer, wrote a short file and
+  reported success — 42 MB of a 64 MB object. The partial slice is now
+  discarded and the error wrapped with the key and the byte count, plus a
+  `Content-Length` cross-check as an independent assertion that does not depend
+  on the transport reporting the truncation. Note the original diagnosis was
+  wrong in mechanism: `net/http` does surface a short `Content-Length`-delimited
+  body as `unexpected EOF`; the information was present at every layer and the
+  function signature is what let it be discarded. A chunked or HTTP/1.0
+  close-delimited short body remains undetectable here, asserted honestly by
+  `TestGetObject_NoContentLength_ShortBodyUndetected` so a future streaming path
+  has to confront it (#74)
+- `cmd/coordinator/main.go`, `api.go`: `WriteTimeout` is an absolute deadline on
+  the whole response, not an idle timeout, so it truncated large object GETs
+  mid-body; the same arithmetic made the documented 256 MiB PUT cap unreachable,
+  needing 25.6 MiB/s sustained. The strict server-wide deadlines are kept —
+  they are correct for the JSON control endpoints — and the object handlers now
+  replace them per request via `http.ResponseController`, sized
+  `clamp(bytes / 1 MiB/s, 30s, 10m)`. The rate is set by the constraint that the
+  advertised size cap must be reachable, not by taste, and
+  `TestTransferDeadline_SizeCapIsReachable` fails if the two drift apart. PUT
+  extends both deadlines: `net/http` arms them together when the request headers
+  finish, so a slow upload otherwise leaves no time to send the 201 it earned
+  (#75)
+- `internal/coordinator/coordinator.go`: a missing object counted as a site
+  failure, so five lookups of absent keys ejected a healthy site from routing
+  for the whole breaker cooldown — each after three retries. There was no
+  `errors.Is(err, ErrNotFound)` anywhere in the tree. All five breaker call
+  sites now route through `recordSiteResult`/`isSiteFailure`, which delegates
+  the classification to objectfs's own `IsServiceFailure` so GlobalFS cannot
+  drift from the layer below. A non-failure error records a *success*: a site
+  that answers "no such key" was reached, authenticated, and answered
+  correctly, which is exactly what the breaker measures. `context.Canceled` is
+  named explicitly because `retry.Do` returns a bare `ctx.Err()` carrying no
+  objectfs code, and an unclassified error counts as a failure — a breaker that
+  opens too eagerly recovers on its cooldown, one that never opens does not.
+  objectfs added its `ProbeAfter` mechanism after this same bug took a mount
+  permanently offline one layer down (#77)
+- `internal/coordinator/coordinator.go`: `Stop()` cancelled the event drain
+  before stopping the worker, so terminal events emitted during shutdown were
+  lost — leaving a phantom job in the store and discarding the dedup hash.
+  Teardown is now producer (`worker.Stop`) → consumer (cancel, `storeWg.Wait`) →
+  a final non-blocking `flushWorkerEvents` on the calling goroutine.
+  **Reordering alone was not sufficient**, which is why the flush exists:
+  `cmd/coordinator` cancels the root context and *then* calls `Close`, so the
+  drain can already have exited on `ctx.Done` before `Stop` is entered, and the
+  same is true after a lost leader lease. `drainWorkerEvents` also flushes on
+  its own `ctx.Done`. Verified by disabling the flush while keeping the
+  corrected order — `TestCoordinator_Stop_DrainFlushesBufferedEvents` still
+  fails (#78)
+- `internal/coordinator/coordinator.go`: a full replication queue was logged at
+  warn level and `Put` returned nil, so callers were told a write was
+  replicated when it was not — 31 of 40 Puts dropped at the shipped defaults,
+  every one reporting success. `Put` now applies bounded backpressure (2s
+  budget, 5ms poll, configurable via `SetEnqueueBackpressure`) and then returns
+  an error wrapping `ErrReplicationNotQueued`, documented explicitly as a
+  *partial success*: the bytes are durable on every primary, the named
+  secondaries do not have them, and retrying the identical Put is safe because
+  the primary write is idempotent and content-hash dedup skips destinations
+  that already hold the content. The budget is finite on purpose — unbounded
+  blocking would make the async path synchronous and let one wedged destination
+  stall every writer. **The HTTP layer does not yet distinguish this**:
+  `objectPutHandler` maps every `Put` error to 502, so a partial success is
+  currently reported as a gateway failure; 202 Accepted is the correct mapping
+  and is a follow-up (#79)
+- `internal/coordinator/coordinator.go`: `RemoveSite` had no `break`, so with
+  duplicate site names it kept only the last match, filtered out all of them,
+  and closed exactly one — leaking the others' connection pools. It now splices
+  out the highest-priority match by index and closes that site. The close stays
+  outside the lock, now with a comment saying why, so the next edit does not
+  move it (#95 exists because `Close` does not do the same) (#80)
+- `pkg/config/config.go`, `cmd/coordinator/main.go`, `cmd/globalfs/main.go`,
+  `config.example.yaml`, `README.md`: the daemon defaulted to `:8080` and the
+  CLI to `:8090`, so out of the box they could not talk. Unified on `:8090` via
+  `config.DefaultListenPort` with `DefaultListenAddr` and
+  `DefaultCoordinatorURL` derived from it, so the two cannot drift again.
+  `config.example.yaml` also said `:8080` — worse than the reported symptom,
+  since copying the shipped example reproduced the bug *with* an explicit config
+  file — and is covered by `TestShippedConfigs_ListenAddrMatchesDefault` (#81)
 - `pkg/types/types.go`: `ReplicationPolicy`, `CoordinatorConfig`, and
   `PerformanceConfig` carried only `json` tags, but `pkg/config` decodes all
   three from YAML. yaml.v3 falls back to the lowercased field name when a tag is
