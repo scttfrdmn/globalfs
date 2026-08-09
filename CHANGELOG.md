@@ -35,12 +35,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `internal/coordinator/coordinator.go`: `AddSiteUnique` and `ErrDuplicateSite`
   — checks the name and appends under a single lock hold, so racing callers
   cannot both claim one name. `AddSite` is retained for config load, which
-  rejects duplicates earlier. No HTTP caller yet; the 409 mapping is a
-  follow-up (#80)
+  rejects duplicates earlier. Wired into `POST /api/v1/sites` as a 409 later in
+  this release (#80, #131)
 - `internal/coordinator/coordinator.go`: `ErrReplicationNotQueued` and
   `SetEnqueueBackpressure`, plus `globalfs_replication_dropped_total` in
   `internal/metrics` — a monotonic counter, because the queue-depth gauge
   returns to zero once a backlog clears and leaves no evidence it existed (#79)
+- `internal/coordinator/coordinator.go`: `StopContext` and `CloseContext` —
+  `Stop`/`Close` with a caller-supplied deadline, returning an error when the
+  budget elapses before shutdown finishes. A non-nil error does not mean the
+  coordinator is still running: the state transition, the worker's stop signal
+  and both context cancellations all happen before anything is waited on. What
+  it reports is that shutdown gave up *observing* the finish, so a transfer may
+  be mid-flight or a site left unclosed (#83)
+- `internal/coordinator/coordinator.go`: `ErrStarted` and `ErrStopped`, the two
+  refusals of the single-use lifecycle contract below (#82, #84, #85)
+- `internal/replication/worker.go`: `DroppedTerminalEvents()` — a monotonic
+  count of terminal events abandoned because the events buffer stayed full for
+  the whole emit budget. Each one is a job the coordinator never learns settled,
+  so the count is exposed rather than only logged, where it would scroll away.
+  Deliberately not a Prometheus counter: `internal/replication` does not import
+  `internal/metrics`, and wiring it belongs to the coordinator that owns the
+  registry — filed as a follow-up (#93)
+- `pkg/client/client.go`: `ErrReplicationPending`, `ErrUnexpectedRedirect`, and
+  `ErrInvalidKey`. `ErrReplicationPending` is an unusual contract worth stating
+  plainly — it is a **non-nil error for a committed write**. A nil would claim
+  durability the coordinator never claimed, which is the "success while
+  something is wrong" shape this release is largely about, merely inverted. Test
+  for it with `errors.Is` and do not retry the write (#130, #132)
+- `cmd/coordinator/main.go`: `X-GlobalFS-Replication: pending` on a 202 from
+  `PUT /api/v1/objects/{key...}`, following the `X-GlobalFS-Partial`/207
+  precedent — a bare 202 is ambiguous, since `replicateHandler` returns one for
+  ordinary success, and a header is what a proxy, an access log, or a metrics
+  pipeline can act on without parsing a body (#130)
+- `cmd/globalfs`: `object put --json` gains `replication_pending` and `detail`,
+  both `omitempty`, so a fully replicated write serialises byte-identically to
+  before and a caller who wants to gate on incomplete replication can (#130)
 
 ### Security
 - `cmd/coordinator/api.go`, `main.go`: path traversal crossed the authorization
@@ -74,6 +104,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolving and dialling is a DNS-rebinding window. Closing it requires pinning
   the connection to the checked address via a `DialContext` hook, and the
   objectfs SDK exposes no transport option — tracked upstream (#76)
+- `pkg/client/client.go`: the client followed HTTP redirects, and Go's
+  `http.Client` replays both the method and the `X-GlobalFS-API-Key` header on a
+  307 — so a redirect became a second, differently-targeted, still-authenticated
+  request. This is the client half of the #73 exploit above. It now refuses every
+  redirect with an error wrapping `ErrUnexpectedRedirect`, chosen over
+  `http.ErrUseLastResponse` because that surfaces a 307 as an ordinary `*APIError`
+  every call site would have to recognise, whereas an error means the follow-up
+  request is never built and the key never reaches the wire a second time. The
+  policy is installed after the options so a client passed via `WithHTTPClient`
+  is covered, on a shallow copy so the caller's own client is untouched and its
+  Transport still pools, and a caller-set `CheckRedirect` is respected — this is a
+  default, not a prohibition. Object keys are also validated locally against
+  `ErrInvalidKey` before a request is sent. Since #73 closed the server side, this
+  is hardening for pre-#73 and misconfigured-proxy deployments rather than a live
+  hole. Not covered: `cmd/globalfs` has its own `httpClient` for two raw GETs to
+  fixed paths that bypass `pkg/client` (#132)
 
 ### Fixed
 - `internal/replication/worker.go`: `srcInfo.Checksum[:8]` sliced an unvalidated
@@ -151,16 +197,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the primary write is idempotent and content-hash dedup skips destinations
   that already hold the content. The budget is finite on purpose — unbounded
   blocking would make the async path synchronous and let one wedged destination
-  stall every writer. **The HTTP layer does not yet distinguish this**:
-  `objectPutHandler` maps every `Put` error to 502, so a partial success is
-  currently reported as a gateway failure; 202 Accepted is the correct mapping
-  and is a follow-up (#79)
+  stall every writer. The HTTP layer initially mapped every `Put` error to 502,
+  reporting this partial success as a gateway failure; that is corrected to 202
+  Accepted later in this release (#79, #130)
 - `internal/coordinator/coordinator.go`: `RemoveSite` had no `break`, so with
   duplicate site names it kept only the last match, filtered out all of them,
   and closed exactly one — leaking the others' connection pools. It now splices
   out the highest-priority match by index and closes that site. The close stays
   outside the lock, now with a comment saying why, so the next edit does not
-  move it (#95 exists because `Close` does not do the same) (#80)
+  move it — `Close` is brought into line with it later in this release (#80, #95)
 - `pkg/config/config.go`, `cmd/coordinator/main.go`, `cmd/globalfs/main.go`,
   `config.example.yaml`, `README.md`: the daemon defaulted to `:8080` and the
   CLI to `:8090`, so out of the box they could not talk. Unified on `:8090` via
@@ -182,6 +227,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `config.example.yaml` — the file README.md tells users to copy — failed
   `globalfs config validate` with `policies[0].path_pattern is required` while
   plainly containing one
+- `internal/coordinator/coordinator.go`, `internal/replication/worker.go`:
+  `Stop()` racing `Start()` permanently leaked the drain and health goroutines —
+  59 of 60 iterations leaked a pair. The cause was a missing mutual-exclusion
+  invariant rather than a missing nil check: `Start` has to release `c.mu` across
+  the lease acquisition and `recoverPendingJobs`, and a `Stop` that slipped into
+  that window saw `storeCancel` still nil and `storeWg` still zero, concluded
+  there was nothing to stop, and returned — after which `Start` launched a drain
+  goroutine and a health poller under a context nothing would ever cancel. A
+  `lifecycleMu` now serialises `Start` against `Stop` for their whole duration
+  (#82)
+- `internal/replication/worker.go`: `Stop()` before `Start()` permanently
+  disabled replication, and nothing said so. `Stop` was `w.once.Do(func() {})` —
+  a no-op whose only purpose was burning the `sync.Once` so a later `Start` could
+  not run — while the doc comment one line above claimed "Calling Stop before
+  Start is safe." The coordinator's other goroutines still launched, so the
+  daemon looked healthy with replication dead. Replaced with an explicit
+  `created → running → stopped` state machine on both Worker and Coordinator:
+  Stop-before-Start is legal *and terminal*, and `Start` on a stopped instance
+  is refused with an error wrapping `ErrStopped` (#84)
+- `internal/coordinator/coordinator.go`: `SetWorkerQueueDepth` after `Start`
+  replaced `c.worker` while documenting that it did not, orphaning the running
+  worker and ending all replication. The six configuration setters now return an
+  error under a freeze-at-Start rule — `Start` snapshots configuration in one
+  lock hold and every setter writing those fields refuses afterwards, with a
+  negative-control test pinning which setters are gated so the gate cannot
+  quietly grow. An error rather than genuine reconfiguration: the depth *is* a
+  channel's buffer, and a channel's buffer cannot be resized, so
+  "reconfigurable" would mean a second channel plus either discarding queued jobs
+  or one worker serving two queues — a feature, not a setter (#85)
+- `internal/coordinator/coordinator.go`: `c.m` was read without the lock while
+  `SetMetrics` wrote it under `c.mu`. Reads now go through a `metrics()`
+  accessor, with call sites that already hold the lock using an explicit
+  `metricsSiteCountLocked` (#86)
+- `internal/coordinator/coordinator.go`, `internal/replication/worker.go`,
+  `cmd/coordinator/main.go`: `Stop()`/`Close()` waited forever on an unresponsive
+  site, so SIGTERM never completed. **The filed diagnosis was partly wrong** and
+  is worth recording: `Health` does impose `defaultHealthTimeout` on its context,
+  so the real question was whether `site.Health` honours a context at all.
+  objectfs v0.12.0's `ConnectionPool.Get()` is hard-coded to
+  `GetWithTimeout(30s)` and takes **no context**, so site probes genuinely ignore
+  deadlines and both layers needed fixing: bounded waits and a partial `Health`
+  report in the coordinator, and an explicit deadline at the daemon's call site.
+  The shutdown context derives from `context.Background()`, *not* from the
+  daemon's already-cancelled root — a context derived from a cancelled parent is
+  born cancelled, so passing one to `CloseContext` would make every bounded wait
+  return immediately, abandoning the in-flight transfer with its terminal event
+  unemitted and the drain already gone, which is precisely the phantom job #78
+  fixed. `newShutdownContext` is a named function so that derivation is testable,
+  and the test pins both directions (#83)
+- `internal/coordinator/coordinator.go`: `Close()` held `c.mu` across per-site
+  network teardown, blocking every method that touches the site set — including
+  `Sites()` and the health endpoint — for as long as a connection-pool drain
+  took. Sites are now closed outside the lock, as `RemoveSite` already did (#95)
+- `cmd/coordinator/main.go`: five lifecycle errors were discarded at boot. The
+  serious one is `c.Start`, which under the new contract can refuse: the daemon
+  would have gone on serving HTTP with no replication worker and no health
+  poller, `/healthz` answering from a cache nothing refreshed, and nothing in the
+  log saying why. The four configuration setters are fatal too, via
+  `mustConfigure`: they all run before `Start` where the contract is to return
+  nil, so a non-nil error means a setter moved below `Start` — a bug in the boot
+  order, not in the operator's file. Fatal rather than logged because the value
+  came from the config file, so `config show` would keep reporting it while the
+  daemon ran on the default, which is the reported-versus-effective divergence
+  #81 and the YAML-tag bug both produced (#83, #84)
+- `internal/replication/worker.go`: the events channel was sized at the job queue
+  depth while `processJob` emits two events per job, so terminal events were
+  dropped past half depth — at the shipped default depth of 8, an 8-job burst
+  delivered terminal events for exactly 4. A dropped terminal event is not
+  cosmetic: the coordinator deletes the durable job record and writes the dedup
+  content hash on that event, so losing it strands a phantom job that is
+  re-enqueued on the next restart and loses the hash. Sizing alone was rejected
+  as insufficient — it moves the threshold and the loss stays silent — so three
+  changes: the buffer is `depth*eventsPerJob + eventBufferSlack`; `EventStarted`
+  can no longer occupy the last slot, so the harmless half of the pair cannot
+  displace the harmful half; and terminal events wait for room under a 10s
+  budget. That wait deliberately ignores `w.done` and the job context, since both
+  mean "stop working" and a terminal event is the record that the work already
+  finished. The budget is finite because an unbounded send would let a wedged
+  consumer wedge the worker that `Stop` waits on. A still-lost terminal event is
+  logged at Error naming both consequences, and counted (#93)
+- `cmd/coordinator/api.go`, `pkg/client/client.go`, `cmd/globalfs/main.go`: a
+  write that reached every primary but could not queue replication returned 502,
+  telling callers to retry a write that had already committed and making a queue
+  backlog look like an outage to anything alerting on 5xx. Now 202 with a
+  `X-GlobalFS-Replication: pending` header and a distinct body type — not
+  `errorResponse`, since a client keying off `{"error": ...}` would read the
+  success as a failure, which is this defect moved from the status code into the
+  body. **The status code alone did not fix it**: `pkg/client.PutObject` matched
+  201 exactly, so the new 202 arrived at the only first-party consumer as an
+  `*APIError` and `globalfs object put` printed a committed write as a failure.
+  The client now returns `ErrReplicationPending` and the CLI reports success with
+  a caveat on stderr at exit 0 — a non-zero exit is the only signal `set -e` and
+  CI runners read, and would relocate the same harm into the exit code. A
+  round-trip test drives the real handler and the real client over a real socket,
+  which is what per-side stubs could not catch (#79, #130)
+- `cmd/coordinator/api.go`: `POST /api/v1/sites` still accepted a duplicate site
+  name. It now uses `AddSiteUnique` and returns 409. Two details matter: the
+  rejected mount is closed, because `AddSiteUnique` deliberately leaves it open
+  and the S3 connection pool `site.NewFromConfig` opened would otherwise leak —
+  #80's leak arriving by a new route — and a name check runs before endpoint
+  validation and `NewFromConfig`, so a duplicate no longer costs a DNS lookup and
+  a signed `HeadBucket` against a caller-supplied endpoint. That pre-check races
+  by construction and says so; `AddSiteUnique` under the lock remains
+  authoritative, verified by 16 concurrent registrations that all see the name
+  free (#131)
 - `internal/metadata/etcd_store.go`: removed `replicatedPrefix`, which was
   never called and duplicated a string literal already inlined at its one
   would-be call site
@@ -199,6 +349,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the build now resolves entirely from the module proxy with no local paths.
 
 ### Changed
+- **Coordinator and Worker are now single-use.** The lifecycle is
+  `created → running → stopped`: `Start` is idempotent, `Stop` before `Start` is
+  legal but terminal, and `Stop`-then-`Start` is refused with `ErrStopped`.
+  Configuration is frozen at `Start` — six setters return an error afterwards
+  instead of silently taking effect or, worse, orphaning the running worker. This
+  makes #82 and #84 invalid by construction rather than defensively patched. A
+  process that needs to restart replication should exit and let its supervisor
+  start a fresh coordinator, which is the recovery a single-use lifecycle allows
+  (#82, #84, #85)
+- **Worst-case time from SIGTERM to exit is now 60 seconds**, in two sequential
+  30s windows: the HTTP drain, then coordinator teardown. Set the termination
+  grace period of whatever supervises the daemon above 60s — below it, SIGKILL
+  preempts the bounded shutdown and none of #83's work runs. A shutdown that
+  exhausts its budget exits non-zero: the process is terminating either way, but
+  a transfer abandoned mid-flight or a site left unclosed is not a clean
+  shutdown, and an orchestrator reading `$?` is entitled to the difference (#83)
+- **`PUT /api/v1/objects/{key...}` can now answer 202**, which is a new response
+  code for that endpoint. A pre-v0.2.3 `pkg/client` build talking to a v0.2.3
+  coordinator matches 201 exactly, so it reports a committed write as
+  `coordinator error (202)` and may re-upload data that is already stored. Not a
+  correctness problem — the write is durable and the retry is idempotent — but a
+  spurious failure and a wasted upload. Client and coordinator are versioned
+  together, though nothing enforces that they are *deployed* together: a pinned
+  dependency in a downstream Go program, or a stale `globalfs` binary on an
+  operator's laptop, is enough to hit this (#130)
 - objectfs dependency upgraded v0.10.0 → v0.12.0 (two minor releases accrued
   while GlobalFS was dormant; the module rename above shipped among them). The
   `ObjectInfo.Checksum` fast path in `internal/replication/worker.go` is
