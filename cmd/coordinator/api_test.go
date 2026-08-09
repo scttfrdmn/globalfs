@@ -35,6 +35,12 @@ type testMemClient struct {
 	headErr   error
 	listErr   error
 	healthErr error
+
+	// getDelay stalls Get before it returns, so a test can make a response take
+	// longer to deliver than the server's WriteTimeout allows without needing a
+	// payload large enough to be slow on its own merits (#75). Set before the
+	// client is handed to a coordinator; not mutated afterwards.
+	getDelay time.Duration
 }
 
 func newTestMemClient(objs map[string][]byte) *testMemClient {
@@ -45,6 +51,9 @@ func newTestMemClient(objs map[string][]byte) *testMemClient {
 }
 
 func (m *testMemClient) Get(_ context.Context, key string, _, _ int64) ([]byte, error) {
+	if m.getDelay > 0 {
+		time.Sleep(m.getDelay)
+	}
 	if m.getErr != nil {
 		return nil, m.getErr
 	}
@@ -1622,6 +1631,212 @@ func TestSitesList_WithCircuitBreaker_Open(t *testing.T) {
 	}
 	if sites[0].CircuitState != "open" {
 		t.Errorf("circuit_state: got %q, want %q", sites[0].CircuitState, "open")
+	}
+}
+
+// ── Transfer deadlines (#75) ──────────────────────────────────────────────────
+
+// TestTransferDeadline_Sizing covers the budget arithmetic: proportional to size
+// at minTransferThroughputBytesPerSec, clamped at both ends.
+func TestTransferDeadline_Sizing(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		size int64
+		want time.Duration
+	}{
+		{"unknown length gets the floor", -1, minTransferDeadline},
+		{"zero gets the floor", 0, minTransferDeadline},
+		{"small object gets the floor", 4096, minTransferDeadline},
+		{"floor holds up to its equivalent size", 30 << 20, minTransferDeadline},
+		{"64 MiB at 1 MiB/s", 64 << 20, 64 * time.Second},
+		{"documented 256 MiB cap is reachable", maxObjectBodyBytes, 256 * time.Second},
+		{"absurd size is capped", 1 << 40, maxTransferDeadline},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := transferDeadline(tc.size); got != tc.want {
+				t.Errorf("transferDeadline(%d) = %v, want %v", tc.size, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTransferDeadline_SizeCapIsReachable is the consistency check the issue asks
+// for: an advertised limit that cannot be reached at realistic bandwidth is a
+// defect. The budget for a maximum-size body must be at least the time that body
+// takes at the throughput floor.
+func TestTransferDeadline_SizeCapIsReachable(t *testing.T) {
+	t.Parallel()
+
+	needed := time.Duration(maxObjectBodyBytes/minTransferThroughputBytesPerSec) * time.Second
+	if got := transferDeadline(maxObjectBodyBytes); got < needed {
+		t.Errorf("a %d-byte body gets %v but needs %v at %d B/s — the documented cap "+
+			"is unreachable (#75)", maxObjectBodyBytes, got, needed, minTransferThroughputBytesPerSec)
+	}
+	if maxTransferDeadline < needed {
+		t.Errorf("maxTransferDeadline (%v) is below the time a maximum-size body needs "+
+			"(%v): the cap and the timeout contradict each other", maxTransferDeadline, needed)
+	}
+}
+
+// TestStatusRecorder_UnwrapReachesDeadlineControl is a small test for the trap
+// that makes the rest of #75's fix a no-op.
+//
+// loggingMiddleware and withObjectMetrics both wrap the ResponseWriter in a
+// statusRecorder, and http.ResponseController finds SetWriteDeadline by walking
+// Unwrap. Without statusRecorder.Unwrap every deadline call returns
+// ErrNotSupported and quietly does nothing, so the handlers keep the 10s
+// server-wide deadline and the bug survives a fix that looks correct. Verified to
+// fail with the Unwrap method removed.
+func TestStatusRecorder_UnwrapReachesDeadlineControl(t *testing.T) {
+	t.Parallel()
+
+	errCh := make(chan error, 1)
+	srv := httptest.NewServer(withObjectMetrics("get", nil,
+		loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Two statusRecorder layers deep, as in the real chain.
+			errCh <- http.NewResponseController(w).SetWriteDeadline(time.Now().Add(time.Minute))
+			w.WriteHeader(http.StatusOK)
+		})).ServeHTTP))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	if err := <-errCh; err != nil {
+		t.Errorf("SetWriteDeadline through the middleware chain: %v — the deadline "+
+			"never reaches the connection, so #75 is unfixed", err)
+	}
+}
+
+// TestObjectGet_LargeBodyNotTruncated is the end-to-end regression test for #75.
+//
+// It runs a real http.Server with WriteTimeout deliberately far shorter than the
+// response takes to deliver, which is the production shape of the bug: an
+// absolute deadline on the whole response rather than an idle one. The handler
+// must extend it per request and the client must receive every byte.
+//
+// The coordinator's Get is made slow rather than the object made huge: a 64 MiB
+// payload would be needed to beat a 10s timeout honestly, and a slow Get with a
+// 1s timeout tests the same deadline arithmetic in a second rather than a minute.
+func TestObjectGet_LargeBodyNotTruncated(t *testing.T) {
+	// The payload has to exceed the socket buffers, or the whole response is
+	// buffered by the kernel and returns before any deadline could bite.
+	const size = 8 << 20
+	payload := bytes.Repeat([]byte("A"), size)
+
+	c, mc := makeTestCoordinator(t, map[string][]byte{"big.bin": payload})
+	mc.getDelay = 2 * time.Second // exceeds the server's WriteTimeout below
+
+	mux := http.NewServeMux()
+	registerAPIRoutes(mux, context.Background(), c, nil, config.SecurityConfig{})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{
+		Handler:      buildHandler(mux, ""),
+		ReadTimeout:  1 * time.Second,
+		WriteTimeout: 1 * time.Second, // shorter than the response takes
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/api/v1/objects/big.bin")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+	if got := resp.ContentLength; got != size {
+		t.Fatalf("Content-Length: got %d, want %d", got, size)
+	}
+
+	// io.ReadAll's error is the whole point: a truncated body shows up here as
+	// "unexpected EOF" against an accurate Content-Length, which is exactly what
+	// the issue reports.
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v — the response was truncated after %d of %d bytes "+
+			"because WriteTimeout is an absolute deadline (#75)", err, len(got), size)
+	}
+	if len(got) != size {
+		t.Errorf("body length: got %d, want %d (truncated mid-body, #75)", len(got), size)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Error("body content differs from the stored object")
+	}
+}
+
+// TestObjectPut_SlowUploadNotCutOff is the same defect in the read direction: a
+// body arriving more slowly than ReadTimeout allows must still be accepted, which
+// is what makes the documented 256 MiB cap reachable below 25.6 MiB/s.
+func TestObjectPut_SlowUploadNotCutOff(t *testing.T) {
+	const size = 1 << 20
+	payload := bytes.Repeat([]byte("B"), size)
+
+	c, mc := makeTestCoordinator(t, nil)
+
+	mux := http.NewServeMux()
+	registerAPIRoutes(mux, context.Background(), c, nil, config.SecurityConfig{})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{
+		Handler:      buildHandler(mux, ""),
+		ReadTimeout:  1 * time.Second, // shorter than the upload takes
+		WriteTimeout: 1 * time.Second,
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	// A body delivered in chunks over ~2s, with an accurate Content-Length so the
+	// handler can size the deadline from it.
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		const chunks = 8
+		for i := 0; i < chunks; i++ {
+			if _, err := pw.Write(payload[i*size/chunks : (i+1)*size/chunks]); err != nil {
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}()
+
+	req, err := http.NewRequest(http.MethodPut,
+		"http://"+ln.Addr().String()+"/api/v1/objects/slow.bin", pr)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.ContentLength = size
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT: %v — a slow upload was cut off by the server-wide "+
+			"ReadTimeout (#75)", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: got %d (%s), want 201", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if !mc.hasKey("slow.bin") {
+		t.Error("object was not stored")
 	}
 }
 

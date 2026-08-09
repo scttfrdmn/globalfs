@@ -679,6 +679,97 @@ func objectListHandler(c *coordinator.Coordinator) http.HandlerFunc {
 	}
 }
 
+// ── Per-request transfer deadlines ────────────────────────────────────────────
+//
+// http.Server's ReadTimeout and WriteTimeout are absolute deadlines on the whole
+// request and the whole response — not idle timeouts.  The values in
+// cmd/coordinator/main.go are right for a JSON control API and wrong for the
+// object routes that share the same server, and the arithmetic is not close
+// (#75):
+//
+//	WriteTimeout 10s vs a 64 MiB GET  -> truncated mid-body at ~42 MB
+//	ReadTimeout  10s vs a 256 MiB PUT -> needs 25.6 MiB/s sustained to
+//	                                     even reach the advertised cap
+//
+// So the strict server-wide deadlines stay, and the object handlers replace them
+// per request with a budget derived from the payload size and a floor.  A stalled
+// transfer is still cut off — the point is to size the deadline to the work, not
+// to remove it.
+
+// minTransferThroughputBytesPerSec is the slowest transfer rate the object routes
+// will tolerate.  A deadline is computed as size/rate, so this is what decides
+// whether a large transfer gets time to finish.
+//
+// 1 MiB/s is deliberately near the floor of plausible: it gives the documented
+// 256 MiB cap 256s and makes the advertised limit reachable, which is the defect
+// the issue identifies. Raising it re-breaks slow clients; the timeout and the
+// size cap have to be consistent with each other, and that is the constraint
+// that sets this number rather than taste.
+const minTransferThroughputBytesPerSec = 1 << 20 // 1 MiB/s
+
+// minTransferDeadline is the floor applied to every computed budget, so a small
+// object is not held to an unreasonably tight deadline (a 4 KiB object would
+// otherwise get 4ms) and a zero-length one still gets time to be written.
+const minTransferDeadline = 30 * time.Second
+
+// maxTransferDeadline caps the budget regardless of size.  Slowloris protection
+// is the reason there is a ceiling at all: without one, a caller advertising a
+// large Content-Length could hold a connection indefinitely.  256 MiB at 1 MiB/s
+// is 256s, so this leaves headroom over the documented cap without being open
+// ended.
+const maxTransferDeadline = 10 * time.Minute
+
+// transferDeadline returns the time budget for moving n bytes: n at
+// minTransferThroughputBytesPerSec, clamped to
+// [minTransferDeadline, maxTransferDeadline].
+//
+// A negative or unknown size (Content-Length of -1 on a chunked upload) yields
+// the floor.
+func transferDeadline(n int64) time.Duration {
+	if n <= 0 {
+		return minTransferDeadline
+	}
+	d := time.Duration(n/minTransferThroughputBytesPerSec) * time.Second
+	if d < minTransferDeadline {
+		return minTransferDeadline
+	}
+	if d > maxTransferDeadline {
+		return maxTransferDeadline
+	}
+	return d
+}
+
+// extendWriteDeadline replaces the server-wide WriteTimeout for this response
+// with a budget sized for n bytes.  Returns the deadline applied, or 0 if the
+// ResponseWriter does not support deadline control.
+//
+// http.ErrNotSupported is not an error worth logging loudly: httptest.Recorder
+// returns it, and so does any ResponseWriter wrapper that does not implement
+// Unwrap. The handler proceeds under the server-wide deadline in that case,
+// which is the pre-fix behaviour rather than a regression.
+func extendWriteDeadline(w http.ResponseWriter, n int64) time.Duration {
+	d := transferDeadline(n)
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d)); err != nil {
+		if !errors.Is(err, http.ErrNotSupported) {
+			slog.Warn("api: set write deadline", "error", err)
+		}
+		return 0
+	}
+	return d
+}
+
+// extendReadDeadline does the same for a request body of n bytes.
+func extendReadDeadline(w http.ResponseWriter, n int64) time.Duration {
+	d := transferDeadline(n)
+	if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(d)); err != nil {
+		if !errors.Is(err, http.ErrNotSupported) {
+			slog.Warn("api: set read deadline", "error", err)
+		}
+		return 0
+	}
+	return d
+}
+
 // objectGetHandler handles GET /api/v1/objects/{key...} — retrieve object data.
 func objectGetHandler(c *coordinator.Coordinator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -698,11 +789,24 @@ func objectGetHandler(c *coordinator.Coordinator) http.HandlerFunc {
 			return
 		}
 
+		// The exact response size is known here, so the deadline is sized to it
+		// before a byte is written. Under the server-wide WriteTimeout of 10s any
+		// object needing longer than that was truncated mid-body, after a 200 and
+		// an accurate Content-Length had already been sent (#75).
+		extendWriteDeadline(w, int64(len(data)))
+
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		w.WriteHeader(http.StatusOK)
 		if _, err := w.Write(data); err != nil {
-			slog.Warn("api: write response body", "key", key, "error", err)
+			// Nothing can be done for the client — the status and Content-Length
+			// are already committed — but this must not be swallowed: it is the
+			// only record that the response the client received was short.
+			slog.Warn("api: write response body truncated",
+				"key", key,
+				"bytes_expected", len(data),
+				"request_id", requestIDFromCtx(r.Context()),
+				"error", err)
 		}
 	}
 }
@@ -719,6 +823,28 @@ func objectPutHandler(c *coordinator.Coordinator) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid object key: "+err.Error())
 			return
 		}
+
+		// Size the read deadline from the advertised body length before reading.
+		// Content-Length is untrusted, but it is only used to grant time, and the
+		// grant is bounded by maxTransferDeadline and the MaxBytesReader below —
+		// so overstating it buys a slow-loris no more than maxTransferDeadline,
+		// which is the ceiling regardless. A chunked upload reports -1 and gets
+		// the floor.
+		//
+		// Without this, ReadTimeout of 10s against the documented 256 MiB cap
+		// required 25.6 MiB/s sustained for the limit to be reachable at all: an
+		// 8 MiB upload at 2 MiB/s failed after 229 KB (#75).
+		extendReadDeadline(w, r.ContentLength)
+
+		// The *write* deadline has to be extended here too, which is not obvious.
+		// net/http arms both deadlines when it finishes reading the request
+		// headers, so WriteTimeout is already ticking while the body is still
+		// arriving. A body that takes longer than WriteTimeout to upload leaves no
+		// time to answer it: the response write fails, the connection is closed,
+		// and the client sees EOF rather than the 201 its upload earned. Found by
+		// TestObjectPut_SlowUploadNotCutOff, which failed exactly that way with
+		// only the read deadline extended.
+		extendWriteDeadline(w, r.ContentLength)
 
 		r.Body = http.MaxBytesReader(w, r.Body, maxObjectBodyBytes)
 		data, err := io.ReadAll(r.Body)
@@ -860,6 +986,17 @@ func (sr *statusRecorder) WriteHeader(code int) {
 	sr.code = code
 	sr.ResponseWriter.WriteHeader(code)
 }
+
+// Unwrap exposes the underlying ResponseWriter to http.ResponseController.
+//
+// This is required, not cosmetic. Both loggingMiddleware and withObjectMetrics
+// wrap the writer in a statusRecorder, and ResponseController walks Unwrap to
+// find something implementing SetWriteDeadline. Without this method every object
+// handler's deadline call returns http.ErrNotSupported and silently does nothing
+// — the handler keeps the server-wide 10s deadline and #75 is unfixed while
+// looking fixed. Verified: with the method absent, SetWriteDeadline through a
+// statusRecorder returns "feature not supported"; with it, nil.
+func (sr *statusRecorder) Unwrap() http.ResponseWriter { return sr.ResponseWriter }
 
 // withObjectMetrics wraps a handler to record operation duration and status.
 // m may be nil; when nil the handler is called without instrumentation.

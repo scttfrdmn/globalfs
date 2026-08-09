@@ -256,6 +256,14 @@ func main() {
 	}
 	handler := buildHandler(mux, apiKey)
 
+	// ReadTimeout and WriteTimeout are absolute deadlines on the whole request and
+	// the whole response, not idle timeouts. These values are correct for the JSON
+	// control endpoints and wrong for the object routes sharing this server, which
+	// is why the object handlers replace them per request via
+	// http.ResponseController — see the transfer-deadline block in api.go. They
+	// are kept strict here so that a slow or stalled control-plane request is
+	// still cut off promptly; raising them globally would have been the wrong fix
+	// for #75, since it weakens every endpoint to accommodate two.
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
