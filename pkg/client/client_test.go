@@ -1,12 +1,16 @@
 package client_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -421,6 +425,252 @@ func TestGetObject_Error(t *testing.T) {
 	if apiErr.StatusCode != http.StatusBadGateway {
 		t.Errorf("expected 502, got %d", apiErr.StatusCode)
 	}
+}
+
+// ── GetObject truncation (#74) ─────────────────────────────────────────────────
+
+// rawServer serves a single hand-written HTTP response over a raw TCP
+// connection, then closes it.  This is the only way to produce responses
+// net/http's server refuses to emit — a body shorter than its own
+// Content-Length, or a close-delimited body with no length at all.
+func rawServer(t *testing.T, response string) *client.Client {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Consume the request head; we do not care what it says.
+			conn.Read(make([]byte, 4096))
+			conn.Write([]byte(response))
+			conn.Close()
+		}
+	}()
+	return client.New("http://" + ln.Addr().String())
+}
+
+// TestGetObject_ShortBody_ContentLength is the primary regression test for #74:
+// the response is a 200 with Content-Length: 64 and only 8 bytes of body.  On
+// the pre-fix tree GetObject returned those 8 bytes with a nil error, and
+// `object get -o file` wrote a short file and exited 0.
+func TestGetObject_ShortBody_ContentLength(t *testing.T) {
+	c := rawServer(t, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 64\r\n\r\n12345678")
+
+	data, err := c.GetObject(context.Background(), "data/genome.bam")
+	if err == nil {
+		t.Fatalf("expected an error for a truncated body, got nil with %d bytes", len(data))
+	}
+	if data != nil {
+		t.Errorf("partial data must not be returned alongside an error; got %d bytes", len(data))
+	}
+	if !strings.Contains(err.Error(), "genome.bam") {
+		t.Errorf("error should name the key; got %v", err)
+	}
+}
+
+// TestGetObject_ShortBody_NoTransportError covers the case the length check
+// exists for: a transport that hands back fewer bytes than Content-Length
+// advertises without reporting a read error at all.  WithHTTPClient makes this
+// substitution part of the public API, so the check cannot lean on net/http
+// noticing.
+func TestGetObject_ShortBody_NoTransportError(t *testing.T) {
+	hc := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		body := []byte("12345678")
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Status:        "200 OK",
+			Header:        http.Header{"Content-Type": {"application/octet-stream"}},
+			ContentLength: 64, // claims 64, delivers 8, reports no error
+			Body:          io.NopCloser(bytes.NewReader(body)),
+			Request:       r,
+		}, nil
+	})}
+	c := client.New("http://coordinator.invalid", client.WithHTTPClient(hc))
+
+	data, err := c.GetObject(context.Background(), "big.bin")
+	if err == nil {
+		t.Fatalf("expected an error, got nil with %d bytes", len(data))
+	}
+	if !strings.Contains(err.Error(), "got 8 bytes, want 64") {
+		t.Errorf("error should report both lengths; got %v", err)
+	}
+	if data != nil {
+		t.Errorf("expected nil data, got %d bytes", len(data))
+	}
+}
+
+// TestGetObject_MidBodyReadError covers a body that fails partway with a
+// transport-level error.  The bytes read before the failure must not be
+// returned as success.
+func TestGetObject_MidBodyReadError(t *testing.T) {
+	boom := errors.New("connection reset by peer")
+	hc := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Status:        "200 OK",
+			Header:        http.Header{},
+			ContentLength: 64,
+			Body: io.NopCloser(io.MultiReader(
+				bytes.NewReader([]byte("1234567890")),
+				errReader{boom},
+			)),
+			Request: r,
+		}, nil
+	})}
+	c := client.New("http://coordinator.invalid", client.WithHTTPClient(hc))
+
+	data, err := c.GetObject(context.Background(), "partial.bin")
+	if err == nil {
+		t.Fatalf("expected an error, got nil with %d bytes", len(data))
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("error should wrap the read failure; got %v", err)
+	}
+	if !strings.Contains(err.Error(), "after 10 bytes") {
+		t.Errorf("error should report how far the read got; got %v", err)
+	}
+	if data != nil {
+		t.Errorf("expected nil data, got %d bytes", len(data))
+	}
+}
+
+// TestGetObject_NoContentLength_ShortBodyUndetected documents the limit of the
+// fix rather than asserting a guarantee it does not make.  With no
+// Content-Length there is nothing to compare against and a close-delimited
+// short body is indistinguishable from a complete one, so it still succeeds.
+// The coordinator always sets Content-Length on GET /api/v1/objects, so this is
+// not reachable against a GlobalFS server; the test exists so that a future
+// change to a streaming or chunked response path fails here and is forced to
+// think about end-to-end integrity instead.
+func TestGetObject_NoContentLength_ShortBodyUndetected(t *testing.T) {
+	c := rawServer(t, "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n12345678")
+
+	data, err := c.GetObject(context.Background(), "unlengthed.bin")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(data) != "12345678" {
+		t.Errorf("got %q, want 12345678", data)
+	}
+}
+
+// TestGetObject_ExactContentLength verifies the check does not reject a
+// correct, complete response.
+func TestGetObject_ExactContentLength(t *testing.T) {
+	payload := bytes.Repeat([]byte("ACGT"), 4096) // 16 KiB
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(payload)
+	})
+	c := newServer(t, mux)
+
+	data, err := c.GetObject(context.Background(), "data/genome.bam")
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	if !bytes.Equal(data, payload) {
+		t.Errorf("got %d bytes, want %d", len(data), len(payload))
+	}
+}
+
+// TestGetObject_EmptyObject verifies a zero-length object with
+// Content-Length: 0 is not mistaken for a truncation.
+func TestGetObject_EmptyObject(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+	})
+	c := newServer(t, mux)
+
+	data, err := c.GetObject(context.Background(), "empty")
+	if err != nil {
+		t.Fatalf("GetObject on an empty object: %v", err)
+	}
+	if len(data) != 0 {
+		t.Errorf("got %d bytes, want 0", len(data))
+	}
+}
+
+// TestGetObject_ServerWriteTimeout reproduces the field scenario from #74
+// end-to-end: a real coordinator-shaped handler writes a large body with
+// Content-Length set, the server's WriteTimeout fires mid-write, and the client
+// must not report success.
+func TestGetObject_ServerWriteTimeout(t *testing.T) {
+	const size = 8 << 20
+	payload := make([]byte, size)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{
+		WriteTimeout: 150 * time.Millisecond,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			w.WriteHeader(http.StatusOK)
+			w.Write(payload) // fails partway once WriteTimeout fires
+		}),
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+
+	// Throttle the client's reads so the server's write deadline expires while
+	// the body is still in flight.
+	hc := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &slowConn{Conn: conn}, nil
+		},
+	}}
+	c := client.New("http://"+ln.Addr().String(), client.WithHTTPClient(hc))
+
+	data, err := c.GetObject(context.Background(), "big.bin")
+	if err == nil {
+		t.Fatalf("expected an error for a server-truncated body, got nil with %d of %d bytes",
+			len(data), size)
+	}
+	if data != nil {
+		t.Errorf("partial data must not be returned; got %d bytes", len(data))
+	}
+}
+
+// roundTripperFunc adapts a function to http.RoundTripper.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// errReader always fails, standing in for a connection that drops mid-body.
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+// slowConn reads in small, slow increments so a server-side write deadline has
+// time to expire while the response body is still being drained.
+type slowConn struct {
+	net.Conn
+}
+
+func (s *slowConn) Read(b []byte) (int, error) {
+	if len(b) > 4096 {
+		b = b[:4096]
+	}
+	time.Sleep(2 * time.Millisecond)
+	return s.Conn.Read(b)
 }
 
 // ── PutObject ─────────────────────────────────────────────────────────────────

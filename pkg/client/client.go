@@ -238,6 +238,10 @@ func (c *Client) Status(ctx context.Context) (StatusResponse, error) {
 	}
 	defer resp.Body.Close()
 
+	// A read error here is deliberately ignored: the status code is what
+	// determines health, and the body only supplies human-readable detail, so a
+	// truncated read degrades the message rather than the answer.  (Bounding
+	// this read is #111.)
 	body, _ := io.ReadAll(resp.Body)
 	text := strings.TrimSpace(string(body))
 
@@ -260,6 +264,11 @@ func (c *Client) Status(ctx context.Context) (StatusResponse, error) {
 // ── Object methods ────────────────────────────────────────────────────────────
 
 // GetObject retrieves the full content of the object at key.
+//
+// GetObject never returns partial content with a nil error: a read that fails
+// mid-body, or a body shorter than the advertised Content-Length, is reported as
+// an error and the partial bytes are discarded (#74).  Callers can therefore
+// treat a nil error as meaning the returned slice is the whole object.
 func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 	resp, err := c.doGet(ctx, "/api/v1/objects/"+key)
 	if err != nil {
@@ -270,7 +279,28 @@ func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 	if err := checkStatus(resp, http.StatusOK); err != nil {
 		return nil, err
 	}
-	return io.ReadAll(resp.Body)
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		// Discard the partial bytes: returning them alongside an error invites
+		// callers to use whichever value they check first.
+		return nil, fmt.Errorf("read object %q body after %d bytes: %w", key, len(data), err)
+	}
+	// Cross-check against the advertised length: an independent assertion that
+	// does not rely on the transport reporting the truncation.  net/http does
+	// report it (a short Content-Length delimited body surfaces as
+	// io.ErrUnexpectedEOF), but WithHTTPClient lets callers substitute any
+	// RoundTripper, and this check holds regardless of which one is in play.
+	//
+	// resp.ContentLength is -1 when the length is unknown — a chunked response
+	// or an HTTP/1.0 close-delimited body — and the check is then skipped
+	// because there is nothing to compare against.  The coordinator always sets
+	// Content-Length on GET /api/v1/objects, so the check is live in practice.
+	if resp.ContentLength >= 0 && int64(len(data)) != resp.ContentLength {
+		return nil, fmt.Errorf("short object body for %q: got %d bytes, want %d",
+			key, len(data), resp.ContentLength)
+	}
+	return data, nil
 }
 
 // PutObject stores data under key. It returns nil on success.
@@ -440,6 +470,9 @@ func checkStatus(resp *http.Response, wantCode int) error {
 	if resp.StatusCode == wantCode {
 		return nil
 	}
+	// As in Status, a read error is ignored on purpose: an *APIError carrying the
+	// status code and a partial message is strictly better than losing the status
+	// code to a body-read failure.  (Bounding this read is #111.)
 	body, _ := io.ReadAll(resp.Body)
 	// Try to extract {"error":"..."} message.
 	var e struct{ Error string }
