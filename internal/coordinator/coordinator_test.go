@@ -32,6 +32,11 @@ type memClient struct {
 	// getFn, if non-nil, overrides the default Get behaviour.  Useful for
 	// simulating sequences of transient failures in retry tests.
 	getFn func(key string) ([]byte, error)
+	// putGate, if non-nil, blocks Put until the channel is closed.  Tests that
+	// assert on state which only exists *while* a transfer is in flight need
+	// the transfer held open; without it the worker and the drain goroutine can
+	// run to completion before the assertion executes.
+	putGate chan struct{}
 }
 
 func newMemClient(objs map[string][]byte) *memClient {
@@ -63,6 +68,14 @@ func (m *memClient) Get(_ context.Context, key string, _, _ int64) ([]byte, erro
 func (m *memClient) Put(_ context.Context, key string, data []byte) error {
 	if m.putErr != nil {
 		return m.putErr
+	}
+	// Read the gate under the lock, then wait outside it: blocking while holding
+	// m.mu would deadlock any concurrent hasKey/keys call.
+	m.mu.Lock()
+	gate := m.putGate
+	m.mu.Unlock()
+	if gate != nil {
+		<-gate
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -140,6 +153,17 @@ func (m *memClient) setHealthErr(err error) {
 	m.mu.Lock()
 	m.healthErr = err
 	m.mu.Unlock()
+}
+
+// blockPuts makes every subsequent Put on this client wait.  The returned
+// function releases them and is safe to call more than once.
+func (m *memClient) blockPuts() (release func()) {
+	gate := make(chan struct{})
+	m.mu.Lock()
+	m.putGate = gate
+	m.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }
 }
 
 func makeMount(name string, role types.SiteRole, objs map[string][]byte) (*site.SiteMount, *memClient) {
@@ -636,16 +660,28 @@ func TestCoordinator_SetStore_PersistsReplicationJob(t *testing.T) {
 	t.Parallel()
 
 	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
-	backup, _ := makeMount("backup", types.SiteRoleBackup, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// A persisted job is deleted by the drain goroutine as soon as the transfer
+	// completes, so its presence in the store is transient. Hold the destination
+	// write open for the duration of the assertion; otherwise the worker and the
+	// drain can both finish before GetPendingJobs runs and the job is legitimately
+	// gone. That is what made this test flake on CI, where two cores and a loaded
+	// runner widen the window enough for the race to land.
+	release := backupClient.blockPuts()
 
 	store := metadata.NewMemoryStore()
 	c := New(primary, backup)
 	c.SetStore(store)
 	c.Start(ctx)
+	// Defers run LIFO, so this releases the blocked transfer *before* Stop runs.
+	// The reverse order would have Stop wait on a worker parked inside Put, which
+	// is the shutdown hang tracked in #83.
 	defer c.Stop()
+	defer release()
 
 	if err := c.Put(ctx, "data/sample.bam", []byte("genome")); err != nil {
 		t.Fatalf("Put: %v", err)
