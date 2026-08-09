@@ -11,8 +11,9 @@
 //   - Get/Head: tries sites in the routed order, returns the first success.
 //   - Put: writes synchronously to primary-role sites in the routed set;
 //     asynchronously replicates to non-primary sites via the replication.Worker.
-//   - Delete: synchronous on primary-role sites (errors returned);
-//     best-effort on non-primaries (errors logged).
+//   - Delete: synchronous on every routed site, primaries first; returns nil
+//     only if the object is gone everywhere, otherwise an error naming the sites
+//     that still hold it (#87).
 //   - List: delegates to the embedded Namespace (priority-merge, no policy).
 //
 // # Lifecycle
@@ -1344,15 +1345,10 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 		return fmt.Errorf("coordinator: Put %q: policy error: %w", key, err)
 	}
 
-	primaries, others := partitionByRole(routed)
-
-	// If the routed set has no primaries (e.g. a burst-only policy rule),
-	// promote the first site to a synchronous write target so the data is
-	// persisted before Put returns.
-	if len(primaries) == 0 && len(others) > 0 {
-		primaries = others[:1]
-		others = others[1:]
-	}
+	// partitionForWrite promotes the first non-primary when the routed set has no
+	// primaries (e.g. a burst-only policy rule), so the data is persisted before
+	// Put returns.  Delete uses the same helper (#88).
+	primaries, others := partitionForWrite(routed)
 
 	// Invalidate the cache on every path out of Put, not only the success path.
 	//
@@ -1502,11 +1498,52 @@ func enqueueWithBackpressure(ctx context.Context, worker *replication.Worker, bu
 	}
 }
 
-// Delete removes the object at key from sites in the policy-routed set.
+// ErrDeleteIncomplete reports that a Delete removed the object from some of the
+// routed sites but not all of them, so the object is still readable.
 //
-// Primary site deletes are synchronous and return errors on failure.
-// Non-primary deletes are best-effort: errors are logged but not returned.
-// The cache entry for key is invalidated regardless of per-site outcome.
+// It is the delete-side counterpart of [ErrReplicationNotQueued]: a partial
+// outcome that neither "succeeded" nor "failed" describes honestly.  The error
+// message names every site that may still hold the object, and the underlying
+// cause of the first such failure is wrapped, so errors.Is finds both this
+// sentinel and the reason.
+//
+// Retrying the identical Delete is safe and is the intended response.  Delete is
+// idempotent at every site: a site that no longer has the key answers "no such
+// key", which Delete counts as already-deleted rather than as a failure, so a
+// retry converges on nil once the unwell sites recover.
+//
+// Nothing in GlobalFS retries on the caller's behalf.  There is no tombstone and
+// no queued delete job — the durable job machinery would need the metadata store,
+// which no shipped deployment wires — so an error wrapping this sentinel is the
+// only signal that exists, and a caller that discards it has an object it
+// believes is erased and that [Coordinator.Get] will still serve from the
+// surviving replica (#87).
+var ErrDeleteIncomplete = errors.New("delete incomplete; object still present at some sites")
+
+// Delete removes the object at key from every site in the policy-routed set.
+//
+// Delete is all-or-report: it returns nil only when every routed site confirmed
+// the object is gone.  If any site failed to delete it, Delete returns an error
+// wrapping [ErrDeleteIncomplete] that names the sites which may still hold the
+// object, and increments globalfs_delete_incomplete_total.  A site that answers
+// "no such key" counts as gone, not as a failure, so repeating a Delete is safe.
+//
+// Every routed site is attempted even after one fails, primaries first.  The
+// previous behaviour returned on the first primary error, which left the replicas
+// untouched, and logged-and-discarded every non-primary error, which meant a
+// delete that removed nothing from a burst site still reported success while Get
+// went on serving the surviving copy (#87, #88).  Removing the object from as
+// many sites as possible and then naming the rest is strictly better for a caller
+// under an erasure obligation than stopping at the first refusal.
+//
+// The cache entry for key is invalidated on every path, including the incomplete
+// one: the object was removed somewhere, so the cached copy is wrong either way.
+//
+// An HTTP layer in front of this may want to distinguish the partial case (the
+// object exists at a named subset of sites, and retrying is the fix) from a
+// delete that achieved nothing.  cmd/coordinator currently maps every Delete
+// error to 502, which is defensible for both but tells the client less than it
+// could; refining it is tracked separately.
 func (c *Coordinator) Delete(ctx context.Context, key string) error {
 	c.mu.RLock()
 	snapshot, pol, cb, oc := c.snapshotSites(), c.policy, c.cb, c.objCache
@@ -1517,29 +1554,82 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("coordinator: Delete %q: policy error: %w", key, err)
 	}
 
-	primaries, others := partitionByRole(routed)
+	// The promotion in partitionForWrite is what makes a burst-only delete rule
+	// report anything at all: without it every site is a non-primary and, before
+	// this, every non-primary error was discarded (#88).  It matters less now that
+	// both loops report, but Put and Delete sharing one partition keeps the two
+	// from drifting apart again.
+	primaries, others := partitionForWrite(routed)
 
-	for _, s := range primaries {
-		if err := s.Delete(ctx, key); err != nil {
-			recordSiteResult(cb, s.Name(), err)
-			return fmt.Errorf("coordinator: Delete %q from primary %q: %w", key, s.Name(), err)
-		}
-		recordSiteResult(cb, s.Name(), nil)
-	}
-	for _, s := range others {
-		err := s.Delete(ctx, key)
-		recordSiteResult(cb, s.Name(), err)
-		if err != nil {
-			slog.Warn("coordinator: Delete from non-primary site", "key", key, "site", s.Name(), "error", err)
-		}
-	}
-
-	// Invalidate the cache entry whether or not site deletes succeeded.
+	// Invalidate on every path out of Delete, for the same reason Put does (#91).
 	if oc != nil {
-		oc.Delete(key)
-		c.metricsCacheBytes(oc.Stats().Bytes)
+		defer func() {
+			oc.Delete(key)
+			c.metricsCacheBytes(oc.Stats().Bytes)
+		}()
+	}
+
+	// Primaries first, then the rest, in one loop so both get identical
+	// treatment.  Built into a fresh slice rather than appending others onto
+	// primaries: after the promotion above, primaries aliases others' backing
+	// array, and appending to it would write through into the slice being
+	// appended from.
+	targets := make([]*site.SiteMount, 0, len(primaries)+len(others))
+	targets = append(targets, primaries...)
+	targets = append(targets, others...)
+
+	// remaining collects the sites that may still hold the object, so the error
+	// names all of them rather than only the first.  cause keeps the first
+	// underlying error for errors.Is.
+	var remaining []string
+	var cause error
+	for _, s := range targets {
+		siteErr := s.Delete(ctx, key)
+		recordSiteResult(cb, s.Name(), siteErr)
+		if !objectStillPresentAfterDelete(siteErr) {
+			continue
+		}
+		remaining = append(remaining, s.Name())
+		if cause == nil {
+			cause = siteErr
+		}
+		slog.Error("coordinator: Delete failed; the object is still readable at this site",
+			"key", key, "site", s.Name(), "role", s.Role(), "error", siteErr)
+	}
+
+	if len(remaining) > 0 {
+		// Counter as well as log: a delete that did not happen everywhere is an
+		// integrity event that has to stay visible after the log line scrolls,
+		// and for a deployment under a retention obligation it is the only
+		// machine-readable record that the API reported an erasure it did not
+		// perform (#87).
+		c.metrics().RecordDeleteIncomplete()
+		return fmt.Errorf("coordinator: Delete %q: %w: %v: %w",
+			key, ErrDeleteIncomplete, remaining, cause)
 	}
 	return nil
+}
+
+// objectStillPresentAfterDelete reports whether a site's Delete error leaves the
+// object readable at that site.
+//
+// A "no such key" answer does not: the site was reached, it answered, and its
+// answer is that the object is absent — which is the state Delete wanted.  Any
+// other error is treated as "it may still be there", because the coordinator
+// cannot tell a refused delete from a delete that happened and failed to
+// acknowledge, and assuming the object survived is the direction that reports a
+// problem instead of hiding one.
+//
+// This is the same classification isSiteFailure makes for the circuit breaker
+// (#77) and it has to be made twice, for different questions: the breaker asks
+// whether the site is unwell, Delete asks whether the object is gone.  A backend
+// that reports not-found on a repeat delete would otherwise make every retry of
+// an already-completed Delete look incomplete forever.
+func objectStillPresentAfterDelete(err error) bool {
+	if err == nil {
+		return false
+	}
+	return !errors.Is(err, objectfssdk.ErrNotFound)
 }
 
 // List returns up to limit objects under prefix, merged across policy-routed sites.
@@ -1891,6 +1981,32 @@ func attemptableSites(cb *circuitbreaker.Breaker, sites []*site.SiteMount, bypas
 			}
 		}
 	}
+}
+
+// partitionForWrite splits routed into the sites a mutation must be applied to
+// synchronously — and whose errors therefore reach the caller — and the sites it
+// is applied to asynchronously (Put) or after the synchronous ones (Delete).
+//
+// It is partitionByRole plus one rule: if the routed set contains no primary at
+// all, the first non-primary is promoted into primaries.  A policy rule whose
+// TargetRoles is [burst] produces exactly that set, and without the promotion
+// there is no synchronous target, so the caller cannot learn whether the
+// mutation happened.  For Put that meant data that was never durably stored
+// anywhere before Put returned nil; for Delete it meant nil under *every*
+// outcome, because every site landed in the loop that logged its errors and
+// discarded them (#88).
+//
+// Put and Delete share this instead of each inlining it because they already
+// drifted apart once: Put grew the promotion with a comment explaining why it
+// was necessary, Delete never did, and neither call site shows the omission on
+// its own.
+func partitionForWrite(routed []*site.SiteMount) (primaries, others []*site.SiteMount) {
+	primaries, others = partitionByRole(routed)
+	if len(primaries) == 0 && len(others) > 0 {
+		primaries = others[:1]
+		others = others[1:]
+	}
+	return primaries, others
 }
 
 // partitionByRole splits sites into primary-role and non-primary slices,
