@@ -18,6 +18,7 @@ type Metrics struct {
 	replicationTotal      *prometheus.CounterVec
 	replicationQueueDepth prometheus.Gauge
 	replicationDropped    prometheus.Counter
+	deleteIncomplete      prometheus.Counter
 	cacheHits             prometheus.Counter
 	cacheMisses           prometheus.Counter
 	cacheEvictions        prometheus.Counter
@@ -64,6 +65,11 @@ func New(reg prometheus.Registerer) *Metrics {
 			Help: "Total number of replication jobs rejected because the queue was full. " +
 				"Non-zero means writes were not replicated; alert on any increase.",
 		}),
+		deleteIncomplete: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "globalfs_delete_incomplete_total",
+			Help: "Total number of deletes that left the object present on at least one site. " +
+				"Non-zero means objects reported deleted are still readable; alert on any increase.",
+		}),
 		cacheHits: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "globalfs_cache_hits_total",
 			Help: "Total number of cache hits.",
@@ -88,6 +94,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.replicationTotal,
 		m.replicationQueueDepth,
 		m.replicationDropped,
+		m.deleteIncomplete,
 		m.cacheHits,
 		m.cacheMisses,
 		m.cacheEvictions,
@@ -144,6 +151,22 @@ func (m *Metrics) RecordReplicationDropped() {
 		return
 	}
 	m.replicationDropped.Inc()
+}
+
+// RecordDeleteIncomplete increments the count of deletes that could not be
+// completed at every routed site.
+//
+// It is monotonic for the same reason RecordReplicationDropped is: an incomplete
+// delete is an object that is still readable through the same API that just
+// reported it gone, and the operator needs to see that it happened even after
+// a later retry succeeds.  Any non-zero value is a correctness event, and for a
+// deployment under a retention or erasure obligation it is a compliance one
+// (#87).
+func (m *Metrics) RecordDeleteIncomplete() {
+	if m == nil {
+		return
+	}
+	m.deleteIncomplete.Inc()
 }
 
 // RecordCacheHit increments the cache hit counter.
