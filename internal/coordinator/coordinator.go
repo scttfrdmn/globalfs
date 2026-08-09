@@ -79,6 +79,10 @@ type Coordinator struct {
 
 	// Read-through object cache (optional).
 	objCache *cache.Cache // nil = disabled
+
+	// enqueueBackpressure bounds how long Put waits for replication queue room.
+	// 0 → defaultEnqueueBackpressure.  Overridden in tests to keep them fast.
+	enqueueBackpressure time.Duration
 }
 
 // defaultHealthPollInterval is the cadence for background site health checks
@@ -106,6 +110,54 @@ const defaultHealthTimeout = 30 * time.Second
 //	errors.Is(err, coordinator.ErrNotFound)
 //	errors.Is(err, objectfssdk.ErrNotFound)
 var ErrNotFound = fmt.Errorf("object not found at any site: %w", objectfssdk.ErrNotFound)
+
+// ErrReplicationNotQueued reports that a Put stored the data on its primary
+// sites but could not queue replication to one or more secondaries, because the
+// replication queue was still full after the backpressure budget elapsed.
+//
+// A Put that returns an error wrapping this sentinel is a *partial success* and
+// must not be read as a failed write:
+//
+//   - The bytes are durably stored on every primary in the routed set.  A
+//     synchronous write failure returns a different error and never reaches
+//     this point.
+//   - Secondary sites named in the message do not have the data and no
+//     background work will deliver it, unless a metadata store is configured —
+//     in which case the persisted job is recovered on the next start.
+//
+// Retrying the identical Put is safe and is the intended response: the primary
+// write is idempotent and the coordinator-level dedup skips destinations that
+// already hold the content.
+//
+// The returned error also wraps the underlying cause — the worker's queue-full
+// error, or the context error if the caller's context ended while waiting for
+// room — so errors.Is finds both this sentinel and the reason.
+//
+// Before this existed, a full queue was logged at warn level and Put returned
+// nil, so callers were told a write was replicated when it was not — 31 of 40
+// Puts were dropped at the shipped defaults with every one reporting success
+// (#79).
+var ErrReplicationNotQueued = errors.New("replication not queued")
+
+// defaultEnqueueBackpressure is how long Put will wait for room in the
+// replication queue before giving up and reporting ErrReplicationNotQueued.
+//
+// It exists because the queue is much smaller than it looks and the worker is
+// serial: the shipped daemon passes Performance.MaxConcurrentTransfers (default
+// 8) to SetWorkerQueueDepth, so a burst of writes fills it almost immediately
+// even though each job takes only as long as one GET plus one PUT.  Waiting
+// briefly converts a burst into a queue rather than into data loss.
+//
+// The budget is deliberately short and deliberately finite.  Unbounded blocking
+// would make the async path synchronous under load and let one unreachable
+// destination stall every writer; returning immediately, as the code did before,
+// loses the write.  A couple of seconds spans a burst without hiding a genuine
+// backlog, which is what the error and the dropped counter are for.
+const defaultEnqueueBackpressure = 2 * time.Second
+
+// enqueueRetryInterval is the poll interval used while waiting for queue room.
+// The worker exposes no "room available" signal, so this polls Enqueue.
+const enqueueRetryInterval = 5 * time.Millisecond
 
 // isSiteFailure reports whether err is evidence that the site itself is unwell,
 // as opposed to an ordinary answer to an ordinary request.
@@ -276,12 +328,32 @@ func (c *Coordinator) SetLeaseTTL(d time.Duration) {
 // SetWorkerQueueDepth configures the replication worker queue depth.
 // Must be called before Start; has no effect if Start has already been called.
 // Pass 0 to retain the existing depth (default 512).
+//
+// Note that this is a *queue depth*, not a concurrency limit — the worker is a
+// single serial goroutine.  The shipped daemon passes
+// Performance.MaxConcurrentTransfers here, which conflates the two and is why
+// the effective queue is 8 rather than 512 at the defaults.  Renaming that
+// setting is a config change and belongs elsewhere; Put now applies
+// backpressure rather than dropping writes, so the small depth costs latency
+// under a burst instead of data (#79).
 func (c *Coordinator) SetWorkerQueueDepth(depth int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if depth > 0 {
 		c.worker = replication.NewWorker(depth)
 	}
+}
+
+// SetEnqueueBackpressure bounds how long Put waits for room in the replication
+// queue before returning an error wrapping ErrReplicationNotQueued.
+//
+// Pass 0 to use defaultEnqueueBackpressure (2 s).  A negative value disables
+// waiting entirely: Put attempts one Enqueue and reports the drop immediately.
+// May be called at any time; safe for concurrent use.
+func (c *Coordinator) SetEnqueueBackpressure(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.enqueueBackpressure = d
 }
 
 // SetCircuitBreaker registers a circuit breaker with the coordinator.
@@ -707,9 +779,25 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 // If the policy routes a write to a set with no primaries (e.g. a burst-only
 // rule), the first non-primary site is promoted to the synchronous write
 // target so data is durably stored before Put returns.
+//
+// # Replication backpressure
+//
+// If the replication queue is full, Put waits up to the backpressure budget
+// (see SetEnqueueBackpressure) for room.  If it is still full, Put returns an
+// error wrapping [ErrReplicationNotQueued] — a *partial success*: the data is
+// durably stored on the primaries but the named secondaries did not get a job.
+// Retrying the same Put is safe and is the intended response.  Callers that only
+// care about the primary write should test for that sentinel rather than
+// treating the error as a failed write (#79).
+//
+// An HTTP layer in front of this should map ErrReplicationNotQueued to 202
+// Accepted (the object exists; replication is incomplete), not to 5xx: the
+// object is retrievable immediately afterwards.  cmd/coordinator currently maps
+// every Put error to 502, which is wrong for this case and is tracked separately.
 func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	c.mu.RLock()
 	snapshot, pol, store, cb, oc := c.snapshotSites(), c.policy, c.store, c.cb, c.objCache
+	m, backpressure := c.m, c.enqueueBackpressure
 	c.mu.RUnlock()
 
 	routed, err := pol.Route(policy.OperationWrite, key, snapshot)
@@ -742,6 +830,13 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	// the worker can complete it.  If the order were reversed, a fast worker
 	// could complete the job and drainWorkerEvents could call DeleteJob before
 	// PutReplicationJob runs, leaving a phantom entry in the store.
+	// notQueued collects destinations whose replication job could not be queued,
+	// so Put can report them all rather than only the first or none at all.
+	// notQueuedCause keeps the first underlying reason (queue full, or the
+	// context error) so the caller can distinguish "we gave up waiting" from
+	// "you cancelled" with errors.Is.
+	var notQueued []string
+	var notQueuedCause error
 	if len(primaries) > 0 {
 		src := primaries[0]
 		// Compute content hash once for coordinator-level dedup below.
@@ -773,23 +868,82 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 					continue
 				}
 			}
-			if enqErr := c.worker.Enqueue(replication.ReplicationJob{
+			if enqErr := c.enqueueWithBackpressure(ctx, backpressure, replication.ReplicationJob{
 				SourceSite: src,
 				DestSite:   s,
 				Key:        key,
 				Size:       int64(len(data)),
 			}); enqErr != nil {
-				slog.Warn("coordinator: Put enqueue async replication", "key", key, "dest", s.Name(), "error", enqErr)
+				// The job stays in the store when one is configured, so a restart
+				// recovers it.  With no store — every shipped deployment today —
+				// the write is simply not replicated, which is why this is an
+				// error to the caller and a counter rather than a log line.
+				m.RecordReplicationDropped()
+				slog.Error("coordinator: replication queue full; write not replicated",
+					"key", key, "dest", s.Name(), "queue_depth", c.worker.QueueDepth(), "error", enqErr)
+				notQueued = append(notQueued, s.Name())
+				if notQueuedCause == nil {
+					notQueuedCause = enqErr
+				}
+				// A dead context will not recover for any later destination, and
+				// polling each one for the full budget would multiply the delay.
+				if ctx.Err() != nil {
+					break
+				}
 			}
 		}
 	}
 
 	// Invalidate the cache so the next Get fetches the freshly-written value.
+	// Done before the partial-success return: the primary write happened, so a
+	// cached copy of the old value is stale either way.
 	if oc != nil {
 		oc.Delete(key)
 		c.metricsCacheBytes(oc.Stats().Bytes)
 	}
+
+	if len(notQueued) > 0 {
+		return fmt.Errorf("coordinator: Put %q: stored on primaries but %w for %v: %w",
+			key, ErrReplicationNotQueued, notQueued, notQueuedCause)
+	}
 	return nil
+}
+
+// enqueueWithBackpressure submits job to the replication worker, waiting up to
+// budget for queue room.  A budget of 0 means defaultEnqueueBackpressure; a
+// negative budget means a single attempt with no wait.
+//
+// Returns nil once the job is queued, or the worker's queue-full error if the
+// budget elapses.  A cancelled ctx aborts the wait and returns ctx.Err().
+func (c *Coordinator) enqueueWithBackpressure(ctx context.Context, budget time.Duration, job replication.ReplicationJob) error {
+	err := c.worker.Enqueue(job)
+	if err == nil || budget < 0 {
+		return err
+	}
+	if budget == 0 {
+		budget = defaultEnqueueBackpressure
+	}
+
+	// The queue is full.  Poll for room: the worker exposes no readiness signal,
+	// and a job leaves the queue as soon as the serial worker picks it up, so the
+	// wait is usually one transfer long rather than the whole budget.
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+	ticker := time.NewTicker(enqueueRetryInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return err // the last queue-full error
+		case <-ticker.C:
+			if err = c.worker.Enqueue(job); err == nil {
+				return nil
+			}
+		}
+	}
 }
 
 // Delete removes the object at key from sites in the policy-routed set.
