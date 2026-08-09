@@ -358,8 +358,8 @@ func isDisallowedAddr(ip net.IP, allowPrivate bool) (bool, string) {
 // signs a request to it.  An empty endpoint means "use the AWS default" and is
 // always allowed.
 //
-// It returns errEndpointRejected for the caller and a detailed reason for the
-// log.  Requirements:
+// It returns a detailed reason for the log and errEndpointRejected for the
+// caller; reason is "" exactly when err is nil.  Requirements:
 //
 //   - absolute URL with an http or https scheme and a host;
 //   - no userinfo, and no path/query/fragment beyond "/" (an S3 endpoint is an
@@ -378,43 +378,43 @@ func isDisallowedAddr(ip net.IP, allowPrivate bool) (bool, string) {
 // transport option).  So this narrows the attack from "any host by name" to "a
 // host whose DNS flips between two answers inside one HeadBucket", and the rest
 // belongs upstream.
-func validateS3Endpoint(ctx context.Context, endpoint string, sec config.SecurityConfig, resolve endpointResolver) (error, string) {
+func validateS3Endpoint(ctx context.Context, endpoint string, sec config.SecurityConfig, resolve endpointResolver) (reason string, err error) {
 	if endpoint == "" {
-		return nil, ""
+		return "", nil
 	}
 
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return errEndpointRejected, fmt.Sprintf("unparseable URL: %v", err)
+		return fmt.Sprintf("unparseable URL: %v", err), errEndpointRejected
 	}
 	switch u.Scheme {
 	case "http", "https":
 	default:
-		return errEndpointRejected, fmt.Sprintf("scheme %q is not http or https", u.Scheme)
+		return fmt.Sprintf("scheme %q is not http or https", u.Scheme), errEndpointRejected
 	}
 	if u.Host == "" {
-		return errEndpointRejected, "URL has no host"
+		return "URL has no host", errEndpointRejected
 	}
 	if u.User != nil {
-		return errEndpointRejected, "URL must not contain userinfo"
+		return "URL must not contain userinfo", errEndpointRejected
 	}
 	if u.Path != "" && u.Path != "/" {
-		return errEndpointRejected, fmt.Sprintf("URL must not contain a path (got %q)", u.Path)
+		return fmt.Sprintf("URL must not contain a path (got %q)", u.Path), errEndpointRejected
 	}
 	if u.RawQuery != "" || u.Fragment != "" {
-		return errEndpointRejected, "URL must not contain a query or fragment"
+		return "URL must not contain a query or fragment", errEndpointRejected
 	}
 
 	host := u.Hostname()
 	if host == "" {
-		return errEndpointRejected, "URL has no host"
+		return "URL has no host", errEndpointRejected
 	}
 
 	// Exact-match allowlist: the narrow escape hatch, and the only way to permit
 	// a loopback endpoint (LocalStack in a test harness, say).
 	for _, allowed := range sec.AllowedEndpointHosts {
 		if strings.EqualFold(strings.TrimSpace(allowed), host) {
-			return nil, ""
+			return "", nil
 		}
 	}
 
@@ -422,24 +422,24 @@ func validateS3Endpoint(ctx context.Context, endpoint string, sec config.Securit
 	// rejected without a DNS round trip.
 	if ip := net.ParseIP(host); ip != nil {
 		if bad, reason := isDisallowedAddr(ip, sec.AllowPrivateEndpoints); bad {
-			return errEndpointRejected, reason
+			return reason, errEndpointRejected
 		}
-		return nil, ""
+		return "", nil
 	}
 
 	addrs, err := resolve(ctx, host)
 	if err != nil {
-		return errEndpointRejected, fmt.Sprintf("host does not resolve: %v", err)
+		return fmt.Sprintf("host does not resolve: %v", err), errEndpointRejected
 	}
 	if len(addrs) == 0 {
-		return errEndpointRejected, "host resolves to no addresses"
+		return "host resolves to no addresses", errEndpointRejected
 	}
 	for _, a := range addrs {
 		if bad, reason := isDisallowedAddr(a.IP, sec.AllowPrivateEndpoints); bad {
-			return errEndpointRejected, fmt.Sprintf("resolves to %s: %s", a.IP, reason)
+			return fmt.Sprintf("resolves to %s: %s", a.IP, reason), errEndpointRejected
 		}
 	}
-	return nil, ""
+	return "", nil
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -499,7 +499,7 @@ func addSiteHandler(daemonCtx context.Context, c *coordinator.Coordinator, sec c
 		connectCtx, cancel := context.WithTimeout(daemonCtx, 30*time.Second)
 		defer cancel()
 
-		if err, reason := validateS3Endpoint(connectCtx, req.S3Endpoint, sec, defaultEndpointResolver); err != nil {
+		if reason, err := validateS3Endpoint(connectCtx, req.S3Endpoint, sec, defaultEndpointResolver); err != nil {
 			// The reason is logged, never returned: see errEndpointRejected.
 			slog.Warn("api: add site: endpoint rejected",
 				"name", req.Name,
@@ -1035,7 +1035,7 @@ func withObjectMetrics(operation string, m *metrics.Metrics, next http.HandlerFu
 // This lives here rather than inline in main so tests can exercise the same
 // chain the daemon serves instead of a hand-assembled approximation.
 func buildHandler(mux *http.ServeMux, apiKey string) http.Handler {
-	var handler http.Handler = rejectUnsafePath(mux)
+	handler := rejectUnsafePath(mux)
 	if apiKey != "" {
 		handler = apiKeyMiddleware(apiKey)(handler)
 	}
