@@ -1368,6 +1368,243 @@ func TestSitesList_WithCircuitBreaker_Open(t *testing.T) {
 	}
 }
 
+// ── Path traversal guard (#73) ────────────────────────────────────────────────
+
+// makeTestServer serves the real middleware chain — buildHandler over the real
+// route table — so these tests exercise what the daemon exercises, including the
+// ServeMux path-cleaning step that is the whole subject of #73. Assembling the
+// handlers by hand, as most tests in this file do, would bypass the mux and
+// therefore bypass the bug.
+func makeTestServer(t *testing.T, objs map[string][]byte, apiKey string) (*httptest.Server, *coordinator.Coordinator, *testMemClient) {
+	t.Helper()
+	c, mc := makeTestCoordinator(t, objs)
+	mux := http.NewServeMux()
+	registerAPIRoutes(mux, context.Background(), c, nil)
+	srv := httptest.NewServer(buildHandler(mux, apiKey))
+	t.Cleanup(srv.Close)
+	return srv, c, mc
+}
+
+// noRedirectClient is an http.Client that surfaces a 3xx instead of following
+// it. Following is what makes #73 exploitable — Go's client replays the method
+// and the X-GlobalFS-API-Key header on a 307 — so a test that follows redirects
+// cannot distinguish "rejected" from "redirected, then succeeded elsewhere".
+func noRedirectClient() *http.Client {
+	return &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// TestPathTraversal_RejectedNotRedirected is the core regression test for #73.
+//
+// Each hostile target must produce a 400 from the guard. Before the fix the
+// literal forms produced a 307 whose Location pointed at a *different route*,
+// which the supported client then followed with the API key attached — so
+// asserting "no Location header, and not a 3xx" is what fails on the pre-fix
+// tree, where merely asserting "not 2xx" would have passed.
+func TestPathTraversal_RejectedNotRedirected(t *testing.T) {
+	t.Parallel()
+	srv, _, _ := makeTestServer(t, map[string][]byte{"data/x": []byte("payload")}, "")
+	client := noRedirectClient()
+
+	cases := []struct {
+		name   string
+		method string
+		target string
+	}{
+		// Literal "..": the mux used to 307 these onto /api/v1/sites/*, turning
+		// an object-scoped call into a site deregistration.
+		{"literal dotdot crosses to sites", http.MethodDelete, "/api/v1/objects/../sites/primary"},
+		{"literal dotdot multi segment", http.MethodDelete, "/api/v1/objects/a/b/../../../sites/primary"},
+		{"literal dotdot on GET reads site inventory", http.MethodGet, "/api/v1/objects/../sites"},
+		{"literal dotdot on PUT", http.MethodPut, "/api/v1/objects/tenants/A/../B/owned.txt"},
+		{"literal dotdot on HEAD", http.MethodHead, "/api/v1/objects/../sites"},
+		// Trailing "..": used to 307 to /api/v1/objects/, i.e. a request for one
+		// key answered as a request for another. The issue is explicit that 400 is
+		// the wanted outcome here, not a redirect.
+		{"trailing dotdot", http.MethodDelete, "/api/v1/objects/data/.."},
+		// Encoded forms. These already reached the handler pre-fix and were caught
+		// by validateObjectKey; they must stay rejected.
+		{"encoded dotdot upper", http.MethodDelete, "/api/v1/objects/%2E%2E/sites/primary"},
+		{"encoded dotdot lower", http.MethodDelete, "/api/v1/objects/%2e%2e/sites/primary"},
+		{"mixed encoded dotdot", http.MethodDelete, "/api/v1/objects/%2e./sites/primary"},
+		{"encoded separator and dotdot", http.MethodDelete, "/api/v1/objects/%2F%2E%2E%2Fsites/primary"},
+		// Non-object routes get the same treatment; no route here has a
+		// legitimate ".." component.
+		{"traversal under sites", http.MethodDelete, "/api/v1/sites/../sites/primary"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req, err := http.NewRequest(tc.method, srv.URL+tc.target, strings.NewReader("body"))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if loc := resp.Header.Get("Location"); loc != "" {
+				t.Errorf("%s %s: served a redirect to %q — a client that follows it "+
+					"crosses the authorization boundary (#73)", tc.method, tc.target, loc)
+			}
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("%s %s: got %d, want 400", tc.method, tc.target, resp.StatusCode)
+			}
+		})
+	}
+}
+
+// TestPathTraversal_DoesNotReachSiteHandlers is the impact assertion: the exact
+// call from the issue must leave the site inventory intact. Pre-fix this
+// returned 204 and removed the site.
+func TestPathTraversal_DoesNotReachSiteHandlers(t *testing.T) {
+	t.Parallel()
+	srv, c, _ := makeTestServer(t, nil, "")
+
+	if got := len(c.Sites()); got != 1 {
+		t.Fatalf("precondition: expected 1 site, got %d", got)
+	}
+
+	// A client that *does* follow redirects — pkg/client's behaviour, and the
+	// behaviour that made this exploitable.
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/api/v1/objects/../sites/primary", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNoContent {
+		t.Errorf("traversal returned 204 — the site deregistration succeeded (#73)")
+	}
+	if got := len(c.Sites()); got != 1 {
+		t.Errorf("site count went 1 -> %d: an object-scoped DELETE deregistered a site (#73)", got)
+	}
+}
+
+// TestPathTraversal_AuthCheckedBeforePathGuard pins the middleware order. The
+// guard sits inside apiKeyMiddleware, so an unauthenticated traversal probe must
+// be answered 401 — a 400 would confirm to an unauthenticated caller that the
+// path was parsed, and would mean the guard runs outside auth.
+func TestPathTraversal_AuthCheckedBeforePathGuard(t *testing.T) {
+	t.Parallel()
+	srv, _, _ := makeTestServer(t, nil, "s3cret")
+	client := noRedirectClient()
+
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/api/v1/objects/../sites/primary", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("unauthenticated traversal: got %d, want 401", resp.StatusCode)
+	}
+
+	// With the key, the same request is rejected by the guard rather than served.
+	req2, _ := http.NewRequest(http.MethodDelete, srv.URL+"/api/v1/objects/../sites/primary", nil)
+	req2.Header.Set(apiKeyHeader, "s3cret")
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Errorf("authenticated traversal: got %d, want 400", resp2.StatusCode)
+	}
+}
+
+// TestPathTraversal_LegitimateKeysStillWork guards against the fix over-reaching.
+// S3 keys may contain dots in every arrangement except a bare ".." component, and
+// a key holding a literal percent-encoded "%2E" (sent as "%252E") must survive:
+// unescaping twice in the guard would reject it.
+func TestPathTraversal_LegitimateKeysStillWork(t *testing.T) {
+	t.Parallel()
+	srv, _, mc := makeTestServer(t, nil, "")
+	client := noRedirectClient()
+
+	cases := []struct {
+		name    string
+		target  string
+		wantKey string
+	}{
+		{"dotdot as substring", "/api/v1/objects/a..b", "a..b"},
+		{"dotdot inside a segment", "/api/v1/objects/data/v1..2/file.bam", "data/v1..2/file.bam"},
+		{"three dots is not a traversal", "/api/v1/objects/.../file", ".../file"},
+		{"dots inside a filename", "/api/v1/objects/archive.tar.gz", "archive.tar.gz"},
+		{"dotdot suffix on a segment", "/api/v1/objects/snapshot..", "snapshot.."},
+		{"double-encoded percent survives", "/api/v1/objects/pct%252E%252E/f", "pct%2E%2E/f"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPut, srv.URL+tc.target, strings.NewReader("payload"))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusCreated {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("PUT %s: got %d (%s), want 201 — the guard rejected a legal S3 key",
+					tc.target, resp.StatusCode, strings.TrimSpace(string(body)))
+			}
+			if !mc.hasKey(tc.wantKey) {
+				t.Errorf("PUT %s: stored under some other key, want %q", tc.target, tc.wantKey)
+			}
+		})
+	}
+}
+
+// TestHasUnsafePathSegment is the unit-level table for the guard's predicate,
+// covering spellings that are awkward to drive through a live server.
+func TestHasUnsafePathSegment(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/api/v1/objects/data/x", false},
+		{"/api/v1/objects/a..b", false},
+		{"/api/v1/objects/...", false},
+		{"/api/v1/objects/.", false},
+		{"/api/v1/objects/%2E", false},   // a single encoded dot is a legal key
+		{"/api/v1/objects/%2E%2E", true}, // encoded ".."
+		{"/api/v1/objects/../x", true},
+		{"/api/v1/objects/x/..", true},
+		{"..", true},
+		{"/api/v1/objects/%2e./x", true},
+		{"/api/v1/objects/.%2e/x", true},
+		{"/api/v1/objects/%2F%2E%2E%2F", true}, // encoded separator hiding a ".."
+		{"/api/v1/objects/%00", true},          // null byte
+		{"/api/v1/objects/%zz", true},          // malformed encoding: treat as hostile
+		{"/api/v1/objects/pct%252E%252E", false},
+	}
+
+	for _, tc := range cases {
+		if got := hasUnsafePathSegment(tc.path); got != tc.want {
+			t.Errorf("hasUnsafePathSegment(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
 // TestWithObjectMetrics_NilMetrics verifies that withObjectMetrics calls the
 // next handler without panicking when m is nil.
 func TestWithObjectMetrics_NilMetrics(t *testing.T) {

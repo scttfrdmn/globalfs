@@ -439,6 +439,18 @@ Responses are `application/json`. Error responses have the shape:
 {"error": "message"}
 ```
 
+### Object key restrictions
+
+Request paths containing a `..` component are rejected with `400`, in both their
+literal and percent-encoded spellings (`..`, `%2E%2E`, `%2e.`, `%2F%2E%2E%2F`).
+The check runs before routing, so a traversal is never redirected onto another
+endpoint — relevant if you authorize by path prefix at a proxy.
+
+`..` is only rejected as a whole path component. Keys such as `a..b`,
+`snapshot..`, and `v1..2/file.bam` are accepted and stored verbatim. S3 permits
+a bare `..` component, so a key of that form cannot be addressed through this
+API.
+
 ### Health endpoints
 
 #### `GET /healthz`
