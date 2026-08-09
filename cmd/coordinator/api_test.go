@@ -196,12 +196,36 @@ func (m *testMemClient) keyCount() int {
 
 // ── Test coordinator factory ──────────────────────────────────────────────────
 
+// mustStart starts c and fails the test if the coordinator refuses.
+//
+// Discarding this error is not cosmetic in a test: Start returning ErrStopped
+// leaves a coordinator with no replication worker and no health poller, and every
+// assertion below would then run against a daemon that is not running.  A test
+// that passes in that state is worse than one that fails, because it reports the
+// handler as working when nothing behind it is.
+func mustStart(t *testing.T, c *coordinator.Coordinator) {
+	t.Helper()
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("coordinator.Start: %v", err)
+	}
+}
+
+// mustSet fails the test if a coordinator configuration call was refused, for the
+// same reason mustConfigure exits the daemon: the setting silently reverts to a
+// default and the test then measures the default instead of the value it set.
+func mustSet(t *testing.T, what string, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("coordinator configuration %s was refused: %v", what, err)
+	}
+}
+
 func makeTestCoordinator(t *testing.T, objs map[string][]byte) (*coordinator.Coordinator, *testMemClient) {
 	t.Helper()
 	mc := newTestMemClient(objs)
 	s := site.New("primary", types.SiteRolePrimary, mc)
 	c := coordinator.New(s)
-	c.Start(context.Background())
+	mustStart(t, c)
 	t.Cleanup(c.Stop)
 	return c, mc
 }
@@ -406,9 +430,9 @@ func makeSaturatedReplicationCoordinator(t *testing.T) (*coordinator.Coordinator
 		site.New("primary", types.SiteRolePrimary, primaryClient),
 		site.New("backup", types.SiteRoleBackup, backupClient),
 	)
-	c.SetWorkerQueueDepth(1)
+	mustSet(t, "worker queue depth", c.SetWorkerQueueDepth(1))
 	c.SetEnqueueBackpressure(20 * time.Millisecond)
-	c.Start(context.Background())
+	mustStart(t, c)
 	t.Cleanup(c.Stop)
 	t.Cleanup(release)
 
@@ -1070,7 +1094,7 @@ func TestInfoHandler_SitesCounted(t *testing.T) {
 	s1 := site.New("primary", types.SiteRolePrimary, mc1)
 	s2 := site.New("backup", types.SiteRoleBackup, mc2)
 	c := coordinator.New(s1, s2)
-	c.Start(context.Background())
+	mustStart(t, c)
 	t.Cleanup(c.Stop)
 
 	req := httptest.NewRequest("GET", "/api/v1/info", nil)
@@ -1145,8 +1169,8 @@ func TestInfoHandler_HealthSummary_AfterPoll(t *testing.T) {
 	mc := newTestMemClient(nil)
 	s := site.New("primary", types.SiteRolePrimary, mc)
 	c := coordinator.New(s)
-	c.SetHealthPollInterval(10 * time.Millisecond)
-	c.Start(context.Background())
+	mustSet(t, "health poll interval", c.SetHealthPollInterval(10*time.Millisecond))
+	mustStart(t, c)
 	t.Cleanup(c.Stop)
 
 	// Wait for the first poll.
@@ -1180,8 +1204,8 @@ func TestHealthzHandler_UsesCachedHealth(t *testing.T) {
 	mc := newTestMemClient(nil)
 	s := site.New("primary", types.SiteRolePrimary, mc)
 	c := coordinator.New(s)
-	c.SetHealthPollInterval(10 * time.Millisecond)
-	c.Start(context.Background())
+	mustSet(t, "health poll interval", c.SetHealthPollInterval(10*time.Millisecond))
+	mustStart(t, c)
 	t.Cleanup(c.Stop)
 
 	// Wait for at least one poll.
@@ -1227,8 +1251,8 @@ func TestHealthzHandler_CacheDegradedSite(t *testing.T) {
 	mc.healthErr = errors.New("disk full")
 	s := site.New("primary", types.SiteRolePrimary, mc)
 	c := coordinator.New(s)
-	c.SetHealthPollInterval(10 * time.Millisecond)
-	c.Start(context.Background())
+	mustSet(t, "health poll interval", c.SetHealthPollInterval(10*time.Millisecond))
+	mustStart(t, c)
 	t.Cleanup(c.Stop)
 
 	// Wait for cache to reflect the error.
