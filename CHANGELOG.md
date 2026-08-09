@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `go.mod` and 10 Go files: the objectfs import path is now
+  `github.com/scttfrdmn/objectfs`, the path the module actually declares and
+  publishes. It was `github.com/objectfs/objectfs`, which objectfs itself
+  renamed away from on 2026-08-02 — and which is a real, unrelated Python
+  project owned by someone else, so anyone reading these import paths to find
+  the source landed on a stranger's repository. `go build ./...` failed at
+  module resolution before compiling anything.
+- `go.mod`: removed both `replace` directives. They pointed at `../objectfs`
+  and `../cargoship`; the latter does not exist, which is what surfaced the
+  breakage, and the former resolved to a directory declaring a different module
+  path. Neither is needed — objectfs and cargoship are both public and tagged,
+  so the build now resolves entirely from the module proxy with no local paths.
+
+### Changed
+- objectfs dependency upgraded v0.10.0 → v0.12.0 (two minor releases accrued
+  while GlobalFS was dormant; the module rename above shipped among them). The
+  `ObjectInfo.Checksum` fast path in `internal/replication/worker.go` is
+  unaffected. Transitive AWS SDK, gRPC, and Prometheus dependencies moved
+  forward with it.
+
 ## [0.2.0] - 2026-02-23
 
 ### Added

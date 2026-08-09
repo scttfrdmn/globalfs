@@ -6,8 +6,8 @@ import (
 	"context"
 	"fmt"
 
-	objectfssdk "github.com/objectfs/objectfs/sdks/go/objectfs"
-	objectfstypes "github.com/objectfs/objectfs/pkg/types"
+	objectfstypes "github.com/scttfrdmn/objectfs/pkg/types"
+	objectfssdk "github.com/scttfrdmn/objectfs/sdks/go/objectfs"
 
 	"github.com/scttfrdmn/globalfs/pkg/config"
 	"github.com/scttfrdmn/globalfs/pkg/types"

@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"sync"
 
-	objectfstypes "github.com/objectfs/objectfs/pkg/types"
+	objectfstypes "github.com/scttfrdmn/objectfs/pkg/types"
 
 	"github.com/scttfrdmn/globalfs/pkg/site"
 )
