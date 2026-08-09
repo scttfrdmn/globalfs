@@ -475,18 +475,40 @@ func TestCoordinator_Delete_RemovesFromAllPrimaries(t *testing.T) {
 	}
 }
 
-// TestCoordinator_Delete_NonPrimaryErrorIgnored verifies that a failure on a
-// non-primary site during Delete does not surface to the caller.
-func TestCoordinator_Delete_NonPrimaryErrorIgnored(t *testing.T) {
+// TestCoordinator_Delete_NonPrimaryErrorIsReported is the inversion of what this
+// test used to assert.  It was named _NonPrimaryErrorIgnored and it verified that
+// a failed replica delete did not surface to the caller — which is exactly the
+// defect in #87: the API returned 204 for an object that was still readable from
+// the surviving replica, with no signal to the operator.
+//
+// The primary delete still happens, so the fix is not "give up on the first
+// failure": as much of the object as can be removed is removed, and the sites
+// that still hold it are named.
+func TestCoordinator_Delete_NonPrimaryErrorIsReported(t *testing.T) {
 	t.Parallel()
 
-	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{"k": []byte("v")})
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, map[string][]byte{"k": []byte("v")})
 	burstClient := &memClient{delErr: errors.New("unavailable"), objects: map[string][]byte{"k": []byte("v")}}
 	burst := site.New("burst", types.SiteRoleBurst, burstClient)
 
 	c := New(primary, burst)
-	if err := c.Delete(context.Background(), "k"); err != nil {
-		t.Errorf("Delete: non-primary error should be ignored, got: %v", err)
+	err := c.Delete(context.Background(), "k")
+	if err == nil {
+		t.Fatal("Delete returned nil while the burst site still holds the object (#87)")
+	}
+	if !errors.Is(err, ErrDeleteIncomplete) {
+		t.Errorf("Delete error does not wrap ErrDeleteIncomplete, so a caller cannot tell a "+
+			"partial delete from a total failure: %v", err)
+	}
+	if !strings.Contains(err.Error(), "burst") {
+		t.Errorf("Delete error does not name the site that still holds the object: %v", err)
+	}
+	if primaryClient.hasKey("k") {
+		t.Error("primary still holds the object: a failing replica must not stop the deletes " +
+			"that can succeed")
+	}
+	if !burstClient.hasKey("k") {
+		t.Error("test setup is wrong: the burst client should still hold the object")
 	}
 }
 
@@ -4183,6 +4205,287 @@ func TestCoordinator_Get_ConcurrentReadsDoNotStrandPermits(t *testing.T) {
 	}
 }
 
+// ── Delete correctness (#87, #88) ─────────────────────────────────────────────
+
+// TestCoordinator_Delete_IncompleteDeleteLeavesObjectReadable is the #87
+// reproduction in full: the delete fails at one site, and the object remains
+// retrievable through the same API that was asked to remove it.
+//
+// The assertion on Get is deliberately an assertion about the *current* read
+// path, not a wish: Get takes the first site that answers, so a surviving replica
+// is served, and nothing in Delete can change that.  What Delete owes the caller
+// is the truth — an error naming the site that still holds the object — so that
+// the condition is actionable rather than invisible.  Before this fix Delete
+// returned nil here and the only trace was a Warn line.
+func TestCoordinator_Delete_IncompleteDeleteLeavesObjectReadable(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"phi/patient.csv": []byte("record"),
+	})
+	burstClient := &memClient{
+		delErr:  errors.New("service unavailable"),
+		objects: map[string][]byte{"phi/patient.csv": []byte("record")},
+	}
+	burst := site.New("burst", types.SiteRoleBurst, burstClient)
+
+	c := New(primary, burst)
+
+	err := c.Delete(ctx, "phi/patient.csv")
+	if err == nil {
+		t.Fatal("Delete reported success for an object that is still present at the burst site; " +
+			"under a retention or erasure obligation that is a compliance-grade lie (#87)")
+	}
+	if !errors.Is(err, ErrDeleteIncomplete) {
+		t.Errorf("Delete error must wrap ErrDeleteIncomplete so callers can distinguish a partial "+
+			"delete from a total one: %v", err)
+	}
+	if !strings.Contains(err.Error(), "burst") {
+		t.Errorf("Delete error must name the sites that still hold the object: %v", err)
+	}
+
+	// The primary delete happened, and the surviving replica is still served —
+	// which is precisely why Delete has to report rather than swallow.
+	if primaryClient.hasKey("phi/patient.csv") {
+		t.Error("primary still holds the object")
+	}
+	data, getErr := c.Get(ctx, "phi/patient.csv")
+	if getErr != nil {
+		t.Fatalf("Get after the incomplete delete: %v (expected the surviving replica to answer)", getErr)
+	}
+	if string(data) != "record" {
+		t.Errorf("Get returned %q, want the surviving replica's %q", data, "record")
+	}
+	t.Log("Get still serves the object from the burst replica; the delete error is the only " +
+		"signal the caller has that this is the case")
+}
+
+// TestCoordinator_Delete_IncompleteIncrementsCounter checks the counter, not the
+// log line.  A log line is gone as soon as it scrolls, and an incomplete delete
+// has to stay attributable afterwards — for a deployment under an erasure
+// obligation this counter is the only machine-readable record that the API
+// reported a deletion it did not perform.
+func TestCoordinator_Delete_IncompleteIncrementsCounter(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{"k": []byte("v")})
+	burstClient := &memClient{delErr: errors.New("unavailable"), objects: map[string][]byte{"k": []byte("v")}}
+	burst := site.New("burst", types.SiteRoleBurst, burstClient)
+
+	c := New(primary, burst)
+	mustConfigure(t, c.SetMetrics(metrics.New(reg)))
+
+	if err := c.Delete(context.Background(), "k"); err == nil {
+		t.Fatal("Delete: expected an error for an incomplete delete")
+	}
+
+	if got := counterValue(t, reg, "globalfs_delete_incomplete_total"); got != 1 {
+		t.Errorf("globalfs_delete_incomplete_total = %v, want 1; an object reported deleted and "+
+			"still readable has to be observable after the log scrolls", got)
+	}
+}
+
+// TestCoordinator_Delete_AllSitesAttemptedAfterPrimaryFailure covers the other
+// half of the old behaviour: Delete returned on the first primary error, so the
+// replicas were never even asked.  That maximised the number of surviving copies
+// of an object the caller wanted gone.
+//
+// Every routed site is now attempted, and every site that may still hold the
+// object is named — not just the first.
+func TestCoordinator_Delete_AllSitesAttemptedAfterPrimaryFailure(t *testing.T) {
+	t.Parallel()
+
+	p1Client := &memClient{delErr: errors.New("primary-1 unavailable"), objects: map[string][]byte{"k": []byte("v")}}
+	p1 := site.New("primary-1", types.SiteRolePrimary, p1Client)
+	p2Client := &memClient{delErr: errors.New("primary-2 unavailable"), objects: map[string][]byte{"k": []byte("v")}}
+	p2 := site.New("primary-2", types.SiteRolePrimary, p2Client)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, map[string][]byte{"k": []byte("v")})
+
+	c := New(p1, p2, backup)
+	err := c.Delete(context.Background(), "k")
+	if err == nil {
+		t.Fatal("Delete: expected an error when two primaries refuse")
+	}
+
+	// The healthy site was reached despite both earlier failures.
+	if backupClient.hasKey("k") {
+		t.Error("backup still holds the object: Delete stopped at the first primary failure " +
+			"instead of removing every copy it could (#87)")
+	}
+	for _, name := range []string{"primary-1", "primary-2"} {
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("Delete error does not name %q, so an operator cannot tell which sites to "+
+				"chase: %v", name, err)
+		}
+	}
+	if strings.Contains(err.Error(), "backup") {
+		t.Errorf("Delete error names the site the object was successfully removed from: %v", err)
+	}
+}
+
+// TestCoordinator_Delete_NotFoundIsNotIncomplete pins the idempotence that makes
+// "retry the same Delete" a usable instruction.  A site that no longer has the
+// key answers "no such key", which is the state Delete wanted; counting it as a
+// failure would make every repeat of a completed delete report incomplete
+// forever, and would open the circuit breaker on healthy sites the same way #77
+// did.
+func TestCoordinator_Delete_NotFoundIsNotIncomplete(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	// Neither site has the key, and both answer with the code-matched not-found a
+	// real objectfs client returns.
+	primaryClient := &memClient{delErr: notFound("gone"), objects: map[string][]byte{}}
+	primary := site.New("primary", types.SiteRolePrimary, primaryClient)
+	burstClient := &memClient{delErr: notFound("gone"), objects: map[string][]byte{}}
+	burst := site.New("burst", types.SiteRoleBurst, burstClient)
+
+	c := New(primary, burst)
+	if err := c.Delete(ctx, "gone"); err != nil {
+		t.Errorf("Delete of an already-absent object reported incomplete: %v — a retry of a "+
+			"completed delete must converge on nil", err)
+	}
+}
+
+// TestCoordinator_Delete_BurstOnlyRouteReportsFailure is #88, and it contrasts
+// Put and Delete on the identical route because that is where the defect lived:
+// two adjacent functions that partition routed sites the same way, only one of
+// which handled the no-primaries case.
+//
+// With TargetRoles [burst] every site is a non-primary, so before the shared
+// partition Delete had no synchronous target at all and returned nil under every
+// outcome — including this one, where nothing was deleted anywhere.
+func TestCoordinator_Delete_BurstOnlyRouteReportsFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"scratch.tmp": []byte("v"),
+	})
+	burstClient := &memClient{
+		delErr:  errors.New("burst unavailable"),
+		putErr:  errors.New("burst unavailable"),
+		objects: map[string][]byte{"scratch.tmp": []byte("v")},
+	}
+	burst := site.New("burst", types.SiteRoleBurst, burstClient)
+
+	c := New(primary, burst)
+	// One route, both operations: *.tmp → burst only.
+	c.SetPolicy(policy.New(policy.Rule{
+		Name:        "tmp-to-burst",
+		KeyPattern:  "*.tmp",
+		Operations:  []policy.OperationType{policy.OperationWrite, policy.OperationDelete},
+		TargetRoles: []types.SiteRole{types.SiteRoleBurst},
+		Priority:    1,
+	}))
+
+	// Put on this route already surfaced its error, thanks to the promotion.
+	if err := c.Put(ctx, "scratch.tmp", []byte("new")); err == nil {
+		t.Fatal("Put on a burst-only route returned nil while the only target refused the write; " +
+			"the promotion this test contrasts against is missing")
+	}
+
+	err := c.Delete(ctx, "scratch.tmp")
+	if err == nil {
+		t.Fatal("Delete on a burst-only route returned nil although nothing was deleted anywhere: " +
+			"with no primaries in the routed set Delete could not report any failure at all (#88)")
+	}
+	if !errors.Is(err, ErrDeleteIncomplete) {
+		t.Errorf("Delete error must wrap ErrDeleteIncomplete: %v", err)
+	}
+	// The policy excluded the primary from the delete route, so it is untouched —
+	// and correctly not named in the error, which lists only sites that were asked.
+	if !primaryClient.hasKey("scratch.tmp") {
+		t.Error("the primary was deleted from despite being excluded by the delete route")
+	}
+}
+
+// TestPartitionForWrite_PromotesWhenNoPrimaries tests the shared helper directly,
+// because the point of extracting it was that neither call site shows the
+// omission on its own: Put grew the promotion with a comment explaining why it
+// was necessary and Delete simply never did (#88).
+func TestPartitionForWrite_PromotesWhenNoPrimaries(t *testing.T) {
+	t.Parallel()
+
+	burst1, _ := makeMount("burst-1", types.SiteRoleBurst, nil)
+	burst2, _ := makeMount("burst-2", types.SiteRoleBurst, nil)
+
+	primaries, others := partitionForWrite([]*site.SiteMount{burst1, burst2})
+	if len(primaries) != 1 || primaries[0].Name() != "burst-1" {
+		t.Fatalf("promotion did not produce exactly one synchronous target: primaries=%v",
+			siteNames(primaries))
+	}
+	if len(others) != 1 || others[0].Name() != "burst-2" {
+		t.Errorf("others = %v, want [burst-2]", siteNames(others))
+	}
+
+	// A set that already has a primary is partitioned by role, unchanged.
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	primaries, others = partitionForWrite([]*site.SiteMount{burst1, primary, burst2})
+	if len(primaries) != 1 || primaries[0].Name() != "primary" {
+		t.Errorf("primaries = %v, want [primary]", siteNames(primaries))
+	}
+	if len(others) != 2 {
+		t.Errorf("others = %v, want both burst sites", siteNames(others))
+	}
+
+	// An empty routed set must not panic on others[:1].
+	primaries, others = partitionForWrite(nil)
+	if len(primaries) != 0 || len(others) != 0 {
+		t.Errorf("empty routed set produced primaries=%v others=%v", siteNames(primaries), siteNames(others))
+	}
+}
+
+// TestCoordinator_Delete_PromotedSiteDeletedExactlyOnce guards the aliasing trap
+// in Delete's single loop: after the promotion, primaries is others[:1], so
+// building the target list by appending others onto primaries would write through
+// into the slice being read from.  A promoted site must be visited once, and the
+// remaining sites must still be visited.
+func TestCoordinator_Delete_PromotedSiteDeletedExactlyOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	b1 := &countingDeleteClient{memClient: newMemClient(map[string][]byte{"k": []byte("v")})}
+	b2 := &countingDeleteClient{memClient: newMemClient(map[string][]byte{"k": []byte("v")})}
+	burst1 := site.New("burst-1", types.SiteRoleBurst, b1)
+	burst2 := site.New("burst-2", types.SiteRoleBurst, b2)
+
+	c := New(burst1, burst2)
+	if err := c.Delete(ctx, "k"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	if got := b1.deleteCount(); got != 1 {
+		t.Errorf("burst-1 (the promoted site) saw %d deletes, want 1", got)
+	}
+	if got := b2.deleteCount(); got != 1 {
+		t.Errorf("burst-2 saw %d deletes, want 1 — the remaining sites must still be visited", got)
+	}
+}
+
+// countingDeleteClient counts Delete calls so a test can prove each routed site
+// is visited exactly once.
+type countingDeleteClient struct {
+	*memClient
+	countMu sync.Mutex
+	deletes int
+}
+
+func (c *countingDeleteClient) Delete(ctx context.Context, key string) error {
+	c.countMu.Lock()
+	c.deletes++
+	c.countMu.Unlock()
+	return c.memClient.Delete(ctx, key)
+}
+
+func (c *countingDeleteClient) deleteCount() int {
+	c.countMu.Lock()
+	defer c.countMu.Unlock()
+	return c.deletes
+}
+
 // ── Put cache invalidation on the error path (#91) ────────────────────────────
 
 // TestCoordinator_Put_ErrorPathStillInvalidatesCache covers the three-way
@@ -4236,5 +4539,41 @@ func TestCoordinator_Put_ErrorPathStillInvalidatesCache(t *testing.T) {
 	}
 	if string(got) != "B" {
 		t.Errorf("Get returned %q, want primary-1's %q", got, "B")
+	}
+}
+
+// TestCoordinator_Delete_ErrorPathStillInvalidatesCache is the same argument for
+// Delete.  An incomplete delete now returns an error, and that error path must
+// not skip the invalidation: the object was removed from at least one site, so
+// the cached copy is wrong regardless of what the caller is told.
+func TestCoordinator_Delete_ErrorPathStillInvalidatesCache(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, map[string][]byte{"k": []byte("v")})
+	burstClient := &memClient{delErr: errors.New("unavailable"), objects: map[string][]byte{}}
+	burst := site.New("burst", types.SiteRoleBurst, burstClient)
+
+	c := New(primary, burst)
+	oc := cache.New(cache.Config{MaxBytes: 1024})
+	c.SetCache(oc)
+
+	if _, err := c.Get(ctx, "k"); err != nil {
+		t.Fatalf("priming Get: %v", err)
+	}
+	if oc.Len() != 1 {
+		t.Fatalf("test setup is wrong: cache holds %d entries, want 1", oc.Len())
+	}
+
+	if err := c.Delete(ctx, "k"); err == nil {
+		t.Fatal("Delete: expected an error while the burst site refuses")
+	}
+
+	if _, hit := oc.Get("k"); hit {
+		t.Error("the cache still holds the object after an incomplete delete; the primary copy " +
+			"is gone, so what is cached is not any site's current state (#91)")
+	}
+	if primaryClient.hasKey("k") {
+		t.Error("primary still holds the object")
 	}
 }
