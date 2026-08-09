@@ -2,6 +2,7 @@ package cache
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -387,5 +388,189 @@ func TestCache_PutAndRecordEvictions_ConsistentWithPut(t *testing.T) {
 	}
 	if c1.Len() != c2.Len() {
 		t.Errorf("len differs: c1=%d c2=%d", c1.Len(), c2.Len())
+	}
+}
+
+// ── Invalidation generation (#89, #90) ────────────────────────────────────────
+//
+// These cover the mechanism.  The races it exists to fix are exercised
+// end-to-end, against a site whose Get blocks, in internal/coordinator.
+
+// TestCache_Generation_UnchangedByReadsAndFills verifies that only invalidation
+// moves the counter.  If ordinary traffic bumped it, every read-through fill
+// under concurrent load would be dropped and the cache would never populate.
+func TestCache_Generation_UnchangedByReadsAndFills(t *testing.T) {
+	t.Parallel()
+	c := New(Config{})
+	gen := c.Generation()
+
+	c.Put("a", []byte("A"))
+	c.Get("a")
+	c.Get("absent")
+	c.PutAndRecordEvictions("b", []byte("B"))
+
+	if got := c.Generation(); got != gen {
+		t.Errorf("generation moved without an invalidation: %d → %d", gen, got)
+	}
+}
+
+// TestCache_Generation_BumpedByDeleteOfAbsentKey is the case the whole fix turns
+// on.  A Delete that finds nothing still has to invalidate, because "nothing to
+// remove" is exactly what a concurrent read-through fill looks like from here:
+// the entry does not exist yet (#89, #90).
+func TestCache_Generation_BumpedByDeleteOfAbsentKey(t *testing.T) {
+	t.Parallel()
+	c := New(Config{})
+	gen := c.Generation()
+
+	c.Delete("never-cached")
+
+	if got := c.Generation(); got == gen {
+		t.Error("Delete of an absent key did not bump the generation; an in-flight " +
+			"fill for that key would be allowed to reinstate the deleted value")
+	}
+}
+
+// TestCache_Generation_BumpedByInvalidate verifies prefix and whole-cache
+// invalidation both move the counter.
+func TestCache_Generation_BumpedByInvalidate(t *testing.T) {
+	t.Parallel()
+	c := New(Config{})
+
+	gen := c.Generation()
+	c.Invalidate("prefix/")
+	afterPrefix := c.Generation()
+	if afterPrefix == gen {
+		t.Error("Invalidate(prefix) did not bump the generation")
+	}
+
+	c.Invalidate("")
+	if c.Generation() == afterPrefix {
+		t.Error(`Invalidate("") did not bump the generation`)
+	}
+}
+
+// TestCache_PutIfUnchanged_StoresWhenGenerationHolds verifies the happy path: an
+// uncontended fill still populates the cache.  Everything else here asserts a
+// refusal, so without this the mechanism could be inert and look correct.
+func TestCache_PutIfUnchanged_StoresWhenGenerationHolds(t *testing.T) {
+	t.Parallel()
+	c := New(Config{MaxBytes: 100})
+
+	gen := c.Generation()
+	if _, stored := c.PutIfUnchanged("k", []byte("v"), gen); !stored {
+		t.Fatal("PutIfUnchanged refused an uncontended fill")
+	}
+	data, ok := c.Get("k")
+	if !ok || string(data) != "v" {
+		t.Errorf(`after an accepted fill: got (%q, %v), want ("v", true)`, data, ok)
+	}
+}
+
+// TestCache_PutIfUnchanged_DropsAfterDelete is the #90 post-condition at the
+// cache layer: a fill holding pre-delete bytes must not resurrect them.
+func TestCache_PutIfUnchanged_DropsAfterDelete(t *testing.T) {
+	t.Parallel()
+	c := New(Config{MaxBytes: 100})
+
+	// A reader takes a miss and starts reading "SENSITIVE" from a site...
+	gen := c.Generation()
+	// ...a deleter removes the object from every site and invalidates...
+	c.Delete("k")
+	// ...and only then does the reader get around to filling.
+	if _, stored := c.PutIfUnchanged("k", []byte("SENSITIVE"), gen); stored {
+		t.Error("PutIfUnchanged stored a value invalidated by a concurrent Delete")
+	}
+	if _, ok := c.Get("k"); ok {
+		t.Error("deleted key is readable from the cache: the delete did not make " +
+			"the object unreadable (#90)")
+	}
+}
+
+// TestCache_PutIfUnchanged_DropsAfterInvalidate verifies a prefix invalidation
+// also fences in-flight fills.
+func TestCache_PutIfUnchanged_DropsAfterInvalidate(t *testing.T) {
+	t.Parallel()
+	c := New(Config{MaxBytes: 100})
+
+	gen := c.Generation()
+	c.Invalidate("")
+	if _, stored := c.PutIfUnchanged("k", []byte("v"), gen); stored {
+		t.Error("PutIfUnchanged stored a value invalidated by a concurrent Invalidate")
+	}
+}
+
+// TestCache_PutIfUnchanged_LeavesNewerValueIntact is the #89 shape specifically:
+// the loser of the race must not overwrite the winner.  A dropped fill costs a
+// cache miss; a fill that clobbers a fresh entry is silent staleness with no
+// expiry to bound it, because TTL defaults to 0.
+func TestCache_PutIfUnchanged_LeavesNewerValueIntact(t *testing.T) {
+	t.Parallel()
+	c := New(Config{MaxBytes: 100})
+
+	gen := c.Generation()    // reader observes the generation, then reads "v1"
+	c.Delete("k")            // writer commits "v2" at the sites and invalidates
+	c.Put("k", []byte("v2")) // a later read caches the new value
+
+	if _, stored := c.PutIfUnchanged("k", []byte("v1"), gen); stored {
+		t.Fatal("the stale fill was accepted")
+	}
+	data, ok := c.Get("k")
+	if !ok || string(data) != "v2" {
+		t.Errorf(`stale fill clobbered the current value: got (%q, %v), want ("v2", true)`, data, ok)
+	}
+}
+
+// TestCache_PutIfUnchanged_EvictionsMatchPut verifies the conditional path
+// reports evictions the way PutAndRecordEvictions does — the coordinator feeds
+// that count straight to a metric, one increment per eviction.
+func TestCache_PutIfUnchanged_EvictionsMatchPut(t *testing.T) {
+	t.Parallel()
+	// Budget = 10 bytes; two 5-byte entries fill it exactly, so a third evicts one.
+	c := New(Config{MaxBytes: 10})
+	c.Put("a", []byte("AAAAA"))
+	c.Put("b", []byte("BBBBB"))
+
+	evicted, stored := c.PutIfUnchanged("c", []byte("CCCCC"), c.Generation())
+	if !stored {
+		t.Fatal("fill refused")
+	}
+	if evicted != 1 {
+		t.Errorf("expected 1 eviction, got %d", evicted)
+	}
+}
+
+// TestCache_PutIfUnchanged_ConcurrentDeleteNeverResurrects hammers the
+// fill/invalidate interleaving under -race.  The assertion is the invariant
+// rather than a count of who won: however each round lands, a key must not be
+// readable after a Delete that followed the generation read.
+func TestCache_PutIfUnchanged_ConcurrentDeleteNeverResurrects(t *testing.T) {
+	t.Parallel()
+	c := New(Config{MaxBytes: 1024})
+
+	for round := 0; round < 200; round++ {
+		key := fmt.Sprintf("k%d", round)
+		gen := c.Generation()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		// The filler holds bytes it read before the delete.
+		go func() {
+			defer wg.Done()
+			c.PutIfUnchanged(key, []byte("stale"), gen)
+		}()
+		go func() {
+			defer wg.Done()
+			c.Delete(key)
+		}()
+		wg.Wait()
+
+		// The Delete happened after gen was read, so the fill must have lost —
+		// either refused outright, or removed by the Delete if it won the lock
+		// first.  Both orders are correct; a readable key is not.
+		if _, ok := c.Get(key); ok {
+			t.Fatalf("round %d: %q is cached after a Delete that followed the "+
+				"generation read", round, key)
+		}
 	}
 }
