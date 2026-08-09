@@ -84,12 +84,13 @@ func (e *EtcdStore) Prefix() string { return e.prefix }
 
 // ── Key helpers ────────────────────────────────────────────────────────────────
 
-func (e *EtcdStore) siteKey(name string) string              { return e.prefix + "sites/" + name }
-func (e *EtcdStore) sitesPrefix() string                     { return e.prefix + "sites/" }
-func (e *EtcdStore) jobKey(id string) string                 { return e.prefix + "jobs/" + id }
-func (e *EtcdStore) jobsPrefix() string                      { return e.prefix + "jobs/" }
-func (e *EtcdStore) replicatedKey(site, key string) string   { return e.prefix + "replicated/" + site + "/" + key }
-func (e *EtcdStore) replicatedPrefix() string                { return e.prefix + "replicated/" }
+func (e *EtcdStore) siteKey(name string) string { return e.prefix + "sites/" + name }
+func (e *EtcdStore) sitesPrefix() string        { return e.prefix + "sites/" }
+func (e *EtcdStore) jobKey(id string) string    { return e.prefix + "jobs/" + id }
+func (e *EtcdStore) jobsPrefix() string         { return e.prefix + "jobs/" }
+func (e *EtcdStore) replicatedKey(site, key string) string {
+	return e.prefix + "replicated/" + site + "/" + key
+}
 
 // ── Site registry ──────────────────────────────────────────────────────────────
 

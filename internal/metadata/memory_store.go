@@ -14,11 +14,11 @@ import (
 // State is not persisted across process restarts.  MemoryStore is suitable
 // for unit tests and single-node deployments that do not require durability.
 type MemoryStore struct {
-	mu          sync.RWMutex
-	sites       map[string]*SiteRecord
-	jobs        map[string]*ReplicationJob
-	replicated  map[string]*ReplicatedObject // key: site+":"+objectKey
-	watchers    []*memWatcher
+	mu         sync.RWMutex
+	sites      map[string]*SiteRecord
+	jobs       map[string]*ReplicationJob
+	replicated map[string]*ReplicatedObject // key: site+":"+objectKey
+	watchers   []*memWatcher
 }
 
 // memWatcher holds a single Watch subscription.

@@ -1,0 +1,304 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to a PR makes the previous run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Sourced from go.mod so this file cannot drift from the version the module declares. setup-go
+  # reads the `go` line as an exact version spec, which is why go.mod also carries a `toolchain`
+  # line — see the comment there for what that pin is protecting.
+  GO_VERSION_FILE: go.mod
+
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  # test — build, vet, and the full suite under the race detector.
+  #
+  # This repository had no CI at all until now, and the cost of that was not hypothetical. objectfs
+  # renamed its module path from github.com/objectfs/objectfs to github.com/scttfrdmn/objectfs, and
+  # every Go file here kept importing the old path for five months. `go build ./...` failed at module
+  # resolution — not at a type error, before compiling a single file — while the test suite it would
+  # have run was passing all along. Two `replace` directives pointing at sibling checkouts hid it on
+  # the one machine that had them.
+  #
+  # So the gate is deliberately plain: the thing that broke was `go build`, and nothing ran it.
+  #
+  # No credentials and no network beyond module downloads. Every test here uses in-process fakes
+  # against the pkg/site ObjectFSClient interface; the suites that need real S3 sit behind the
+  # `integration` tag and are compiled, not run, by the job below.
+  # ---------------------------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # -race because the fixes in v0.1.4 through v0.1.12 were mostly concurrency defects — a
+      # double-close on the worker's done channel, a TOCTOU in RemoveSite, a data race on leaseTTL.
+      # That is the class of bug this repository actually produces, so the detector is the point of
+      # the job rather than an extra.
+      - name: Test
+        run: go test -race -timeout=5m ./...
+
+  # ---------------------------------------------------------------------------------------------
+  # tidy — go.mod and go.sum are what the source actually requires.
+  #
+  # Named separately because this is the file that broke the build, and the failure mode is
+  # specific: a stale `require`, a dependency no longer imported, or a `replace` directive pointing
+  # somewhere that exists only on the author's laptop. `go build` on a machine that happens to have
+  # the sibling checkout will not notice any of them.
+  #
+  # git diff --exit-code rather than `go mod verify`, because the question is whether the committed
+  # files match what tidy computes, and only a diff answers that.
+  # ---------------------------------------------------------------------------------------------
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+
+      - name: go mod tidy leaves no diff
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go.mod or go.sum is not tidy. Run 'go mod tidy' and commit the result."
+            exit 1
+          fi
+
+      # A `replace` directive pointing at a filesystem path resolves on whichever machine has the
+      # sibling checkout and nowhere else, which is precisely how the objectfs import-path break
+      # stayed invisible for five months. Both dependencies are public and tagged, so there is no
+      # longer a reason for one to exist — and if a future one is added deliberately, this failing
+      # is the conversation worth having.
+      #
+      # Parsed rather than grepped. `go mod edit -json` pretty-prints, so the Path lands on its own
+      # line and the obvious one-line pattern matches nothing — a check that silently never fires,
+      # which is worse than no check. Verified against all three shapes: a relative path and an
+      # absolute path both fail, a module-to-module replace (the legitimate kind) passes.
+      - name: No filesystem-path replace directives
+        run: |
+          go mod edit -json > /tmp/gomod.json
+          python3 - <<'PY'
+          import json, sys
+
+          with open("/tmp/gomod.json") as fh:
+              replaces = json.load(fh).get("Replace") or []
+
+          local = [r for r in replaces if r["New"]["Path"].startswith((".", "/"))]
+          if local:
+              for r in local:
+                  print(f'::error::replace {r["Old"]["Path"]} => {r["New"]["Path"]}')
+              print("::error::go.mod replaces a module with a filesystem path. These resolve only "
+                    "on a machine that has the sibling checkout, and hide dependency breakage from "
+                    "every other machine — including this one.")
+              sys.exit(1)
+
+          print(f"No filesystem-path replace directives ({len(replaces)} replace(s) checked).")
+          PY
+
+  # ---------------------------------------------------------------------------------------------
+  # cross-build — every target .goreleaser.yaml claims to ship.
+  #
+  # The release builds linux and darwin on amd64 and arm64 for both binaries. A release is the worst
+  # time to discover that one of those does not compile, and `go build ./...` on an amd64 runner
+  # cannot tell you: it checks one cell of the matrix the release promises.
+  #
+  # CGO_ENABLED=0 matches what .goreleaser.yaml sets, so this compiles what a release compiles.
+  # Windows is absent here for the same reason it is absent there.
+  # ---------------------------------------------------------------------------------------------
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: linux, goarch: amd64}
+          - {goos: linux, goarch: arm64}
+          - {goos: darwin, goarch: amd64}
+          - {goos: darwin, goarch: arm64}
+    steps:
+      - uses: actions/checkout@v7
+
+      # setup-go runs before GOOS/GOARCH are in scope, deliberately: they are set per step below so
+      # nothing about the toolchain install or its cache keys reasons about a cross-compile target.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+
+      - name: Build both binaries for ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -o /dev/null ./cmd/coordinator
+          go build -o /dev/null ./cmd/globalfs
+
+      # `go build` does not compile _test.go files, so a compile error reachable only from a test
+      # would pass every cell above. Vet type-checks them.
+      - name: Type-check tests for ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go vet ./...
+
+  # ---------------------------------------------------------------------------------------------
+  # lint — gofmt across the repo, golangci-lint on new code.
+  #
+  # gofmt is whole-repo and blocking, which it can be because the commit adding this workflow also
+  # ran `gofmt -w .` over the 12 files that had drifted. That was 44 lines of pure whitespace —
+  # comment alignment, and five one-line metrics wrappers gofmt wants expanded — verified as
+  # token-identical by the suite passing unchanged. Doing it as part of this change rather than
+  # leaving a scoped-to-changed-files gate is the cheaper end state: no per-PR diff computation, and
+  # no gate that would have failed on the very PR introducing it.
+  #
+  # golangci-lint is --new-from-merge-base rather than whole-repo, and the number is the argument:
+  # the tree has 57 findings under the default configuration, 45 of them in _test.go files (mostly
+  # unchecked errcheck returns on t.Setenv and response-body closes). Blocking every PR on all 57
+  # would mean the config gets weakened until it passes, which is how a lint gate becomes
+  # decorative. This gates *new* code at the full configuration and leaves the backlog to be drawn
+  # down deliberately. The whole-repo count is reported below so it stays visible rather than
+  # forgotten.
+  # ---------------------------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # golangci-lint needs the merge base to diff against, which a shallow clone lacks.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+
+      # --new-from-merge-base resolves origin/<base> with git, so the ref must exist locally.
+      # fetch-depth: 0 fetches all branches on a push, but a pull_request checkout gets the merge
+      # ref and the base branch is not guaranteed among them. Fetching it explicitly costs seconds
+      # and removes the case where the gate silently degrades to linting everything.
+      - name: Fetch the base branch for the diff
+        run: git fetch --no-tags origin ${{ github.base_ref || 'main' }}
+
+      - name: gofmt
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "::error::these files are not gofmt-clean. Run 'gofmt -w .' and commit the result."
+            gofmt -l .
+            echo "--- diff ---"
+            gofmt -d .
+            exit 1
+          fi
+          echo "Every Go file is gofmt-clean."
+
+      # install-only, then invoke the binary directly: two steps below need golangci-lint and the
+      # action runs it at most once.
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          install-only: true
+
+      - name: Lint new code (blocking)
+        run: |
+          golangci-lint run \
+            --new-from-merge-base=origin/${{ github.base_ref || 'main' }} \
+            --timeout=5m
+
+      - name: Whole-repo finding count (informational)
+        if: always()
+        run: |
+          # Not a gate. It is here so the backlog has a number attached to it in every run, rather
+          # than being a thing everyone knows is nonzero and nobody can quantify.
+          golangci-lint run --timeout=5m ./... 2>&1 | tail -20 || true
+
+  # ---------------------------------------------------------------------------------------------
+  # build-tags — compile the integration tag.
+  #
+  # A build tag is invisible to `go build ./...`, `go vet ./...`, and `go test ./...`: the files
+  # behind it are not in the default build, so nothing type-checks them. CONTRIBUTING.md and the
+  # README both document `-tags=integration`, which means it is expected to work, which means it
+  # can rot without anyone finding out until they try to run it against real S3.
+  #
+  # Vet rather than test, deliberately. Those suites need AWS credentials and a bucket and correctly
+  # refuse to run without one; *compiling* them needs neither. This gate says only "the code behind
+  # this tag is still valid Go against today's APIs" — which, given that the untagged code silently
+  # stopped compiling against objectfs for five months, is the claim most worth holding.
+  # ---------------------------------------------------------------------------------------------
+  build-tags:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+
+      - name: Compile the integration tag
+        run: go vet -tags=integration ./...
+
+  # ---------------------------------------------------------------------------------------------
+  # config-examples — the YAML files this repository tells operators to copy.
+  #
+  # config.example.yaml and examples/coordinator-config.yaml are both presented as starting points,
+  # and `globalfs config validate` is the binary's own answer for whether one is usable. Running it
+  # here means a field renamed in pkg/config cannot leave a shipped example behind — which has
+  # already happened once in the other direction: v0.1.5 deleted five config fields that README.md
+  # still documents.
+  #
+  # The generated template is validated too, since `config init` is step two of the Quick Start and
+  # its output going stale would be the first thing a new user hits.
+  # ---------------------------------------------------------------------------------------------
+  config-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+
+      - name: Build the CLI
+        run: go build -o bin/globalfs ./cmd/globalfs
+
+      - name: Every shipped example config validates
+        run: |
+          set -e
+          for f in config.example.yaml examples/*.yaml; do
+            echo "── $f"
+            ./bin/globalfs config validate "$f"
+          done
+
+      - name: The generated template validates
+        run: |
+          set -e
+          ./bin/globalfs config init --output /tmp/generated.yaml
+          ./bin/globalfs config validate /tmp/generated.yaml

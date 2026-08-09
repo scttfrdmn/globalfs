@@ -1387,4 +1387,3 @@ func TestWithObjectMetrics_NilMetrics(t *testing.T) {
 		t.Errorf("status: got %d, want %d", w.Code, http.StatusOK)
 	}
 }
-

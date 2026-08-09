@@ -465,6 +465,132 @@ func TestValidate_CargoShip_DisabledWithoutEndpoint(t *testing.T) {
 	}
 }
 
+// TestLoad_TypesStructsBindFromYAML covers the three structs in pkg/types that
+// pkg/config decodes YAML into. They carried only json tags, and yaml.v3 falls
+// back to the lowercased field name when a tag is absent — so `listen_addr`
+// bound to nothing, every field stayed at its zero value, and Load then
+// overwrote them with defaults. An operator's port, etcd endpoints, lease TTL,
+// and worker queue depth were all silently discarded while `config show`
+// reported the file as loaded.
+//
+// The values below deliberately differ from every default in NewDefault, so a
+// regression cannot pass by coincidence.
+func TestLoad_TypesStructsBindFromYAML(t *testing.T) {
+	t.Parallel()
+
+	path := writeTempFile(t, `
+global:
+  cluster_name: bind-test
+coordinator:
+  listen_addr: ":19999"
+  lease_timeout: 90s
+  etcd_endpoints:
+    - etcd-a:2379
+    - etcd-b:2379
+performance:
+  max_concurrent_transfers: 32
+policies:
+  - name: hot
+    path_pattern: "/datasets/hot/*"
+    primary: onprem
+    replicate_to: [cloud]
+    priority: 10
+sites:
+  - name: onprem
+    role: primary
+    objectfs:
+      mount_point: /mnt/onprem
+      s3_bucket: onprem-bucket
+      s3_region: us-west-2
+  - name: cloud
+    role: burst
+    objectfs:
+      mount_point: /mnt/cloud
+      s3_bucket: cloud-bucket
+      s3_region: us-east-1
+`)
+
+	cfg := config.NewDefault()
+	if err := cfg.LoadFromFile(path); err != nil {
+		t.Fatalf("LoadFromFile: %v", err)
+	}
+
+	// types.CoordinatorConfig
+	if got := cfg.Coordinator.ListenAddr; got != ":19999" {
+		t.Errorf("Coordinator.ListenAddr = %q, want \":19999\"", got)
+	}
+	if got := cfg.Coordinator.LeaseTimeout; got != 90*time.Second {
+		t.Errorf("Coordinator.LeaseTimeout = %v, want 90s", got)
+	}
+	if got := cfg.Coordinator.EtcdEndpoints; len(got) != 2 || got[0] != "etcd-a:2379" {
+		t.Errorf("Coordinator.EtcdEndpoints = %v, want [etcd-a:2379 etcd-b:2379]", got)
+	}
+
+	// types.PerformanceConfig
+	if got := cfg.Performance.MaxConcurrentTransfers; got != 32 {
+		t.Errorf("Performance.MaxConcurrentTransfers = %d, want 32", got)
+	}
+
+	// types.ReplicationPolicy — the field whose absence made config.example.yaml
+	// fail validation with "policies[0].path_pattern is required".
+	if len(cfg.Policies) != 1 {
+		t.Fatalf("len(Policies) = %d, want 1", len(cfg.Policies))
+	}
+	p := cfg.Policies[0]
+	if p.Name != "hot" {
+		t.Errorf("Policies[0].Name = %q, want \"hot\"", p.Name)
+	}
+	if p.PathPattern != "/datasets/hot/*" {
+		t.Errorf("Policies[0].PathPattern = %q, want \"/datasets/hot/*\"", p.PathPattern)
+	}
+	if p.Primary != "onprem" {
+		t.Errorf("Policies[0].Primary = %q, want \"onprem\"", p.Primary)
+	}
+	if len(p.ReplicateTo) != 1 || p.ReplicateTo[0] != "cloud" {
+		t.Errorf("Policies[0].ReplicateTo = %v, want [cloud]", p.ReplicateTo)
+	}
+	if p.Priority != 10 {
+		t.Errorf("Policies[0].Priority = %d, want 10", p.Priority)
+	}
+
+	// The policy block above only validates if PathPattern actually bound.
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+}
+
+// TestShippedConfigsAreValid loads every config file this repository presents as
+// a starting point. config.example.yaml is the file README.md tells users to
+// copy, and it did not validate: the yaml-tag defect above meant its `policies:`
+// block decoded to five empty policies. CI runs `globalfs config validate` over
+// these same files; this test is the half that runs on a laptop.
+func TestShippedConfigsAreValid(t *testing.T) {
+	t.Parallel()
+
+	// Relative to pkg/config/, where this test runs.
+	shipped := []string{
+		"../../config.example.yaml",
+		"../../examples/coordinator-config.yaml",
+	}
+
+	for _, path := range shipped {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("shipped config is missing: %v", err)
+			}
+			cfg := config.NewDefault()
+			if err := cfg.LoadFromFile(path); err != nil {
+				t.Fatalf("LoadFromFile: %v", err)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate: %v", err)
+			}
+		})
+	}
+}
+
 // writeTempFile writes content to a temp file and returns its path.
 // The file is removed when the test completes.
 func writeTempFile(t *testing.T, content string) string {

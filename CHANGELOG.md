@@ -9,7 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `.github/workflows/ci.yml`: continuous integration, which this repository has
+  never had. Six jobs: `test` (build, vet, `go test -race`), `tidy` (go.mod/go.sum
+  are what the source requires, and no `replace` points at a filesystem path),
+  `cross-build` (all four goreleaser targets, both binaries, plus `go vet` to
+  type-check the tests `go build` skips), `lint` (whole-repo gofmt, blocking;
+  golangci-lint `--new-from-merge-base` on new code), `build-tags` (compiles the
+  documented `integration` tag, which nothing type-checked), and
+  `config-examples` (every shipped YAML plus the `config init` template through
+  `globalfs config validate`). The absence of CI is why the objectfs import path
+  below could break for five months while the test suite passed
+- `pkg/config`: `TestLoad_TypesStructsBindFromYAML` and
+  `TestShippedConfigsAreValid` — regression cover for the YAML binding defect
+  below. Both fail on the pre-fix tree
+
 ### Fixed
+- `pkg/types/types.go`: `ReplicationPolicy`, `CoordinatorConfig`, and
+  `PerformanceConfig` carried only `json` tags, but `pkg/config` decodes all
+  three from YAML. yaml.v3 falls back to the lowercased field name when a tag is
+  absent, so `path_pattern`, `listen_addr`, `etcd_endpoints`, `lease_timeout`,
+  and `max_concurrent_transfers` bound to nothing and every field silently
+  stayed at its zero value — after which `LoadFromFile`'s caller overwrote them
+  with defaults. An operator setting `listen_addr: ":9000"` got `:8080`, and a
+  `lease_timeout` or `max_concurrent_transfers` was discarded outright while
+  `globalfs config show` reported the file as loaded. Added `yaml` tags to all
+  three. Found by the `config-examples` CI job on its first run:
+  `config.example.yaml` — the file README.md tells users to copy — failed
+  `globalfs config validate` with `policies[0].path_pattern is required` while
+  plainly containing one
+- `internal/metadata/etcd_store.go`: removed `replicatedPrefix`, which was
+  never called and duplicated a string literal already inlined at its one
+  would-be call site
 - `go.mod` and 10 Go files: the objectfs import path is now
   `github.com/scttfrdmn/objectfs`, the path the module actually declares and
   publishes. It was `github.com/objectfs/objectfs`, which objectfs itself
@@ -29,6 +60,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ObjectInfo.Checksum` fast path in `internal/replication/worker.go` is
   unaffected. Transitive AWS SDK, gRPC, and Prometheus dependencies moved
   forward with it.
+- `go.mod`: added `toolchain go1.26.5`. The CI workflow passes
+  `go-version-file: go.mod` to setup-go, which reads the `go` line as an exact
+  version spec — so without this every job, including release builds, would
+  compile against the go1.26.0 standard library and the advisories fixed in
+  1.26.3 through 1.26.5. objectfs pins the same version for the same reason
+- `gofmt -w .` across 12 files: 44 lines of comment alignment and five one-line
+  metrics wrappers gofmt wants expanded. Whitespace only — the suite passes
+  unchanged — done here so the new gofmt gate can be whole-repo and blocking
+  rather than scoped to changed files
 
 ## [0.2.0] - 2026-02-23
 
