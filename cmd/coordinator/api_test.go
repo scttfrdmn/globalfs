@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	objectfstypes "github.com/objectfs/objectfs/pkg/types"
+	objectfstypes "github.com/scttfrdmn/objectfs/pkg/types"
 
 	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/coordinator"
