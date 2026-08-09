@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -47,6 +49,14 @@ type memClient struct {
 	// started, and polling the destination for the key cannot tell it — the key
 	// only appears once the gate is released.
 	putsEntered int
+	// healthGate is the same device for Health.  It deliberately ignores the
+	// caller's context, because that is what the real stack does: objectfs's
+	// ClientManager.HealthCheck acquires a pooled client through
+	// ConnectionPool.Get, which takes no context and waits up to 30 s of its own
+	// before the ctx-aware HeadBucket is ever reached.  A gate that honoured ctx
+	// would make the shutdown-bound tests pass for the wrong reason (#83).
+	healthGate    chan struct{}
+	healthEntered int
 	// closes counts Close calls, so tests can assert that removing a site
 	// releases exactly the resources it took (#80).
 	closes int
@@ -167,8 +177,14 @@ func (m *memClient) hasKey(key string) bool {
 
 func (m *memClient) Health(_ context.Context) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.healthErr
+	gate := m.healthGate
+	m.healthEntered++
+	err := m.healthErr
+	m.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	return err
 }
 
 func (m *memClient) Close() error {
@@ -204,26 +220,68 @@ func (m *memClient) blockPuts() (release func()) {
 	return func() { once.Do(func() { close(gate) }) }
 }
 
+// blockHealth makes every subsequent Health probe on this client wait.
+func (m *memClient) blockHealth() (release func()) {
+	gate := make(chan struct{})
+	m.mu.Lock()
+	m.healthGate = gate
+	m.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }
+}
+
 // waitForPut blocks until at least n Put calls have reached the gate, or the
 // timeout elapses (reported as a fatal test failure).
 func (m *memClient) waitForPut(t *testing.T, n int, timeout time.Duration) {
 	t.Helper()
+	m.waitForEntry(t, "Put", n, timeout, func() int { return m.putsEntered })
+}
+
+// waitForHealth blocks until at least n Health probes have reached the gate.
+func (m *memClient) waitForHealth(t *testing.T, n int, timeout time.Duration) {
+	t.Helper()
+	m.waitForEntry(t, "Health", n, timeout, func() int { return m.healthEntered })
+}
+
+// waitForEntry polls count (called under m.mu) until it reaches n, or fails.
+func (m *memClient) waitForEntry(t *testing.T, what string, n int, timeout time.Duration, count func() int) {
+	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		m.mu.Lock()
-		entered := m.putsEntered
+		entered := count()
 		m.mu.Unlock()
 		if entered >= n {
 			return
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("no Put reached the client within %v — the transfer never started", timeout)
+	t.Fatalf("fewer than %d %s call(s) reached the client within %v", n, what, timeout)
 }
 
 func makeMount(name string, role types.SiteRole, objs map[string][]byte) (*site.SiteMount, *memClient) {
 	mc := newMemClient(objs)
 	return site.New(name, role, mc), mc
+}
+
+// mustStart starts the coordinator and fails the test if it refuses.
+//
+// Start returns an error now (#84), and a test that discards it would silently
+// exercise an unstarted coordinator — which is the exact failure mode these fixes
+// are about, so it must not be possible to reintroduce it by inattention.
+func mustStart(t *testing.T, ctx context.Context, c *Coordinator) {
+	t.Helper()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+}
+
+// mustConfigure asserts that a Set* call before Start was accepted.
+func mustConfigure(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("configuration call before Start was rejected: %v", err)
+	}
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -334,7 +392,7 @@ func TestCoordinator_Put_AsyncReplicatesToBackup(t *testing.T) {
 	defer cancel()
 
 	c := New(primary, backup)
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	if err := c.Put(ctx, "data.fastq", []byte("genome-data")); err != nil {
@@ -722,7 +780,7 @@ func TestCoordinator_SetPolicy_Put_RoutesToBurst(t *testing.T) {
 	defer cancel()
 
 	c := New(primaryMount, burstMount)
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	// Policy: *.tmp writes → burst only (primary is not in TargetRoles).
@@ -845,11 +903,11 @@ func TestCoordinator_SetWorkerQueueDepth(t *testing.T) {
 	dst, dstClient := makeMount("dst", types.SiteRoleBackup, nil)
 
 	c := New(src, dst)
-	c.SetWorkerQueueDepth(4) // small depth to verify it's applied
+	mustConfigure(t, c.SetWorkerQueueDepth(4)) // small depth to verify it's applied
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	if err := c.Put(ctx, "k", []byte("v")); err != nil {
@@ -873,11 +931,11 @@ func TestCoordinator_SetLeaseTTL_NoLeaseManager(t *testing.T) {
 
 	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
 	c := New(primary)
-	c.SetLeaseTTL(30 * time.Second) // must not panic; no lease manager set
+	mustConfigure(t, c.SetLeaseTTL(30*time.Second)) // must not panic; no lease manager set
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 }
 
@@ -905,8 +963,8 @@ func TestCoordinator_SetStore_PersistsReplicationJob(t *testing.T) {
 
 	store := metadata.NewMemoryStore()
 	c := New(primary, backup)
-	c.SetStore(store)
-	c.Start(ctx)
+	mustConfigure(t, c.SetStore(store))
+	mustStart(t, ctx, c)
 	// Defers run LIFO, so this releases the blocked transfer *before* Stop runs.
 	// The reverse order would have Stop wait on a worker parked inside Put, which
 	// is the shutdown hang tracked in #83.
@@ -954,8 +1012,8 @@ func TestCoordinator_SetStore_DeletesJobAfterReplication(t *testing.T) {
 
 	store := metadata.NewMemoryStore()
 	c := New(primary, backup)
-	c.SetStore(store)
-	c.Start(ctx)
+	mustConfigure(t, c.SetStore(store))
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	if err := c.Put(ctx, "output.vcf", []byte("variant-calls")); err != nil {
@@ -1016,8 +1074,8 @@ func TestCoordinator_SetStore_RecoversPendingJobs(t *testing.T) {
 
 	// Start the coordinator; recoverPendingJobs should re-enqueue the job.
 	c := New(primary, backup)
-	c.SetStore(store)
-	c.Start(ctx)
+	mustConfigure(t, c.SetStore(store))
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	// Backup should eventually receive the recovered replication.
@@ -1046,8 +1104,8 @@ func TestCoordinator_Put_StoreFailureSkipsEnqueue(t *testing.T) {
 
 	store := &failingPutJobStore{MemoryStore: metadata.NewMemoryStore()}
 	c := New(primary, backup)
-	c.SetStore(store)
-	c.Start(ctx)
+	mustConfigure(t, c.SetStore(store))
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	if err := c.Put(ctx, "genome.bam", []byte("data")); err != nil {
@@ -1100,10 +1158,10 @@ func TestCoordinator_Put_FullQueueDoesNotReportSuccess(t *testing.T) {
 
 	const depth = 2
 	c := New(primary, backup)
-	c.SetWorkerQueueDepth(depth)
+	mustConfigure(t, c.SetWorkerQueueDepth(depth))
 	// Keep the test quick; the default 2 s budget × N Puts is not worth waiting for.
 	c.SetEnqueueBackpressure(50 * time.Millisecond)
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	// LIFO: release the blocked transfer before Stop, or Stop parks on a worker
 	// inside Put and the test hangs instead of failing (#83).
 	defer c.Stop()
@@ -1153,9 +1211,9 @@ func TestCoordinator_Put_ErrReplicationNotQueuedIsDistinguishable(t *testing.T) 
 	defer release()
 
 	c := New(primary, backup)
-	c.SetWorkerQueueDepth(1)
+	mustConfigure(t, c.SetWorkerQueueDepth(1))
 	c.SetEnqueueBackpressure(-1) // no waiting: fail the first full Enqueue
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 	defer release()
 
@@ -1206,8 +1264,8 @@ func TestCoordinator_Put_BackpressureWaitsForRoom(t *testing.T) {
 	defer cancel()
 
 	c := New(primary, backup)
-	c.SetWorkerQueueDepth(1) // pathologically small; the worker drains it fast
-	c.Start(ctx)
+	mustConfigure(t, c.SetWorkerQueueDepth(1)) // pathologically small; the worker drains it fast
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	const total = 20
@@ -1244,9 +1302,9 @@ func TestCoordinator_Put_BackpressureRespectsContextCancellation(t *testing.T) {
 	defer release()
 
 	c := New(primary, backup)
-	c.SetWorkerQueueDepth(1)
+	mustConfigure(t, c.SetWorkerQueueDepth(1))
 	c.SetEnqueueBackpressure(time.Hour) // would hang without cancellation
-	c.Start(startCtx)
+	mustStart(t, startCtx, c)
 	defer c.Stop()
 	defer release()
 
@@ -1299,10 +1357,10 @@ func TestCoordinator_Put_FullQueueIncrementsDroppedCounter(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	c := New(primary, backup)
-	c.SetMetrics(metrics.New(reg))
-	c.SetWorkerQueueDepth(1)
+	mustConfigure(t, c.SetMetrics(metrics.New(reg)))
+	mustConfigure(t, c.SetWorkerQueueDepth(1))
 	c.SetEnqueueBackpressure(-1)
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 	defer release()
 
@@ -1353,9 +1411,9 @@ func TestCoordinator_Put_NoStore_FullQueueStillReports(t *testing.T) {
 	defer release()
 
 	c := New(primary, backup) // no SetStore
-	c.SetWorkerQueueDepth(1)
+	mustConfigure(t, c.SetWorkerQueueDepth(1))
 	c.SetEnqueueBackpressure(-1)
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 	defer release()
 
@@ -1397,8 +1455,8 @@ func TestCoordinator_Stop_WhileTransferInFlight_SettlesTheJob(t *testing.T) {
 
 	store := metadata.NewMemoryStore()
 	c := New(primary, backup)
-	c.SetStore(store)
-	c.Start(ctx)
+	mustConfigure(t, c.SetStore(store))
+	mustStart(t, ctx, c)
 
 	const key = "data/sample.bam"
 	if err := c.Put(ctx, key, []byte("genome")); err != nil {
@@ -1477,8 +1535,8 @@ func TestCoordinator_Stop_DrainFlushesBufferedEvents(t *testing.T) {
 
 	store := metadata.NewMemoryStore()
 	c := New(primary, backup)
-	c.SetStore(store)
-	c.Start(ctx)
+	mustConfigure(t, c.SetStore(store))
+	mustStart(t, ctx, c)
 
 	const key = "reads.fastq"
 	if err := c.Put(ctx, key, []byte("sequence")); err != nil {
@@ -1490,8 +1548,9 @@ func TestCoordinator_Stop_DrainFlushesBufferedEvents(t *testing.T) {
 	// release the transfer.  The completion event is emitted into a buffer with
 	// no live reader; Stop's final flush is the only thing that can consume it.
 	cancel()
-	// Wait for the drain and the health poller to observe the cancellation.
-	c.storeWg.Wait()
+	// Wait for the drain to observe the cancellation.  The health poller has its
+	// own WaitGroup now and is irrelevant here.
+	c.drainWg.Wait()
 	release()
 
 	c.Stop()
@@ -1544,8 +1603,8 @@ func TestCoordinator_SetLeaseManager_LeaderReplicates(t *testing.T) {
 
 	mgr := lease.NewMemoryManager("coord-1")
 	c := New(primary, backup)
-	c.SetLeaseManager(mgr)
-	c.Start(ctx)
+	mustConfigure(t, c.SetLeaseManager(mgr))
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	if err := c.Put(ctx, "data/reads.bam", []byte("genome")); err != nil {
@@ -1584,8 +1643,8 @@ func TestCoordinator_SetLeaseManager_StandbySkipsWorker(t *testing.T) {
 
 	// coord-2 starts with mgr2 — it will be in standby mode.
 	c := New(primary, backup)
-	c.SetLeaseManager(mgr2)
-	c.Start(ctx)
+	mustConfigure(t, c.SetLeaseManager(mgr2))
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	// Sync write to primary should still succeed.
@@ -1613,8 +1672,8 @@ func TestCoordinator_SetLeaseManager_LeaseLossStopsWorker(t *testing.T) {
 
 	mgr := lease.NewMemoryManager("coord-1")
 	c := New(primary, backup)
-	c.SetLeaseManager(mgr)
-	c.Start(ctx)
+	mustConfigure(t, c.SetLeaseManager(mgr))
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	// Verify the coordinator is operating as leader.
@@ -1678,10 +1737,10 @@ func TestCoordinator_HealthStatus_PopulatedAfterPoll(t *testing.T) {
 	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
 	c := New(primary)
 	// Use a very short poll interval so the test doesn't wait 30s.
-	c.SetHealthPollInterval(20 * time.Millisecond)
+	mustConfigure(t, c.SetHealthPollInterval(20*time.Millisecond))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	// Wait up to 500ms for the first poll to complete.
@@ -1700,11 +1759,11 @@ func TestCoordinator_HealthStatus_ReflectsUnhealthySite(t *testing.T) {
 	t.Parallel()
 	primary, mc := makeMount("primary", types.SiteRolePrimary, nil)
 	c := New(primary)
-	c.SetHealthPollInterval(20 * time.Millisecond)
+	mustConfigure(t, c.SetHealthPollInterval(20*time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	// Wait for first (healthy) poll.
@@ -1734,11 +1793,11 @@ func TestCoordinator_SetHealthPollInterval_StopsWithStop(t *testing.T) {
 	t.Parallel()
 	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
 	c := New(primary)
-	c.SetHealthPollInterval(10 * time.Millisecond)
+	mustConfigure(t, c.SetHealthPollInterval(10*time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 
 	// Stop should return quickly without hanging on the polling goroutine.
 	done := make(chan struct{})
@@ -1834,10 +1893,10 @@ func TestCoordinator_Get_SkipsDegradedPrimary(t *testing.T) {
 	})
 
 	c := New(primary, backup)
-	c.SetHealthPollInterval(10 * time.Millisecond)
+	mustConfigure(t, c.SetHealthPollInterval(10*time.Millisecond))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	// Wait for health cache to show primary as degraded.
@@ -1870,10 +1929,10 @@ func TestCoordinator_Get_FallsBackToDegradedWhenAllDegraded(t *testing.T) {
 	primaryClient.setHealthErr(errors.New("degraded"))
 
 	c := New(primary)
-	c.SetHealthPollInterval(10 * time.Millisecond)
+	mustConfigure(t, c.SetHealthPollInterval(10*time.Millisecond))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	// Wait for cache to mark primary degraded.
@@ -1911,10 +1970,10 @@ func TestCoordinator_Head_SkipsDegradedSite(t *testing.T) {
 	})
 
 	c := New(primary, backup)
-	c.SetHealthPollInterval(10 * time.Millisecond)
+	mustConfigure(t, c.SetHealthPollInterval(10*time.Millisecond))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.Start(ctx)
+	mustStart(t, ctx, c)
 	defer c.Stop()
 
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -2777,4 +2836,581 @@ func TestSiteInfos_MultipleSites(t *testing.T) {
 	if stateByName["site-b"] != "open" {
 		t.Errorf("site-b: got %q, want %q", stateByName["site-b"], "open")
 	}
+}
+
+// ─── Lifecycle tests (#82, #83, #84, #85, #86, #95) ───────────────────────────
+//
+// This block exists because the suite had a hole exactly the shape of five bugs:
+// nothing called Stop against a busy coordinator, and nothing called any Set*
+// after Start.  Every test here does one of those two things.
+
+// coordinatorGoroutines counts live goroutines whose stack mentions one of the
+// coordinator's background loops.
+//
+// Counting *all* goroutines would be useless here: the package's tests are
+// parallel, so the total is dominated by unrelated work and by the runtime's own
+// goroutines.  Matching frame names is what makes the count attributable, and it
+// is why runHealthPollLoop and drainWorkerEvents are named methods rather than
+// closures.
+func coordinatorGoroutines() int {
+	buf := make([]byte, 1<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	n := 0
+	for _, frame := range []string{
+		"coordinator.(*Coordinator).runHealthPollLoop",
+		"coordinator.(*Coordinator).drainWorkerEvents",
+	} {
+		n += strings.Count(string(buf), frame)
+	}
+	return n
+}
+
+// waitForGoroutines waits for the coordinator background goroutine count to fall
+// to want, and reports the last observation if it never does.  Polling rather than
+// sleeping is what makes this an assertion on the count instead of on a duration.
+func waitForGoroutines(t *testing.T, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var got int
+	for time.Now().Before(deadline) {
+		got = coordinatorGoroutines()
+		if got <= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Errorf("coordinator background goroutines: got %d, want <= %d after %v — they were leaked",
+		got, want, timeout)
+}
+
+// TestCoordinator_Lifecycle_ConcurrentStartStop_DoesNotLeak is #82.
+//
+// Start could not be ordered against Stop: Start released c.mu across the lease
+// acquisition and recoverPendingJobs, and a Stop that landed in that window read
+// storeCancel==nil and a zero storeWg, concluded there was nothing to tear down,
+// and returned — after which Start launched a drain goroutine and a health poller
+// under a context nothing would ever cancel.  Both leaked for the process
+// lifetime, the poller waking every interval to probe sites forever.
+//
+// The assertion is on the goroutine count, not on elapsed time: a leak is a
+// goroutine that is still there, and no sleep can prove its absence.
+func TestCoordinator_Lifecycle_ConcurrentStartStop_DoesNotLeak(t *testing.T) {
+	// Not parallel: it reads the process-wide goroutine dump, and a parallel
+	// sibling starting a coordinator would be counted as this test's leak.
+	baseline := coordinatorGoroutines()
+
+	const iterations = 60
+	for i := 0; i < iterations; i++ {
+		primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+		backup, _ := makeMount("backup", types.SiteRoleBackup, nil)
+		c := New(primary, backup)
+		// A short interval makes a leaked poller cheap to detect and expensive to
+		// ignore — it keeps probing after the coordinator is gone.
+		mustConfigure(t, c.SetHealthPollInterval(5*time.Millisecond))
+		mustConfigure(t, c.SetStore(metadata.NewMemoryStore()))
+
+		ctx, cancel := context.WithCancel(context.Background())
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			// Either outcome is contractual: Start won the race (nil) or Stop did
+			// (ErrStopped).  What is not contractual is Start launching goroutines
+			// that Stop has already decided not to wait for.
+			if err := c.Start(ctx); err != nil && !errors.Is(err, ErrStopped) {
+				t.Errorf("iteration %d: Start: unexpected error %v", i, err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			c.Stop()
+		}()
+		wg.Wait()
+
+		// The context is cancelled only *after* both calls return.  Cancelling
+		// earlier would let ctx.Done tear down a leaked goroutine and hide the bug —
+		// which is precisely what the daemon's `cancel(); c.Close()` does, and why
+		// this leak survived in production without being noticed.
+		cancel()
+	}
+
+	waitForGoroutines(t, baseline, 5*time.Second)
+}
+
+// TestCoordinator_Lifecycle_StopThenStart_Refuses is #84.
+//
+// Stop before Start burned the worker's start Once, so a subsequent Start brought
+// up the drain goroutine and the health poller while silently leaving the worker
+// dead.  The coordinator then looked healthy, Put returned nil, and nothing was
+// ever replicated for the rest of the process's life.  It is now an error.
+func TestCoordinator_Lifecycle_StopThenStart_Refuses(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+	c := New(primary, backup)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c.Stop() // e.g. a deferred Stop on a boot path that failed later
+
+	err := c.Start(ctx)
+	if err == nil {
+		t.Fatal("Start after Stop returned nil; the caller has no way to learn that " +
+			"replication is dead, which is the whole of #84")
+	}
+	if !errors.Is(err, ErrStopped) {
+		t.Errorf("Start after Stop: got %v, want an error wrapping ErrStopped", err)
+	}
+
+	// And the claim is accurate: the coordinator really is not replicating.  A Put
+	// still writes to the primary synchronously, so this asserts on the backup.
+	if err := c.Put(ctx, "k", []byte("v")); err != nil &&
+		!errors.Is(err, ErrReplicationNotQueued) {
+		t.Fatalf("Put: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if backupClient.hasKey("k") {
+		t.Error("backup received the object from a coordinator that refused to start")
+	}
+}
+
+// TestCoordinator_Lifecycle_StartIsIdempotent keeps the other half of the #84
+// contract honest: a second Start on a *running* coordinator must succeed and must
+// not launch a second set of background goroutines.
+func TestCoordinator_Lifecycle_StartIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mustStart(t, ctx, c)
+
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("second Start on a running coordinator: got %v, want nil", err)
+	}
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("third Start on a running coordinator: got %v, want nil", err)
+	}
+
+	// A double Add on drainWg would make this Stop wait for a Done that never
+	// comes, and a double-launched drain would race the final flush.  Stop
+	// returning nil within its budget is the assertion.
+	if err := c.StopContext(context.Background()); err != nil {
+		t.Errorf("Stop after three Starts: %v — Start launched goroutines it did not "+
+			"account for", err)
+	}
+}
+
+// TestCoordinator_Lifecycle_StopBeforeStart_IsTerminalNotFatal records the
+// deliberate half of the #84 decision.  Stop-before-Start stays legal — a boot
+// path that defers Stop and then fails must not panic — but it is terminal, and
+// the terminality is what the previous test asserts.  Both halves are the contract.
+func TestCoordinator_Lifecycle_StopBeforeStart_IsTerminalNotFatal(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+
+	done := make(chan struct{})
+	go func() {
+		c.Stop()
+		c.Stop() // idempotent
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop before Start did not return within 2s")
+	}
+}
+
+// TestCoordinator_SetWorkerQueueDepth_AfterStart_Refuses is #85.
+//
+// The setter unconditionally replaced c.worker.  Called on a running coordinator
+// it therefore orphaned the goroutine draining the live queue and installed a
+// fresh worker that nobody would ever Start: every later Enqueue filled a queue
+// with no consumer, Put kept returning nil, and replication was over.  The
+// coordinator's own ReplicationQueueDepth then reported the *new* worker's depth,
+// so the queue looked empty while jobs piled up in a channel nobody held.
+func TestCoordinator_SetWorkerQueueDepth_AfterStart_Refuses(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+	c := New(primary, backup)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mustStart(t, ctx, c)
+	defer c.Stop()
+
+	// Prove replication works before the bad call, so a failure afterwards is
+	// attributable to the setter and not to a coordinator that never worked.
+	if err := c.Put(ctx, "before", []byte("v1")); err != nil {
+		t.Fatalf("Put(before): %v", err)
+	}
+	waitForKey(t, backupClient, "before", 2*time.Second)
+
+	err := c.SetWorkerQueueDepth(64)
+	if err == nil {
+		t.Fatal("SetWorkerQueueDepth after Start returned nil; it used to replace the " +
+			"running worker and end replication for the process lifetime (#85)")
+	}
+	if !errors.Is(err, ErrStarted) {
+		t.Errorf("SetWorkerQueueDepth after Start: got %v, want an error wrapping ErrStarted", err)
+	}
+
+	// The rejection has to be a no-op, not a partial mutation: replication must
+	// still work.  This is the assertion the old code failed.
+	if err := c.Put(ctx, "after", []byte("v2")); err != nil {
+		t.Fatalf("Put(after): %v", err)
+	}
+	waitForKey(t, backupClient, "after", 2*time.Second)
+}
+
+// TestCoordinator_GatedSetters_AfterStart_AllRefuse covers the rest of the frozen
+// configuration set in one place, so a newly added setter that forgets the gate is
+// noticed here rather than in production.
+func TestCoordinator_GatedSetters_AfterStart_AllRefuse(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mustStart(t, ctx, c)
+	defer c.Stop()
+
+	calls := map[string]func() error{
+		"SetStore":              func() error { return c.SetStore(metadata.NewMemoryStore()) },
+		"SetLeaseManager":       func() error { return c.SetLeaseManager(lease.NewMemoryManager("x")) },
+		"SetMetrics":            func() error { return c.SetMetrics(metrics.New(prometheus.NewRegistry())) },
+		"SetHealthPollInterval": func() error { return c.SetHealthPollInterval(time.Second) },
+		"SetLeaseTTL":           func() error { return c.SetLeaseTTL(time.Second) },
+		"SetWorkerQueueDepth":   func() error { return c.SetWorkerQueueDepth(8) },
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			err := call()
+			if err == nil {
+				t.Fatalf("%s after Start: got nil, want an error wrapping ErrStarted", name)
+			}
+			if !errors.Is(err, ErrStarted) {
+				t.Errorf("%s after Start: got %v, want an error wrapping ErrStarted", name, err)
+			}
+		})
+	}
+}
+
+// TestCoordinator_DynamicSetters_AfterStart_StillApply is the negative control for
+// the gate.  These five knobs are genuinely dynamic — they are read per operation,
+// not copied into a goroutine at Start — so gating them would be a regression, not
+// a safety improvement.  The distinction is the whole design of the contract, so it
+// is asserted rather than left to the doc comment.
+func TestCoordinator_DynamicSetters_AfterStart_StillApply(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{"k": []byte("v")})
+	c := New(primary)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mustStart(t, ctx, c)
+	defer c.Stop()
+
+	c.SetPolicy(policy.New())
+	c.SetCache(cache.New(cache.Config{MaxBytes: 1024}))
+	c.SetCircuitBreaker(circuitbreaker.New(3, time.Hour))
+	c.SetRetryConfig(&retry.Config{MaxAttempts: 2, InitialDelay: time.Millisecond, Multiplier: 1.0})
+	c.SetEnqueueBackpressure(10 * time.Millisecond)
+
+	// The cache is the one whose effect is directly observable: a Get populates
+	// it, so a second Get is served without touching the site.
+	if _, err := c.Get(ctx, "k"); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if _, err := c.Get(ctx, "k"); err != nil {
+		t.Fatalf("cached Get: %v", err)
+	}
+}
+
+// TestCoordinator_SetMetrics_ConcurrentWithPut is #86.
+//
+// SetMetrics writes c.m under c.mu while Put, Get and the event drain read the
+// field with no lock at all.  It is a data race on an 8-byte pointer, which looks
+// harmless and is not: the reader can observe the write out of order, so the
+// `if c.m != nil` guard the old helpers relied on could pass while the value is
+// still the zero it was reading a moment ago.  -race is the assertion; the test
+// only has to create the overlap.
+//
+// The setter now refuses after Start, so the surviving window is the one that
+// remains legal: a caller configuring a *created* coordinator while another
+// goroutine uses it.  That is a real pattern (config assembly racing the first
+// request) and it is what this exercises.
+func TestCoordinator_SetMetrics_ConcurrentWithPut(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{"k": []byte("v")})
+	backup, _ := makeMount("backup", types.SiteRoleBackup, nil)
+	c := New(primary, backup)
+	c.SetCache(cache.New(cache.Config{MaxBytes: 4096})) // makes Get touch the cache metrics
+	// No worker is running here — the coordinator is deliberately left in the
+	// created state, which is the window SetMetrics is still allowed in — so the
+	// replication queue fills and never drains.  A negative budget makes Put try
+	// once and report ErrReplicationNotQueued instead of waiting out the
+	// backpressure timer on every call, which would turn this into a 5-minute test.
+	c.SetEnqueueBackpressure(-1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const iterations = 100
+	var wg sync.WaitGroup
+	wg.Add(4)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			// Each call gets its own registry: re-registering the same collectors
+			// would panic, which would mask the race this test is looking for.
+			if err := c.SetMetrics(metrics.New(prometheus.NewRegistry())); err != nil {
+				return // gated; nothing more to do
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			// Errors are expected and irrelevant: the point is that Put reads c.m.
+			_ = c.Put(ctx, fmt.Sprintf("key-%d", i), []byte("data"))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_, _ = c.Get(ctx, "k") // reads c.m via the cache hit/miss counters
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		// AddSite/RemoveSite reach c.m through metricsSiteCountLocked, which is the
+		// one read that happens with the write lock already held.
+		for i := 0; i < iterations; i++ {
+			name := fmt.Sprintf("extra-%d", i)
+			c.AddSite(makeMountOnly(name))
+			c.RemoveSite(name)
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestCoordinator_ReplicationQueueDepth_ConcurrentWithSetWorkerQueueDepth is the
+// second half of #85: the unlocked read of the c.worker pointer.  Both of these
+// are exported, so this races two documented API calls against each other with
+// nothing exotic in between — and it failed under -race before workerRef existed.
+func TestCoordinator_ReplicationQueueDepth_ConcurrentWithSetWorkerQueueDepth(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= 200; i++ {
+			_ = c.SetWorkerQueueDepth(i)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_ = c.ReplicationQueueDepth()
+		}
+	}()
+	wg.Wait()
+}
+
+// TestCoordinator_StopContext_BoundedWhenTransferWedged is #83 on the worker path.
+//
+// Stop waited on the replication worker without any bound, and the worker waits
+// for the in-flight transfer.  A destination site that never answers therefore held
+// SIGTERM open indefinitely: the daemon's shutdown path is `cancel(); c.Close()`,
+// and Close's wait is not on the ctx that was cancelled.  Operators saw the process
+// survive its grace period and get SIGKILLed, losing the in-memory queue.
+func TestCoordinator_StopContext_BoundedWhenTransferWedged(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	release := backupClient.blockPuts()
+	// Released only on the way out.  Releasing before StopContext would turn this
+	// into the settle-normally test; releasing in a defer that runs *after* the
+	// measurement is what leaves the transfer genuinely wedged, which is the shape
+	// #83 warns about — get it wrong and the test hangs instead of failing.
+	defer release()
+
+	c := New(primary, backup)
+	mustConfigure(t, c.SetStore(metadata.NewMemoryStore()))
+	mustStart(t, ctx, c)
+
+	if err := c.Put(ctx, "wedged.bam", []byte("genome")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	backupClient.waitForPut(t, 1, 2*time.Second)
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer stopCancel()
+
+	start := time.Now()
+	err := c.StopContext(stopCtx)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("StopContext returned nil while a transfer was wedged in the destination's Put")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("StopContext error: got %v, want a wrapped context.DeadlineExceeded", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("StopContext took %v with a 200ms budget — shutdown is not bounded, "+
+			"which is exactly the SIGTERM hang in #83", elapsed)
+	}
+}
+
+// TestCoordinator_Stop_CompletesWhenHealthProbeWedged is the other #83 path, and
+// the one that matters most in production because it needs no traffic at all.
+//
+// The health poller calls Health, which used to wg.Wait() for every probe.  objectfs
+// probes are not context-aware — ClientManager.HealthCheck takes a pooled client via
+// ConnectionPool.Get, which has a hard-coded 30 s timeout and no ctx parameter — so a
+// saturated pool pinned Health open, pinned the poller open, and pinned Stop open,
+// with an idle coordinator and no replication in flight.
+//
+// The assertion is that Stop *succeeds* quickly, not that it times out.  Both layers
+// of the fix are visible in that: Health returns its partial report as soon as its
+// context is cancelled, so cancelling the drain context is enough to retire the
+// poller, and StopContext's own budget is never reached.  A wedged probe now costs
+// one abandoned goroutine in a terminating process instead of the whole shutdown.
+// Bounding Stop alone would have got a *timeout* here, and a non-zero exit code on
+// every restart of a cluster with one slow endpoint.
+func TestCoordinator_Stop_CompletesWhenHealthProbeWedged(t *testing.T) {
+	t.Parallel()
+
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	release := primaryClient.blockHealth()
+	// Released only on the way out, so the probe is genuinely wedged for the whole
+	// of the measurement below.  Releasing it first is the mistake that turns this
+	// into a test that hangs rather than one that fails.
+	defer release()
+
+	c := New(primary)
+	mustConfigure(t, c.SetHealthPollInterval(10*time.Millisecond))
+	mustStart(t, ctx, c)
+
+	// The first poll happens immediately at Start, so this is the probe that wedges.
+	primaryClient.waitForHealth(t, 1, 2*time.Second)
+
+	// Stop runs on its own goroutine: on the pre-fix tree it never returns at all,
+	// and a test that fails is worth more than a test that hangs.
+	type result struct {
+		err     error
+		elapsed time.Duration
+	}
+	done := make(chan result, 1)
+	go func() {
+		start := time.Now()
+		err := c.StopContext(context.Background())
+		done <- result{err, time.Since(start)}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Errorf("StopContext: %v — a wedged probe should be abandoned, not reported as "+
+				"a failed shutdown", r.err)
+		}
+		// defaultStopTimeout is 30 s, so anything near it means the bound fired
+		// rather than the poller retiring on its own.
+		if r.elapsed > 3*time.Second {
+			t.Errorf("StopContext took %v — the poller is not retiring on context "+
+				"cancellation, it is being timed out", r.elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("StopContext did not return within 10s while a health probe was wedged — " +
+			"this is the SIGTERM hang in #83")
+	}
+}
+
+// TestCoordinator_Health_ReportsTimedOutSitesAsUnknown pins the shape of the
+// partial report.  Health returns on its deadline, and every site that has not
+// answered is present in the map with ErrHealthTimeout — present, not omitted,
+// because SiteInfos and preferHealthySites both index the report by site name and
+// read a missing key as "healthy".
+func TestCoordinator_Health_ReportsTimedOutSitesAsUnknown(t *testing.T) {
+	t.Parallel()
+
+	fast, _ := makeMount("fast", types.SiteRolePrimary, nil)
+	slow, slowClient := makeMount("slow", types.SiteRoleBackup, nil)
+
+	release := slowClient.blockHealth()
+	defer release()
+
+	c := New(fast, slow)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	report := c.Health(ctx)
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("Health took %v with a 150ms deadline — the deadline is a request, not a guarantee", elapsed)
+	}
+	if len(report) != 2 {
+		t.Fatalf("report has %d entries, want 2 (one per site); a missing key reads as healthy "+
+			"to preferHealthySites: %v", len(report), report)
+	}
+	if err := report["slow"]; !errors.Is(err, ErrHealthTimeout) {
+		t.Errorf("report[slow]: got %v, want an error wrapping ErrHealthTimeout", err)
+	}
+	if err := report["fast"]; err != nil {
+		t.Errorf("report[fast]: got %v, want nil — a fast site must not be tarred with the slow one", err)
+	}
+}
+
+// waitForKey polls a client for a key, failing the test if it never arrives.
+func waitForKey(t *testing.T, mc *memClient, key string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if mc.hasKey(key) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("key %q never replicated within %v", key, timeout)
+}
+
+// makeMountOnly is makeMount for tests that do not need the client handle.
+func makeMountOnly(name string) *site.SiteMount {
+	m, _ := makeMount(name, types.SiteRoleBackup, nil)
+	return m
 }
