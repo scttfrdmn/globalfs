@@ -1284,7 +1284,7 @@ func TestValidateS3Endpoint_Allowed(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if err, reason := validateS3Endpoint(context.Background(), tc.endpoint, tc.sec, resolve); err != nil {
+			if reason, err := validateS3Endpoint(context.Background(), tc.endpoint, tc.sec, resolve); err != nil {
 				t.Errorf("validateS3Endpoint(%q) = %v (%s), want nil", tc.endpoint, err, reason)
 			}
 		})
@@ -1324,7 +1324,7 @@ func TestValidateS3Endpoint_ResolvedAddressIsChecked(t *testing.T) {
 		"nxdomain.example",
 	} {
 		endpoint := "https://" + host
-		err, reason := validateS3Endpoint(context.Background(), endpoint, config.SecurityConfig{}, resolve)
+		reason, err := validateS3Endpoint(context.Background(), endpoint, config.SecurityConfig{}, resolve)
 		if err == nil {
 			t.Errorf("validateS3Endpoint(%q) = nil, want rejection — a DNS name pointing at "+
 				"an internal address must be caught after resolution (#76)", endpoint)
@@ -1708,7 +1708,7 @@ func TestStatusRecorder_UnwrapReachesDeadlineControl(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if err := <-errCh; err != nil {
 		t.Errorf("SetWriteDeadline through the middleware chain: %v — the deadline "+
@@ -1754,7 +1754,7 @@ func TestObjectGet_LargeBodyNotTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status: got %d, want 200", resp.StatusCode)
@@ -1807,7 +1807,7 @@ func TestObjectPut_SlowUploadNotCutOff(t *testing.T) {
 	// handler can size the deadline from it.
 	pr, pw := io.Pipe()
 	go func() {
-		defer pw.Close()
+		defer func() { _ = pw.Close() }()
 		const chunks = 8
 		for i := 0; i < chunks; i++ {
 			if _, err := pw.Write(payload[i*size/chunks : (i+1)*size/chunks]); err != nil {
@@ -1829,7 +1829,7 @@ func TestObjectPut_SlowUploadNotCutOff(t *testing.T) {
 		t.Fatalf("PUT: %v — a slow upload was cut off by the server-wide "+
 			"ReadTimeout (#75)", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
@@ -1919,7 +1919,7 @@ func TestPathTraversal_RejectedNotRedirected(t *testing.T) {
 			if err != nil {
 				t.Fatalf("request: %v", err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 
 			if loc := resp.Header.Get("Location"); loc != "" {
 				t.Errorf("%s %s: served a redirect to %q — a client that follows it "+
@@ -1953,7 +1953,7 @@ func TestPathTraversal_DoesNotReachSiteHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNoContent {
 		t.Errorf("traversal returned 204 — the site deregistration succeeded (#73)")
@@ -1980,7 +1980,7 @@ func TestPathTraversal_AuthCheckedBeforePathGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("unauthenticated traversal: got %d, want 401", resp.StatusCode)
 	}
@@ -1992,7 +1992,7 @@ func TestPathTraversal_AuthCheckedBeforePathGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	defer resp2.Body.Close()
+	defer func() { _ = resp2.Body.Close() }()
 	if resp2.StatusCode != http.StatusBadRequest {
 		t.Errorf("authenticated traversal: got %d, want 400", resp2.StatusCode)
 	}
@@ -2030,7 +2030,7 @@ func TestPathTraversal_LegitimateKeysStillWork(t *testing.T) {
 			if err != nil {
 				t.Fatalf("request: %v", err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 
 			if resp.StatusCode != http.StatusCreated {
 				body, _ := io.ReadAll(resp.Body)
