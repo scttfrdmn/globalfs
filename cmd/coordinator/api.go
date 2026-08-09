@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -52,6 +53,14 @@ const maxJSONBodyBytes = 1 << 20 // 1 MiB
 
 // validateObjectKey returns an error if key contains path-traversal characters
 // (null bytes or ".." components) that could bypass bucket prefix boundaries.
+//
+// This is the second of two layers and it is not the load-bearing one.  It runs
+// inside the handler, on the key http.ServeMux has already extracted, and by
+// then the mux has path-cleaned the request — a literal ".." never reaches here
+// at all (see rejectUnsafePath for what does).  Keep it: it still catches a
+// traversal that arrives through the decoding of an escaped separator
+// ("%2F%2E%2E%2F" reaches the handler as key "/../sites/..."), and it guards
+// callers that invoke the handlers directly rather than through the mux.
 func validateObjectKey(key string) error {
 	if strings.Contains(key, "\x00") {
 		return fmt.Errorf("key contains null byte")
@@ -62,6 +71,94 @@ func validateObjectKey(key string) error {
 		}
 	}
 	return nil
+}
+
+// ── Path traversal guard ──────────────────────────────────────────────────────
+
+// hasUnsafePathSegment reports whether escapedPath contains a ".." path
+// component or a null byte, considering both the literal and the
+// percent-encoded spelling of each.
+//
+// It takes the *escaped* path (r.URL.EscapedPath()) rather than r.URL.Path,
+// because r.URL.Path is already percent-decoded: "%2E%2E" and ".." are
+// indistinguishable there, and only one of the two survives the mux.  Each
+// segment is unescaped exactly once and then re-split on "/", so an encoded
+// separator ("%2F%2E%2E%2F") is caught as well.
+//
+// Decoding once and no more is deliberate.  A key containing a literal "%2E"
+// is legal in S3 and arrives as "%252E"; unescaping twice would reject it.
+func hasUnsafePathSegment(escapedPath string) bool {
+	for _, seg := range strings.Split(escapedPath, "/") {
+		// Fast path: no escaping to consider.
+		if !strings.Contains(seg, "%") {
+			if seg == ".." {
+				return true
+			}
+			continue
+		}
+		dec, err := url.PathUnescape(seg)
+		if err != nil {
+			// Malformed percent-encoding.  net/http normally rejects this before
+			// a handler runs; treat it as hostile rather than guessing.
+			return true
+		}
+		if strings.Contains(dec, "\x00") {
+			return true
+		}
+		for _, part := range strings.Split(dec, "/") {
+			if part == ".." {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rejectUnsafePath rejects requests whose raw path contains a ".." component
+// before http.ServeMux can dispatch them.
+//
+// This has to be middleware; it cannot live in a handler.  ServeMux path-cleans
+// the target and answers with a 307 *before* it picks a handler, so
+// validateObjectKey never sees a literal "..":
+//
+//	DELETE /api/v1/objects/../sites/primary        -> 307 Location=/api/v1/sites/primary
+//	DELETE /api/v1/objects/a/b/../../../sites/x    -> 307 Location=/api/v1/sites/x
+//	DELETE /api/v1/objects/data/..                 -> 307 Location=/api/v1/objects/
+//
+// Go's http.Client replays both the method and the X-GlobalFS-API-Key header on
+// a 307, so pkg/client following that first redirect turns an object-scoped
+// DELETE into a site deregistration and reports success (#73).  A reverse proxy
+// that allows /api/v1/objects/ and denies /api/v1/sites/ is bypassed the same
+// way, because the proxy only ever sees the object path.
+//
+// Rejecting rather than cleaning is the point.  Cleaning would keep the third
+// case above silently succeeding as a delete of a different key, and "data/.."
+// is a legal S3 key this server cannot route — 400 says so, a 307 does not.
+//
+// The guard applies to every path, not just /api/v1/objects/: no route this
+// server exposes has a legitimate ".." component, and confining it to one
+// prefix would mean deciding which prefix *after* the mux had already decided
+// for us.
+func rejectUnsafePath(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hasUnsafePathSegment(r.URL.EscapedPath()) {
+			slog.Warn("api: rejected request with unsafe path",
+				"method", r.Method,
+				"raw_path", r.URL.EscapedPath(),
+				"request_id", requestIDFromCtx(r.Context()),
+				"remote_addr", r.RemoteAddr,
+			)
+			if r.Method == http.MethodHead {
+				// HEAD must not return a body.
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			writeError(w, http.StatusBadRequest,
+				"invalid request path: path traversal component not permitted")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ── API key middleware ────────────────────────────────────────────────────────
@@ -615,6 +712,32 @@ func withObjectMetrics(operation string, m *metrics.Metrics, next http.HandlerFu
 		}
 		m.RecordOperation(operation, status, time.Since(start))
 	}
+}
+
+// buildHandler wraps mux in the server's middleware chain, applied innermost →
+// outermost:
+//
+//	mux → rejectUnsafePath → apiKey (when key != "") → logging → requestID
+//
+// requestID is outermost so every response carries a correlation ID; logging
+// wraps apiKey so auth rejections are recorded too.  When key is "" the auth
+// layer is omitted entirely.
+//
+// The order of the two innermost layers is load-bearing. rejectUnsafePath must
+// wrap the mux directly — it is the only layer that observes the request target
+// before ServeMux path-cleans it and 307s a traversal onto a different route
+// (#73) — and it must sit inside apiKey so an unauthenticated traversal probe
+// gets 401, not the 400 that would confirm the path was parsed.
+//
+// This lives here rather than inline in main so tests can exercise the same
+// chain the daemon serves instead of a hand-assembled approximation.
+func buildHandler(mux *http.ServeMux, apiKey string) http.Handler {
+	var handler http.Handler = rejectUnsafePath(mux)
+	if apiKey != "" {
+		handler = apiKeyMiddleware(apiKey)(handler)
+	}
+	handler = loggingMiddleware(handler)
+	return requestIDMiddleware(handler)
 }
 
 // registerAPIRoutes registers all /api/v1/* endpoints on mux.

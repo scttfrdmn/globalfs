@@ -249,17 +249,12 @@ func main() {
 	mux.HandleFunc("GET /api/v1/info", infoHandler(c, version, startTime))
 	registerAPIRoutes(mux, ctx, c, m)
 
-	// Build middleware chain (applied innermost → outermost):
-	//   mux → apiKey (when set) → logging → requestID
-	// requestID is outermost: every response gets a correlation ID.
-	// logging wraps apiKey so auth rejections are also recorded.
-	var handler http.Handler = mux
+	// buildHandler applies the middleware chain; see its doc comment for the
+	// order and why the path-traversal guard has to wrap the mux directly.
 	if apiKey != "" {
-		handler = apiKeyMiddleware(apiKey)(handler)
 		slog.Info("API key authentication enabled")
 	}
-	handler = loggingMiddleware(handler)
-	handler = requestIDMiddleware(handler)
+	handler := buildHandler(mux, apiKey)
 
 	srv := &http.Server{
 		Addr:              addr,
