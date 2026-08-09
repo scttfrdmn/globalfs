@@ -56,8 +56,8 @@
 //
 // Stop and Close wait for the in-flight replication transfer to settle, which is
 // unbounded if the destination site is unresponsive.  Use [Coordinator.StopContext]
-// to bound that wait; a caller that must terminate (a SIGTERM handler) should
-// always use the bounded form (#83).
+// or [Coordinator.CloseContext] to bound that wait; a caller that must terminate
+// (a SIGTERM handler) should always use the bounded form (#83).
 //
 // Coordinator is safe for concurrent use.
 package coordinator
@@ -950,11 +950,98 @@ func waitBounded(ctx context.Context, wg *sync.WaitGroup) error {
 }
 
 // Close stops background work and closes all sites.
+//
+// It bounds itself at defaultStopTimeout (30 s); use [Coordinator.CloseContext]
+// to supply your own budget.  Close is idempotent: the second call finds no sites
+// and returns whatever the stop reported.
 func (c *Coordinator) Close() error {
-	c.Stop()
+	return c.CloseContext(context.Background())
+}
+
+// CloseContext is Close with a caller-supplied deadline.  It stops background
+// work and then closes every site, returning the joined errors of both halves.
+//
+// # Why the sites are closed outside c.mu
+//
+// A site's Close is a network operation — connection-pool drain, in-flight
+// request completion — with no bound on how long it takes.  Holding c.mu across
+// it blocked every method that touches the site set, including Sites() and the
+// /health handler behind it, for the full duration: measured at over two seconds
+// against one slow site, which an orchestrator polling health during a rolling
+// restart reads as a hung process rather than a draining one (#95).
+//
+// So this follows the pattern [Coordinator.RemoveSite] already uses: snapshot
+// under the lock, clear the set inside the same critical section so a concurrent
+// request sees an empty site list rather than a half-closed one, and do the
+// teardown after releasing.  Clearing inside the critical section is also what
+// keeps Close idempotent.
+//
+// The closes run concurrently and are bounded by ctx for the same reason the
+// worker wait is: one unresponsive endpoint must not be able to prevent the
+// process from terminating (#83).  A close that outruns the budget is abandoned
+// and reported.
+func (c *Coordinator) CloseContext(ctx context.Context) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultStopTimeout)
+		defer cancel()
+	}
+
+	var errs []error
+	if err := c.StopContext(ctx); err != nil {
+		errs = append(errs, err)
+	}
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.ns.Close()
+	sites := c.snapshotSites()
+	c.sites = nil
+	// c.ns is replaced rather than closed: it holds the same *SiteMount pointers
+	// as c.sites, so closing both would close every site twice.  An empty
+	// Namespace keeps every c.ns.* call site nil-safe.
+	c.ns = namespace.New()
+	c.mu.Unlock()
+
+	if err := closeSites(ctx, sites); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// closeSites closes every site concurrently and waits up to ctx for them.
+// Returns the joined per-site errors, plus ctx.Err() if the budget elapsed with
+// closes still outstanding.
+func closeSites(ctx context.Context, sites []*site.SiteMount) error {
+	if len(sites) == 0 {
+		return nil
+	}
+
+	// Buffered to len(sites) so a close that finishes after the deadline can still
+	// deliver its result and exit instead of blocking on the send forever.
+	results := make(chan error, len(sites))
+	for _, s := range sites {
+		go func() {
+			if err := s.Close(); err != nil {
+				results <- fmt.Errorf("close site %q: %w", s.Name(), err)
+				return
+			}
+			results <- nil
+		}()
+	}
+
+	var errs []error
+	for i := 0; i < len(sites); i++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				errs = append(errs, err)
+			}
+		case <-ctx.Done():
+			errs = append(errs, fmt.Errorf("%d of %d site close(s) did not finish: %w",
+				len(sites)-i, len(sites), ctx.Err()))
+			return errors.Join(errs...)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // AddSite appends a site at the lowest priority, without checking whether its
