@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	objectfserrors "github.com/scttfrdmn/objectfs/pkg/errors"
 	objectfstypes "github.com/scttfrdmn/objectfs/pkg/types"
 
 	"github.com/scttfrdmn/globalfs/pkg/site"
@@ -28,6 +29,11 @@ type failClient struct {
 	// that is precisely the shutdown case StopContext has to bound (#83).
 	putGate     chan struct{}
 	putsEntered int
+	// getGate is putGate's counterpart for Get, and exists to park a transfer at
+	// the exact point #92 is about: after the bytes have been read from the
+	// source and before they are written to the destination.
+	getGate     chan struct{}
+	getsEntered int
 }
 
 func newFailClient(objs map[string][]byte) *failClient {
@@ -39,20 +45,29 @@ func newFailClient(objs map[string][]byte) *failClient {
 
 func (f *failClient) Get(_ context.Context, key string, _, _ int64) ([]byte, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if len(f.getErrs) > 0 {
 		err := f.getErrs[0]
 		f.getErrs = f.getErrs[1:]
 		if err != nil {
+			f.mu.Unlock()
 			return nil, err
 		}
 	}
 	v, ok := f.data[key]
 	if !ok {
+		f.mu.Unlock()
 		return nil, errors.New("not found")
 	}
 	cp := make([]byte, len(v))
 	copy(cp, v)
+	// The bytes are already read; park here, outside the lock, so the object can
+	// be deleted from this very client while the transfer holds them.
+	gate := f.getGate
+	f.getsEntered++
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	return cp, nil
 }
 
@@ -110,12 +125,67 @@ func (f *failClient) waitForPut(t *testing.T, timeout time.Duration) {
 	t.Fatalf("no Put reached the client within %v — the transfer never started", timeout)
 }
 
-func (f *failClient) Delete(_ context.Context, _ string) error { return nil }
+// blockGets parks every subsequent Get on this client *after* it has copied the
+// bytes out, which is where a transfer sits between reading the source and
+// writing the destination.  The returned release is safe to call more than once.
+func (f *failClient) blockGets() (release func()) {
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.getGate = gate
+	f.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }
+}
+
+// waitForGet blocks until a Get has reached the gate, i.e. until the transfer is
+// genuinely parked holding the object's bytes.
+func (f *failClient) waitForGet(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		entered := f.getsEntered
+		f.mu.Unlock()
+		if entered >= 1 {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("no Get reached the client within %v — the transfer never started", timeout)
+}
+
+func (f *failClient) Delete(_ context.Context, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.data, key)
+	return nil
+}
+
 func (f *failClient) List(_ context.Context, _ string, _ int) ([]objectfstypes.ObjectInfo, error) {
 	return nil, nil
 }
-func (f *failClient) Head(_ context.Context, _ string) (*objectfstypes.ObjectInfo, error) {
-	return nil, nil
+
+// Head answers from the same map Get and Put use, and reports an absent key with
+// the code-matched objectfs error a real client returns.  A stub that claimed
+// every key existed would make transfer's pre-PUT source check (#92) vacuous in
+// every test that goes near it.
+func (f *failClient) Head(_ context.Context, key string) (*objectfstypes.ObjectInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.data[key]
+	if !ok {
+		return nil, notFound(key)
+	}
+	return &objectfstypes.ObjectInfo{Key: key, Size: int64(len(v))}, nil
+}
+
+// notFound builds the error a real objectfs client returns for an absent key.
+// It is code-matched by errors.Is against objectfssdk.ErrNotFound, which is what
+// sourceStillHasKey classifies on.
+func notFound(key string) error {
+	return objectfserrors.NewError(objectfserrors.ErrCodeObjectNotFound, "object does not exist").
+		WithComponent("failclient").
+		WithContext("key", key)
 }
 func (f *failClient) Health(_ context.Context) error { return nil }
 func (f *failClient) Close() error                   { return nil }
@@ -1375,4 +1445,163 @@ func TestWorker_StopCompletesWithNoEventConsumer(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("Stop did not return with no event consumer: a blocking terminal send wedged shutdown")
 	}
+}
+
+// ─── Concurrent delete (#92) ───────────────────────────────────────────────────
+
+// TestTransfer_AbandonsWhenSourceKeyDeletedMidFlight is the direct #92
+// reproduction, driven through transfer rather than the worker so the race is
+// deterministic: the source Get is parked after it has handed out the bytes, the
+// object is deleted while the transfer holds them, and only then is the transfer
+// released.
+//
+// Before the pre-PUT source check, the released PUT re-created the object at the
+// destination after a delete that had already succeeded everywhere — and because
+// Coordinator.Get accepts any replica, that resurrected copy was then served to
+// clients for a key the API had reported as erased.
+func TestTransfer_AbandonsWhenSourceKeyDeletedMidFlight(t *testing.T) {
+	t.Parallel()
+
+	src, srcClient := makeMount("src", types.SiteRolePrimary, map[string][]byte{
+		"phi/patient.csv": []byte("record"),
+	})
+	dst, dstClient := makeMount("dst", types.SiteRoleBurst, nil)
+
+	release := srcClient.blockGets()
+	defer release()
+
+	job := ReplicationJob{SourceSite: src, DestSite: dst, Key: "phi/patient.csv"}
+
+	type result struct {
+		hash string
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		hash, err := transfer(context.Background(), job)
+		done <- result{hash, err}
+	}()
+
+	// Wait until the transfer is genuinely holding the bytes, then delete.
+	srcClient.waitForGet(t, 2*time.Second)
+	if err := src.Delete(context.Background(), "phi/patient.csv"); err != nil {
+		t.Fatalf("Delete from source: %v", err)
+	}
+	release()
+
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("transfer did not return within 5s")
+	}
+
+	if dstClient.hasKey("phi/patient.csv") {
+		t.Error("the destination has the object after a completed delete: the in-flight " +
+			"transfer resurrected it, and Coordinator.Get will serve it (#92)")
+	}
+	// An abandoned transfer is not a failure: there is nothing left to move, so
+	// spending two more attempts and two backoffs on it would only re-discover
+	// the same absence and report an ordinary race as a replication fault.
+	if got.err != nil {
+		t.Errorf("abandoned transfer reported an error: %v", got.err)
+	}
+	// No bytes were written, so there is no content hash to record for dedup.
+	if got.hash != "" {
+		t.Errorf("abandoned transfer returned content hash %q; nothing was written", got.hash)
+	}
+}
+
+// TestWorker_DeletedMidFlightIsNotResurrected is the same race through the whole
+// worker, because the guard has to hold where it actually runs: inside the retry
+// loop, under safeTransfer's recover, with the job settling through the event
+// channel.  The job must settle on the first attempt rather than being retried.
+func TestWorker_DeletedMidFlightIsNotResurrected(t *testing.T) {
+	t.Parallel()
+
+	src, srcClient := makeMount("src", types.SiteRolePrimary, map[string][]byte{
+		"k": []byte("v"),
+	})
+	dst, dstClient := makeMount("dst", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	release := srcClient.blockGets()
+	defer release()
+
+	w := fastWorker(4)
+	w.Start(ctx)
+	defer w.Stop()
+
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "k"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	srcClient.waitForGet(t, 2*time.Second)
+	if err := src.Delete(ctx, "k"); err != nil {
+		t.Fatalf("Delete from source: %v", err)
+	}
+	release()
+
+	// Drain until the job settles; EventStarted comes first and carries no
+	// outcome.
+	var settled ReplicationEvent
+	for {
+		ev, ok := drainEvent(t, w, 5*time.Second)
+		if !ok {
+			t.Fatal("the job never settled")
+		}
+		if ev.Type == EventStarted {
+			continue
+		}
+		settled = ev
+		break
+	}
+
+	if settled.Type != EventCompleted {
+		t.Errorf("job settled as %v (%v), want completed: abandoning a transfer whose object "+
+			"is gone is not a replication failure", settled.Type, settled.Err)
+	}
+	if settled.Attempt != 1 {
+		t.Errorf("job settled on attempt %d, want 1: an absent source must not be retried",
+			settled.Attempt)
+	}
+	if settled.ContentHash != "" {
+		t.Errorf("settled with content hash %q; no bytes were written, so recording one would "+
+			"make the dedup index claim the destination holds content it does not",
+			settled.ContentHash)
+	}
+	if dstClient.hasKey("k") {
+		t.Error("destination has the object after the delete completed (#92)")
+	}
+}
+
+// TestSourceStillHasKey_UnreachableSourceProceeds pins the asymmetry in the
+// guard.  Only a code-matched "no such key" abandons the transfer; a source that
+// merely failed to answer must not, or a throttle or a timeout would silently
+// stop replicating for the duration of the incident, one log line per object and
+// no retry.
+func TestSourceStillHasKey_UnreachableSourceProceeds(t *testing.T) {
+	t.Parallel()
+
+	unreachable := &headErrClient{failClient: newFailClient(nil), err: errors.New("connection reset")}
+	src := site.New("src", types.SiteRolePrimary, unreachable)
+	dst, _ := makeMount("dst", types.SiteRoleBackup, nil)
+
+	job := ReplicationJob{SourceSite: src, DestSite: dst, Key: "k"}
+	if !sourceStillHasKey(context.Background(), job) {
+		t.Error("an unreachable source was read as a delete; replication would stop during " +
+			"any transient source outage")
+	}
+}
+
+// headErrClient fails every Head with a fixed non-not-found error.
+type headErrClient struct {
+	*failClient
+	err error
+}
+
+func (h *headErrClient) Head(_ context.Context, _ string) (*objectfstypes.ObjectInfo, error) {
+	return nil, h.err
 }
