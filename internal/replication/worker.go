@@ -21,6 +21,15 @@
 // channel returned by Events to observe progress.  The channel is buffered to
 // the same depth as the work queue; if it fills, events are dropped (logged)
 // rather than blocking the worker.
+//
+// # Panic containment
+//
+// The worker goroutine is a long-lived part of the coordinator daemon, so a
+// panic in it would terminate the whole process.  Each job is therefore run
+// under a recover: the panic value and stack are logged at Error and the job
+// settles as EventFailed, keeping the failure scoped to the object that caused
+// it.  This is containment, not suppression — a recovered panic is still a bug
+// and is logged as loudly as the process can log it.
 package replication
 
 import (
@@ -30,6 +39,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -168,9 +178,37 @@ func (w *Worker) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case job := <-w.queue:
-			w.processJob(ctx, job)
+			w.runJob(ctx, job)
 		}
 	}
+}
+
+// runJob invokes processJob with a last-resort panic backstop.
+//
+// safeTransfer already converts a panic inside transfer into an ordinary
+// attempt error, which is where a panic is overwhelmingly likely to originate.
+// This outer recover covers the remainder of processJob — the retry loop, the
+// log calls that dereference job fields, and emit — so that no panic in the
+// worker can terminate the process that hosts it.  It emits EventFailed before
+// returning, because the coordinator deletes a persisted job from the metadata
+// store only on a terminal event; skipping it would leave an orphaned job that
+// is re-enqueued on every restart.
+func (w *Worker) runJob(ctx context.Context, job ReplicationJob) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("replication: recovered panic while processing job",
+				"key", job.Key,
+				"panic", fmt.Sprintf("%v", r),
+				"stack", string(debug.Stack()))
+			w.emit(ReplicationEvent{
+				Job:     job,
+				Type:    EventFailed,
+				Attempt: MaxRetries,
+				Err:     fmt.Errorf("replication: panic processing job: %v", r),
+			})
+		}
+	}()
+	w.processJob(ctx, job)
 }
 
 func (w *Worker) processJob(ctx context.Context, job ReplicationJob) {
@@ -201,7 +239,7 @@ func (w *Worker) processJob(ctx context.Context, job ReplicationJob) {
 			}
 		}
 
-		contentHash, err := transfer(ctx, job)
+		contentHash, err := safeTransfer(ctx, job)
 		if err != nil {
 			lastErr = err
 			slog.Warn("replication: transfer attempt failed",
@@ -231,6 +269,43 @@ func (w *Worker) emit(ev ReplicationEvent) {
 	}
 }
 
+// safeTransfer calls transfer and converts a panic into an ordinary error so
+// that one malformed object cannot terminate the coordinator process.
+//
+// A panic here is a bug, and the retry loop will re-run the same input twice
+// more before giving up — which is the point: the failure is reported through
+// the normal EventFailed path with the job's key attached, rather than as a
+// process-wide crash whose only record is stderr on a daemon that is no longer
+// running.  The panic value and stack are logged at Error so the bug is not
+// silently swallowed.
+func safeTransfer(ctx context.Context, job ReplicationJob) (hash string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("replication: recovered panic during transfer",
+				"key", job.Key,
+				"src", job.SourceSite.Name(),
+				"dst", job.DestSite.Name(),
+				"panic", fmt.Sprintf("%v", r),
+				"stack", string(debug.Stack()))
+			hash = ""
+			err = fmt.Errorf("replication: panic during transfer of %q: %v", job.Key, r)
+		}
+	}()
+	return transfer(ctx, job)
+}
+
+// shortChecksum truncates a checksum for logging, without assuming its length.
+// Checksums originate in S3 user metadata and are not guaranteed to be 64-char
+// SHA-256 hex: a non-ObjectFS backend or an ETag-derived value can be shorter
+// (#72).
+func shortChecksum(s string) string {
+	const n = 8
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
 // transfer performs the actual byte movement: GET from source, PUT to dest.
 // Returns the SHA-256 hex of the transferred content and any error.
 //
@@ -250,7 +325,7 @@ func transfer(ctx context.Context, job ReplicationJob) (string, error) {
 		if destErr == nil && destInfo != nil && destInfo.Checksum == srcInfo.Checksum {
 			slog.Info("replication: skipping transfer, dest already has matching content",
 				"key", job.Key,
-				"checksum", srcInfo.Checksum[:8]+"...",
+				"checksum", shortChecksum(srcInfo.Checksum),
 				"dest", job.DestSite.Name())
 			return srcInfo.Checksum, nil
 		}

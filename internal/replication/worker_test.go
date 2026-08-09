@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -86,6 +87,31 @@ func (f *failClient) putCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.data) // approximation; use a counter for exact counts
+}
+
+// checksumClient is an ObjectFSClient whose Head returns a fixed checksum, so
+// tests can drive the replication fast path with arbitrary checksum values —
+// including ones shorter than the 8 characters the log line used to slice (#72).
+type checksumClient struct {
+	*failClient
+	checksum string
+}
+
+func newChecksumClient(objs map[string][]byte, checksum string) *checksumClient {
+	return &checksumClient{failClient: newFailClient(objs), checksum: checksum}
+}
+
+func (c *checksumClient) Head(_ context.Context, key string) (*objectfstypes.ObjectInfo, error) {
+	return &objectfstypes.ObjectInfo{Key: key, Checksum: c.checksum}, nil
+}
+
+// panicClient panics on Get, standing in for any bug reachable from transfer.
+type panicClient struct {
+	*failClient
+}
+
+func (p *panicClient) Get(_ context.Context, _ string, _, _ int64) ([]byte, error) {
+	panic("synthetic transfer panic")
 }
 
 // countingClient wraps failClient and tracks call counts.
@@ -553,4 +579,165 @@ func TestWorker_ContextCancellation(t *testing.T) {
 	}
 
 	w.Stop()
+}
+
+// ─── #72: short checksums and panic containment ────────────────────────────────
+
+// TestShortChecksum covers the log-truncation helper at and around the boundary.
+// Before the fix the call site was srcInfo.Checksum[:8], which panics for every
+// input shorter than 8 bytes.
+func TestShortChecksum(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ in, want string }{
+		{"", ""},
+		{"ab", "ab"},                    // the reproduced panic: length 2
+		{"1234567", "1234567"},          // one below the boundary
+		{"12345678", "12345678"},        // exactly the boundary: no ellipsis
+		{"123456789", "12345678..."},    // one above
+		{"deadbeefcafe", "deadbeef..."}, // typical hex prefix
+		{"héllo", "héllo"},              // 6 bytes, 5 runes: no slice
+		{"héllo-world", "héllo-w..."},   // multi-byte, sliced on a rune boundary
+	}
+	for _, tt := range tests {
+		if got := shortChecksum(tt.in); got != tt.want {
+			t.Errorf("shortChecksum(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestTransfer_ShortMatchingChecksum_DoesNotPanic is the regression test for
+// #72.  Both sites report the same 2-character checksum, which takes the fast
+// path straight into the log line that used to slice [:8].  On the pre-fix tree
+// this panics with "slice bounds out of range [:8] with length 2"; the panic is
+// what fails the test, so no assertion on it is needed beyond reaching the end.
+func TestTransfer_ShortMatchingChecksum_DoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	const short = "ab" // shorter than the 8 bytes the log line sliced
+	srcClient := newChecksumClient(map[string][]byte{"genome.bam": []byte("data")}, short)
+	dstClient := newChecksumClient(nil, short)
+	src := site.New("src", types.SiteRolePrimary, srcClient)
+	dst := site.New("dst", types.SiteRoleBackup, dstClient)
+
+	hash, err := transfer(context.Background(), ReplicationJob{
+		SourceSite: src, DestSite: dst, Key: "genome.bam",
+	})
+	if err != nil {
+		t.Fatalf("transfer: unexpected error: %v", err)
+	}
+	if hash != short {
+		t.Errorf("fast path should return the source checksum: got %q, want %q", hash, short)
+	}
+	// The fast path must have skipped the copy entirely.
+	if dstClient.hasKey("genome.bam") {
+		t.Error("fast path transferred data despite matching checksums")
+	}
+}
+
+// TestWorker_ShortMatchingChecksum_WorkerSurvives exercises the same input
+// through the live worker goroutine.  On the pre-fix tree the panic is
+// unrecovered and takes down the test binary — which is exactly what it does to
+// the coordinator process in production.
+func TestWorker_ShortMatchingChecksum_WorkerSurvives(t *testing.T) {
+	t.Parallel()
+
+	srcClient := newChecksumClient(map[string][]byte{"a.bam": []byte("data")}, "ab")
+	dstClient := newChecksumClient(nil, "ab")
+	src := site.New("src", types.SiteRolePrimary, srcClient)
+	dst := site.New("dst", types.SiteRoleBackup, dstClient)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := fastWorker(8)
+	w.Start(ctx)
+	defer w.Stop()
+
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "a.bam"}); err != nil {
+		t.Fatalf("Enqueue: unexpected error: %v", err)
+	}
+
+	var got ReplicationEvent
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && got.Type == "" {
+		ev, ok := drainEvent(t, w, 200*time.Millisecond)
+		if ok && (ev.Type == EventCompleted || ev.Type == EventFailed) {
+			got = ev
+		}
+	}
+	if got.Type != EventCompleted {
+		t.Fatalf("expected EventCompleted, got %q (err: %v)", got.Type, got.Err)
+	}
+	if got.ContentHash != "ab" {
+		t.Errorf("ContentHash: got %q, want %q", got.ContentHash, "ab")
+	}
+
+	// The worker must still be alive and able to process the next job.
+	srcClient.checksum = "" // force the slow path this time
+	dstClient.checksum = ""
+	srcClient.data["b.bam"] = []byte("more")
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "b.bam"}); err != nil {
+		t.Fatalf("Enqueue second job: unexpected error: %v", err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if dstClient.hasKey("b.bam") {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Error("worker did not process the job after a short-checksum job")
+}
+
+// TestWorker_PanicInTransfer_FailsJobAndKeepsWorkerAlive verifies the panic
+// backstop: an arbitrary panic reachable from transfer settles the job as
+// EventFailed (so the coordinator can delete it from the metadata store) and
+// leaves the worker goroutine running.
+func TestWorker_PanicInTransfer_FailsJobAndKeepsWorkerAlive(t *testing.T) {
+	t.Parallel()
+
+	srcClient := &panicClient{failClient: newFailClient(map[string][]byte{"boom": []byte("x")})}
+	src := site.New("src", types.SiteRolePrimary, srcClient)
+	dst, dstClient := makeMount("dst", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := fastWorker(8)
+	w.Start(ctx)
+	defer w.Stop()
+
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "boom"}); err != nil {
+		t.Fatalf("Enqueue: unexpected error: %v", err)
+	}
+
+	var got ReplicationEvent
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && got.Type == "" {
+		ev, ok := drainEvent(t, w, 200*time.Millisecond)
+		if ok && (ev.Type == EventCompleted || ev.Type == EventFailed) {
+			got = ev
+		}
+	}
+	if got.Type != EventFailed {
+		t.Fatalf("expected EventFailed after a panic, got %q", got.Type)
+	}
+	if got.Err == nil || !strings.Contains(got.Err.Error(), "synthetic transfer panic") {
+		t.Errorf("EventFailed.Err should name the panic value; got %v", got.Err)
+	}
+
+	// A healthy job must still go through on the same worker goroutine.
+	good, _ := makeMount("src2", types.SiteRolePrimary, map[string][]byte{"ok": []byte("y")})
+	if err := w.Enqueue(ReplicationJob{SourceSite: good, DestSite: dst, Key: "ok"}); err != nil {
+		t.Fatalf("Enqueue after panic: unexpected error: %v", err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if dstClient.hasKey("ok") {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Error("worker did not process a job after recovering from a panic")
 }
