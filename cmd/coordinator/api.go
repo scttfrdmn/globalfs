@@ -354,8 +354,8 @@ func replicateHandler(c *coordinator.Coordinator) http.HandlerFunc {
 
 // listObjectsResponse is the JSON envelope for GET /api/v1/objects.
 type listObjectsResponse struct {
-	Prefix  string                    `json:"prefix"`
-	Count   int                       `json:"count"`
+	Prefix  string                     `json:"prefix"`
+	Count   int                        `json:"count"`
 	Objects []objectfstypes.ObjectInfo `json:"objects"`
 }
 

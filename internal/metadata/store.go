@@ -106,7 +106,7 @@ type WatchEvent struct {
 type ReplicatedObject struct {
 	Site         string    `json:"site"`
 	Key          string    `json:"key"`
-	ContentHash  string    `json:"content_hash"`  // SHA-256 hex of uncompressed content
+	ContentHash  string    `json:"content_hash"` // SHA-256 hex of uncompressed content
 	ReplicatedAt time.Time `json:"replicated_at"`
 }
 

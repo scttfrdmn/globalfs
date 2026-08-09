@@ -1,6 +1,17 @@
 module github.com/scttfrdmn/globalfs
 
+// The `go` line is the language minimum. `toolchain` is what CI actually compiles with, because
+// .github/workflows/ci.yml passes `go-version-file: go.mod` to setup-go, which reads the `go` line
+// as an exact version spec. Without the line below, every job — including the release build —
+// compiles with go1.26.0 and its standard library, which is five patch releases and a pile of
+// advisories behind (crypto/tls fixed in 1.26.5, crypto/x509 in 1.26.4, net/http in 1.26.3).
+// None would be a defect in this code; all would be shipped by it.
+//
+// Bump this when a patch release carries a fix worth having. objectfs pins the same version for
+// the same reason, and these two build against each other.
 go 1.26.0
+
+toolchain go1.26.5
 
 require (
 	github.com/prometheus/client_golang v1.24.1

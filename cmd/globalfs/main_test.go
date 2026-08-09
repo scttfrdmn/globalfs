@@ -88,8 +88,8 @@ func TestParseS3URI(t *testing.T) {
 	}{
 		{"s3://my-bucket?region=us-west-2", "my-bucket", "us-west-2", false},
 		{"s3://bucket-only", "bucket-only", "", false},
-		{"https://bucket", "", "", true},  // wrong scheme
-		{"s3://", "", "", true},           // no bucket
+		{"https://bucket", "", "", true}, // wrong scheme
+		{"s3://", "", "", true},          // no bucket
 	}
 	for _, tc := range cases {
 		bucket, region, _, err := parseS3URI(tc.input)
@@ -599,8 +599,8 @@ func TestObjectList_Table(t *testing.T) {
 	mux.HandleFunc("GET /api/v1/objects", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"prefix":  "",
-			"count":   2,
+			"prefix": "",
+			"count":  2,
 			"objects": []client.ObjectInfo{
 				{Key: "data/a.bam", Size: 100},
 				{Key: "data/b.bam", Size: 200},

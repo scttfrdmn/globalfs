@@ -173,7 +173,7 @@ func TestCache_AccessPromotesToFront(t *testing.T) {
 	c := New(Config{MaxBytes: 10})
 	c.Put("a", []byte("AAAAA")) // inserted first → LRU candidate
 	c.Put("b", []byte("BBBBB"))
-	c.Get("a") // promote "a" → now "b" is LRU
+	c.Get("a")                  // promote "a" → now "b" is LRU
 	c.Put("c", []byte("CCCCC")) // must evict "b"
 
 	if _, ok := c.Get("b"); ok {
@@ -249,8 +249,8 @@ func TestCache_Stats(t *testing.T) {
 	c := New(Config{MaxBytes: 10})
 	c.Put("a", []byte("AAAAA"))
 	c.Put("b", []byte("BBBBB"))
-	c.Get("a") // hit
-	c.Get("x") // miss
+	c.Get("a")                  // hit
+	c.Get("x")                  // miss
 	c.Put("c", []byte("CCCCC")) // evicts "a" (accessed after "b", but "b" is older — actually "b" is LRU after we accessed "a")
 
 	s := c.Stats()

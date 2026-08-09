@@ -65,7 +65,7 @@ func (f *failClient) Put(_ context.Context, key string, data []byte) error {
 	return nil
 }
 
-func (f *failClient) Delete(_ context.Context, _ string) error                        { return nil }
+func (f *failClient) Delete(_ context.Context, _ string) error { return nil }
 func (f *failClient) List(_ context.Context, _ string, _ int) ([]objectfstypes.ObjectInfo, error) {
 	return nil, nil
 }

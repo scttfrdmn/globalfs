@@ -61,7 +61,6 @@ type ReplicationJob struct {
 
 	// Size is the expected object size in bytes (0 = unknown; informational only).
 	Size int64
-
 }
 
 // ReplicationEvent is emitted for each job lifecycle transition.

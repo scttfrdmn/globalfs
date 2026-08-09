@@ -50,7 +50,7 @@ type Coordinator struct {
 	mu           sync.RWMutex
 	sites        []*site.SiteMount
 	ns           *namespace.Namespace
-	policy       *policy.Engine  // never nil; default = empty engine
+	policy       *policy.Engine // never nil; default = empty engine
 	worker       *replication.Worker
 	store        metadata.Store   // optional; nil means no persistence
 	m            *metrics.Metrics // optional; nil means no instrumentation
@@ -63,7 +63,7 @@ type Coordinator struct {
 	leaseTTL     time.Duration      // 0 → defaultLeaseTTL
 
 	// Background health polling.
-	healthPollInterval time.Duration   // 0 → use defaultHealthPollInterval
+	healthPollInterval time.Duration // 0 → use defaultHealthPollInterval
 	healthCacheMu      sync.RWMutex
 	healthCache        map[string]error // nil = not yet polled
 	healthCheckedAt    time.Time
@@ -92,11 +92,31 @@ const defaultHealthTimeout = 30 * time.Second
 // ── Metrics helpers ───────────────────────────────────────────────────────────
 // These wrappers centralise the nil check so call sites stay clean.
 
-func (c *Coordinator) metricsCacheHit()            { if c.m != nil { c.m.RecordCacheHit() } }
-func (c *Coordinator) metricsCacheMiss()           { if c.m != nil { c.m.RecordCacheMiss() } }
-func (c *Coordinator) metricsCacheEviction()       { if c.m != nil { c.m.RecordCacheEviction() } }
-func (c *Coordinator) metricsCacheBytes(n int64)   { if c.m != nil { c.m.SetCacheBytes(n) } }
-func (c *Coordinator) metricsSiteCount(n int)      { if c.m != nil { c.m.SetSiteCount(n) } }
+func (c *Coordinator) metricsCacheHit() {
+	if c.m != nil {
+		c.m.RecordCacheHit()
+	}
+}
+func (c *Coordinator) metricsCacheMiss() {
+	if c.m != nil {
+		c.m.RecordCacheMiss()
+	}
+}
+func (c *Coordinator) metricsCacheEviction() {
+	if c.m != nil {
+		c.m.RecordCacheEviction()
+	}
+}
+func (c *Coordinator) metricsCacheBytes(n int64) {
+	if c.m != nil {
+		c.m.SetCacheBytes(n)
+	}
+}
+func (c *Coordinator) metricsSiteCount(n int) {
+	if c.m != nil {
+		c.m.SetSiteCount(n)
+	}
+}
 
 // New creates a Coordinator from an ordered list of SiteMounts.
 //

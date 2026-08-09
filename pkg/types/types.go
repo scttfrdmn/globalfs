@@ -89,39 +89,50 @@ const (
 )
 
 // ReplicationPolicy defines a data placement policy.
+//
+// The yaml tags are load-bearing: pkg/config decodes this type straight out of
+// the `policies:` block, and yaml.v3 falls back to the lowercased field name
+// when a tag is absent — so `path_pattern` bound to nothing and every field
+// here silently stayed at its zero value. That is why config.example.yaml
+// failed `globalfs config validate` with "policies[0].path_pattern is
+// required" while plainly containing one.
 type ReplicationPolicy struct {
 	// Name is the policy identifier.
-	Name string `json:"name"`
+	Name string `json:"name" yaml:"name"`
 
 	// PathPattern is a glob pattern matching file paths.
-	PathPattern string `json:"path_pattern"`
+	PathPattern string `json:"path_pattern" yaml:"path_pattern"`
 
 	// Primary is the primary site name for files matching this policy.
-	Primary string `json:"primary"`
+	Primary string `json:"primary" yaml:"primary"`
 
 	// ReplicateTo lists sites to replicate to.
-	ReplicateTo []string `json:"replicate_to"`
+	ReplicateTo []string `json:"replicate_to" yaml:"replicate_to"`
 
 	// Priority affects scheduling (higher = higher priority).
-	Priority int `json:"priority"`
+	Priority int `json:"priority" yaml:"priority"`
 }
 
 // CoordinatorConfig contains coordinator configuration.
+//
+// See the note on ReplicationPolicy for why the yaml tags matter: without them
+// `listen_addr: ":9000"` decoded to the empty string and the daemon bound the
+// default port while reporting the operator's config as loaded.
 type CoordinatorConfig struct {
 	// ListenAddr is the address the coordinator listens on.
-	ListenAddr string `json:"listen_addr"`
+	ListenAddr string `json:"listen_addr" yaml:"listen_addr"`
 
 	// EtcdEndpoints are the etcd cluster endpoints.
-	EtcdEndpoints []string `json:"etcd_endpoints"`
+	EtcdEndpoints []string `json:"etcd_endpoints" yaml:"etcd_endpoints"`
 
 	// LeaseTimeout is the TTL used when acquiring the distributed leader lease.
 	// The coordinator daemon reads this and passes it to SetLeaseTTL at startup.
-	LeaseTimeout time.Duration `json:"lease_timeout"`
+	LeaseTimeout time.Duration `json:"lease_timeout" yaml:"lease_timeout"`
 }
 
 // PerformanceConfig contains performance tuning settings.
 type PerformanceConfig struct {
 	// MaxConcurrentTransfers sets the replication worker queue depth.
 	// The coordinator daemon reads this and passes it to SetWorkerQueueDepth at startup.
-	MaxConcurrentTransfers int `json:"max_concurrent_transfers"`
+	MaxConcurrentTransfers int `json:"max_concurrent_transfers" yaml:"max_concurrent_transfers"`
 }

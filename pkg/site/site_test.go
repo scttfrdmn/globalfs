@@ -28,8 +28,8 @@ func (m *mockClient) Get(_ context.Context, key string, _, _ int64) ([]byte, err
 	return nil, errors.New("not found")
 }
 
-func (m *mockClient) Put(_ context.Context, _ string, _ []byte) error  { return nil }
-func (m *mockClient) Delete(_ context.Context, _ string) error          { return nil }
+func (m *mockClient) Put(_ context.Context, _ string, _ []byte) error { return nil }
+func (m *mockClient) Delete(_ context.Context, _ string) error        { return nil }
 
 func (m *mockClient) List(_ context.Context, prefix string, limit int) ([]objectfstypes.ObjectInfo, error) {
 	if m.listErr != nil {
