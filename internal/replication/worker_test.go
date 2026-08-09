@@ -22,6 +22,12 @@ type failClient struct {
 	data    map[string][]byte
 	getErrs []error // consumed in order; nil = success
 	putErrs []error // consumed in order; nil = success
+	// putGate, if non-nil, blocks Put until it is closed.  It deliberately
+	// ignores the caller's context: a real S3 PUT parked in a connection pool or
+	// a TCP retransmit does not return because someone cancelled a context, and
+	// that is precisely the shutdown case StopContext has to bound (#83).
+	putGate     chan struct{}
+	putsEntered int
 }
 
 func newFailClient(objs map[string][]byte) *failClient {
@@ -51,6 +57,16 @@ func (f *failClient) Get(_ context.Context, key string, _, _ int64) ([]byte, err
 }
 
 func (f *failClient) Put(_ context.Context, key string, data []byte) error {
+	// The gate is read under the lock but waited on outside it: blocking while
+	// holding f.mu would deadlock any concurrent hasKey call.
+	f.mu.Lock()
+	gate := f.putGate
+	f.putsEntered++
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.putErrs) > 0 {
@@ -64,6 +80,34 @@ func (f *failClient) Put(_ context.Context, key string, data []byte) error {
 	copy(cp, data)
 	f.data[key] = cp
 	return nil
+}
+
+// blockPuts makes every subsequent Put on this client wait.  The returned
+// release is safe to call more than once.
+func (f *failClient) blockPuts() (release func()) {
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.putGate = gate
+	f.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }
+}
+
+// waitForPut blocks until a Put has reached the gate, so a test that needs a
+// transfer to be genuinely in flight does not race the worker's scheduling.
+func (f *failClient) waitForPut(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		entered := f.putsEntered
+		f.mu.Unlock()
+		if entered >= 1 {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("no Put reached the client within %v — the transfer never started", timeout)
 }
 
 func (f *failClient) Delete(_ context.Context, _ string) error { return nil }
@@ -390,6 +434,169 @@ func TestWorker_StopBeforeStart(t *testing.T) {
 	t.Parallel()
 	w := NewWorker(4)
 	w.Stop() // must not panic or deadlock
+}
+
+// ─── Lifecycle (#83, #84) ─────────────────────────────────────────────────────
+
+// TestWorker_Lifecycle_StateMachine pins the one-directional contract from the
+// package doc: Start once succeeds, Start again is a no-op, Stop is terminal, and
+// a stopped worker refuses to restart.
+func TestWorker_Lifecycle_StateMachine(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := fastWorker(4)
+	if w.Started() {
+		t.Error("Started() on a fresh worker: got true, want false")
+	}
+	if !w.Start(ctx) {
+		t.Fatal("Start on a created worker: got false, want true")
+	}
+	if !w.Started() {
+		t.Error("Started() after Start: got false, want true")
+	}
+	if w.Start(ctx) {
+		t.Error("second Start on a running worker: got true, want false (it must not launch a second goroutine)")
+	}
+
+	w.Stop()
+	if w.Started() {
+		t.Error("Started() after Stop: got true, want false")
+	}
+	w.Stop() // idempotent: must not panic on a double close of w.done
+	if w.Start(ctx) {
+		t.Error("Start on a stopped worker: got true, want false — a Worker is single-use")
+	}
+}
+
+// TestWorker_StopBeforeStart_IsTerminal is the worker half of #84.  Stop before
+// Start used to be implemented as w.once.Do(func(){}), burning Start's Once, so a
+// later Start silently did nothing and the caller had no way to find out.  The
+// worker is still single-use — that part was intended — but the refusal now has to
+// be observable, which is what lets Coordinator.Start turn it into an error.
+func TestWorker_StopBeforeStart_IsTerminal(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := fastWorker(4)
+	w.Stop()
+
+	if w.Start(ctx) {
+		t.Fatal("Start after a Stop-before-Start returned true, but the worker cannot run: " +
+			"a caller that trusts this reports success while replication is off for the process lifetime")
+	}
+
+	// And the refusal is real, not just a return value: nothing drains the queue.
+	src, _ := makeMount("src", types.SiteRolePrimary, map[string][]byte{"k": []byte("v")})
+	dst, dstClient := makeMount("dst", types.SiteRoleBackup, nil)
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "k"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if dstClient.hasKey("k") {
+		t.Error("a job was transferred by a worker that refused to start")
+	}
+}
+
+// TestWorker_StopContext_BoundedWhenTransferWedged is the worker half of #83.
+// A PUT parked in an unresponsive endpoint must not be able to hold shutdown open:
+// StopContext returns when its budget expires and reports ctx.Err() so the caller
+// knows the job was abandoned rather than settled.
+func TestWorker_StopContext_BoundedWhenTransferWedged(t *testing.T) {
+	t.Parallel()
+
+	src, _ := makeMount("src", types.SiteRolePrimary, map[string][]byte{"k": []byte("v")})
+	dst, dstClient := makeMount("dst", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	release := dstClient.blockPuts()
+	// Released before StopContext is measured would defeat the test; released in a
+	// defer so the abandoned goroutine still exits when the test ends.
+	defer release()
+
+	w := fastWorker(4)
+	if !w.Start(ctx) {
+		t.Fatal("Start: got false")
+	}
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "k"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	dstClient.waitForPut(t, 2*time.Second)
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer stopCancel()
+
+	start := time.Now()
+	err := w.StopContext(stopCtx)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("StopContext returned nil while the transfer was still wedged in Put")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("StopContext error: got %v, want a wrapped context.DeadlineExceeded", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("StopContext took %v with a 100ms budget — the wait is not actually bounded", elapsed)
+	}
+
+	// The signal half must have happened regardless of the error: releasing the
+	// transfer lets the abandoned goroutine finish and exit rather than picking up
+	// another job.
+	if w.Started() {
+		t.Error("Started() after a timed-out StopContext: got true, want false")
+	}
+}
+
+// TestWorker_StopContext_ReturnsNilWhenSettled is the companion to the bounded
+// case: with room to finish, StopContext reports success rather than a timeout.
+func TestWorker_StopContext_ReturnsNilWhenSettled(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := fastWorker(4)
+	if !w.Start(ctx) {
+		t.Fatal("Start: got false")
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := w.StopContext(stopCtx); err != nil {
+		t.Fatalf("StopContext on an idle worker: %v", err)
+	}
+}
+
+// TestWorker_Lifecycle_ConcurrentStartStop runs Start and Stop against each other
+// under -race.  Whichever wins, the invariant is the same: no goroutine survives
+// the Stop, and neither call panics on a double close of w.done.
+func TestWorker_Lifecycle_ConcurrentStartStop(t *testing.T) {
+	t.Parallel()
+
+	for i := 0; i < 50; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		w := fastWorker(4)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); w.Start(ctx) }()
+		go func() { defer wg.Done(); w.Stop() }()
+		wg.Wait()
+
+		// Stop is terminal either way, so the worker must be stopped when both
+		// calls have returned — even if Start ran second and observed "stopped".
+		if w.Started() {
+			t.Fatalf("iteration %d: worker still running after a concurrent Start/Stop", i)
+		}
+		cancel()
+	}
 }
 
 // TestWorker_MultipleJobs verifies that multiple queued jobs are all processed.

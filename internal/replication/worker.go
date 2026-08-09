@@ -10,9 +10,28 @@
 //
 // # Lifecycle
 //
+// A Worker is single-use.  It moves through exactly three states, in one
+// direction only:
+//
+//	created --Start--> running --Stop--> stopped
+//	created ---------------Stop--------> stopped
+//
 // Create a Worker with NewWorker, call Start to begin processing, then Stop
 // when done.  Enqueue is safe to call before Start; jobs accumulate in the
-// bounded queue.  Stop waits for the currently executing job to finish.
+// bounded queue.  Stop waits for the currently executing job to finish, and
+// StopContext bounds that wait.
+//
+// A stopped Worker cannot be restarted: Start on it is a no-op logged at Error,
+// and that includes a Worker stopped before it was ever started.  The single-use
+// rule is deliberate rather than an artefact — the done channel, the WaitGroup
+// and the job context are all one-shot — and it is the same rule the coordinator
+// enforces one level up, so a stopped Worker is never reached through it.
+//
+// Before this was a state machine the rule was expressed as two sync.Onces, and
+// Stop burned Start's once with `w.once.Do(func(){})`.  That made "stopped after
+// running" and "stopped before ever running" indistinguishable to the caller and
+// to the doc comment, which claimed Stop-before-Start was safe while it in fact
+// disabled the worker for the process lifetime with no way to observe it (#84).
 //
 // # Events
 //
@@ -92,18 +111,49 @@ const (
 	defaultBaseBackoff = 100 * time.Millisecond
 )
 
+// workerState is the Worker's position in its one-directional lifecycle.
+type workerState int
+
+const (
+	// workerCreated is a Worker that has never run.  Start moves it to
+	// workerRunning; Stop moves it straight to workerStopped.
+	workerCreated workerState = iota
+	// workerRunning is a Worker whose run goroutine is live.
+	workerRunning
+	// workerStopped is terminal.  Start on it is refused.
+	workerStopped
+)
+
+func (s workerState) String() string {
+	switch s {
+	case workerCreated:
+		return "created"
+	case workerRunning:
+		return "running"
+	case workerStopped:
+		return "stopped"
+	default:
+		return fmt.Sprintf("workerState(%d)", int(s))
+	}
+}
+
 // Worker processes ReplicationJobs from a bounded FIFO queue.
 //
 // Each job is attempted up to MaxRetries times with exponential backoff
 // (baseBackoff × 2^(attempt-1)).  Worker is safe for concurrent use.
+// See the package doc for the lifecycle contract.
 type Worker struct {
 	queue  chan ReplicationJob
 	events chan ReplicationEvent
 
-	wg        sync.WaitGroup
-	done      chan struct{}
-	once      sync.Once
-	closeOnce sync.Once
+	wg   sync.WaitGroup
+	done chan struct{}
+
+	// stateMu guards state.  It is held only across the state transition
+	// itself, never across wg.Wait, so a Stop in progress cannot block a
+	// concurrent Started query.
+	stateMu sync.Mutex
+	state   workerState
 
 	// baseBackoff controls the initial retry delay.  Defaults to
 	// defaultBaseBackoff; may be overridden in tests.
@@ -150,21 +200,95 @@ func (w *Worker) Enqueue(job ReplicationJob) error {
 	}
 }
 
-// Start launches the background worker goroutine.
-// Calling Start multiple times is safe; only the first call has effect.
-func (w *Worker) Start(ctx context.Context) {
-	w.once.Do(func() {
-		w.wg.Add(1)
-		go w.run(ctx)
-	})
+// Start launches the background worker goroutine and reports whether it did.
+//
+// Calling Start more than once is safe: the second call returns false and has no
+// effect.  Start on a stopped Worker also returns false, and logs at Error —
+// restarting a Worker is not supported (see the package Lifecycle doc), and a
+// caller that tries has almost certainly lost track of its own lifecycle.
+// [Coordinator.Start] turns that false into an error the operator can see rather
+// than running with replication silently off (#84).
+func (w *Worker) Start(ctx context.Context) bool {
+	w.stateMu.Lock()
+	switch w.state {
+	case workerRunning:
+		w.stateMu.Unlock()
+		return false
+	case workerStopped:
+		w.stateMu.Unlock()
+		slog.Error("replication: Start on a stopped worker; a Worker is single-use and cannot be restarted")
+		return false
+	}
+	w.state = workerRunning
+	w.wg.Add(1)
+	w.stateMu.Unlock()
+
+	go w.run(ctx)
+	return true
+}
+
+// Started reports whether the worker's run goroutine is currently live.
+func (w *Worker) Started() bool {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	return w.state == workerRunning
 }
 
 // Stop signals the worker to exit and waits for it to finish the current job.
-// Calling Stop before Start is safe.  Calling Stop multiple times is safe.
+//
+// Stop before Start is a genuine no-op on the goroutine — there is none — but it
+// is still terminal: it moves a created Worker to stopped, so a later Start is
+// refused.  Calling Stop more than once is safe.
+//
+// Stop waits without bound.  A job parked in an unresponsive site's PUT holds it
+// there for as long as that PUT takes, which is the shutdown hang in #83; prefer
+// [Worker.StopContext] anywhere a deadline matters.
 func (w *Worker) Stop() {
-	w.once.Do(func() {}) // prevent any future Start
-	w.closeOnce.Do(func() { close(w.done) })
-	w.wg.Wait()
+	_ = w.StopContext(context.Background())
+}
+
+// StopContext signals the worker to exit and waits up to ctx for the current job
+// to settle.  It returns nil once the run goroutine has returned, or ctx.Err() if
+// ctx ends first.
+//
+// The signal half always happens, even on the error return: the worker is
+// stopped, and the only thing the deadline gives up on is *observing* that it
+// finished.  A caller that gets a non-nil error must treat the in-flight job as
+// still running and its terminal event as possibly unemitted — the job is
+// abandoned rather than cancelled, because transfer holds the caller's context
+// and Stop has no authority to cancel it.
+//
+// Abandoning a goroutine is a deliberate trade.  A transfer blocked in a site's
+// PUT does not become interruptible because shutdown would like it to be, so the
+// options are a leaked goroutine in a process that is terminating anyway, or a
+// process that never terminates.  #83 chose the first.
+func (w *Worker) StopContext(ctx context.Context) error {
+	w.stateMu.Lock()
+	alreadyStopped := w.state == workerStopped
+	w.state = workerStopped
+	w.stateMu.Unlock()
+
+	if !alreadyStopped {
+		close(w.done)
+	}
+
+	// wg.Wait has no context-aware form, so it runs on its own goroutine and the
+	// select below picks whichever finishes first.  This goroutine outlives a
+	// timed-out StopContext by exactly as long as the abandoned job does.
+	waited := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(waited)
+	}()
+
+	select {
+	case <-waited:
+		return nil
+	case <-ctx.Done():
+		slog.Warn("replication: worker did not stop within the deadline; abandoning the in-flight job",
+			"error", ctx.Err())
+		return ctx.Err()
+	}
 }
 
 // ── Internal ─────────────────────────────────────────────────────────────────
