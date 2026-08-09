@@ -49,14 +49,17 @@ type memClient struct {
 	// started, and polling the destination for the key cannot tell it — the key
 	// only appears once the gate is released.
 	putsEntered int
-	// healthGate is the same device for Health.  It deliberately ignores the
-	// caller's context, because that is what the real stack does: objectfs's
-	// ClientManager.HealthCheck acquires a pooled client through
-	// ConnectionPool.Get, which takes no context and waits up to 30 s of its own
-	// before the ctx-aware HeadBucket is ever reached.  A gate that honoured ctx
-	// would make the shutdown-bound tests pass for the wrong reason (#83).
+	// healthGate and closeGate are the same device for Health and Close.  They
+	// deliberately ignore the caller's context, because that is what the real
+	// stack does: objectfs's ClientManager.HealthCheck acquires a pooled client
+	// through ConnectionPool.Get, which takes no context and waits up to 30 s of
+	// its own before the ctx-aware HeadBucket is ever reached.  A gate that
+	// honoured ctx would make the shutdown-bound tests pass for the wrong reason
+	// (#83, #95).
 	healthGate    chan struct{}
 	healthEntered int
+	closeGate     chan struct{}
+	closeEntered  int
 	// closes counts Close calls, so tests can assert that removing a site
 	// releases exactly the resources it took (#80).
 	closes int
@@ -189,6 +192,13 @@ func (m *memClient) Health(_ context.Context) error {
 
 func (m *memClient) Close() error {
 	m.mu.Lock()
+	gate := m.closeGate
+	m.closeEntered++
+	m.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.closes++
 	return nil
@@ -230,6 +240,16 @@ func (m *memClient) blockHealth() (release func()) {
 	return func() { once.Do(func() { close(gate) }) }
 }
 
+// blockCloses makes every subsequent Close on this client wait.
+func (m *memClient) blockCloses() (release func()) {
+	gate := make(chan struct{})
+	m.mu.Lock()
+	m.closeGate = gate
+	m.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }
+}
+
 // waitForPut blocks until at least n Put calls have reached the gate, or the
 // timeout elapses (reported as a fatal test failure).
 func (m *memClient) waitForPut(t *testing.T, n int, timeout time.Duration) {
@@ -241,6 +261,12 @@ func (m *memClient) waitForPut(t *testing.T, n int, timeout time.Duration) {
 func (m *memClient) waitForHealth(t *testing.T, n int, timeout time.Duration) {
 	t.Helper()
 	m.waitForEntry(t, "Health", n, timeout, func() int { return m.healthEntered })
+}
+
+// waitForClose blocks until at least n Closes have reached the gate.
+func (m *memClient) waitForClose(t *testing.T, n int, timeout time.Duration) {
+	t.Helper()
+	m.waitForEntry(t, "Close", n, timeout, func() int { return m.closeEntered })
 }
 
 // waitForEntry polls count (called under m.mu) until it reaches n, or fails.
@@ -3393,6 +3419,106 @@ func TestCoordinator_Health_ReportsTimedOutSitesAsUnknown(t *testing.T) {
 	}
 	if err := report["fast"]; err != nil {
 		t.Errorf("report[fast]: got %v, want nil — a fast site must not be tarred with the slow one", err)
+	}
+}
+
+// TestCoordinator_Close_DoesNotBlockSitesDuringSlowClose is #95.
+//
+// Close held c.mu for writing across every site's Close, and a site Close is a
+// network operation — pool drain, in-flight request completion — with no bound.
+// Every method that touches the site set therefore blocked for the full duration,
+// including Sites() and the /health handler behind it: measured at over two
+// seconds against one slow site, which an orchestrator polling health during a
+// rolling restart reads as a hung process rather than a draining one.
+func TestCoordinator_Close_DoesNotBlockSitesDuringSlowClose(t *testing.T) {
+	t.Parallel()
+
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, _ := makeMount("backup", types.SiteRoleBackup, nil)
+
+	release := primaryClient.blockCloses()
+	defer release()
+
+	c := New(primary, backup)
+
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+
+	// Close must have reached the site teardown, so the assertion below is made
+	// while the slow close is genuinely in flight.
+	primaryClient.waitForClose(t, 1, 2*time.Second)
+
+	// Sites() takes c.mu.RLock.  If Close still held the write lock this would
+	// block until the gate is released, which is after this test's assertion.
+	blocked := make(chan int, 1)
+	go func() { blocked <- len(c.Sites()) }()
+
+	select {
+	case <-blocked:
+		// Good: the lock was free.  The value is unimportant — Close clears the
+		// site list inside its critical section, so 0 is the expected answer and
+		// getting any answer at all is the point.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Sites() blocked while a site close was in flight — Close is holding c.mu " +
+			"across per-site network teardown (#95), so /health hangs for the duration")
+	}
+
+	release()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return within 5s after the slow site was released")
+	}
+}
+
+// TestCoordinator_CloseContext_BoundedWhenSiteCloseWedged is #95's other half:
+// having moved the closes outside the lock, they still must not be unbounded, or
+// one dead endpoint prevents the process from exiting.
+func TestCoordinator_CloseContext_BoundedWhenSiteCloseWedged(t *testing.T) {
+	t.Parallel()
+
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, nil)
+	release := primaryClient.blockCloses()
+	defer release()
+
+	c := New(primary)
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer closeCancel()
+
+	start := time.Now()
+	err := c.CloseContext(closeCtx)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("CloseContext returned nil while a site close was wedged")
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("CloseContext took %v with a 200ms budget — an unresponsive endpoint can still "+
+			"hold the process open (#83)", elapsed)
+	}
+}
+
+// TestCoordinator_Close_Idempotent guards the consequence of clearing the site
+// list inside Close's critical section: a second Close must not close every site
+// twice, which for a real client is a double-free of its connection pool.
+func TestCoordinator_Close_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if got := primaryClient.closeCount(); got != 1 {
+		t.Errorf("site Close called %d times across two coordinator Closes, want 1", got)
 	}
 }
 
