@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	objectfserrors "github.com/scttfrdmn/objectfs/pkg/errors"
 	objectfstypes "github.com/scttfrdmn/objectfs/pkg/types"
 	objectfssdk "github.com/scttfrdmn/objectfs/sdks/go/objectfs"
@@ -16,6 +17,7 @@ import (
 	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/lease"
 	"github.com/scttfrdmn/globalfs/internal/metadata"
+	"github.com/scttfrdmn/globalfs/internal/metrics"
 	"github.com/scttfrdmn/globalfs/internal/policy"
 	"github.com/scttfrdmn/globalfs/internal/retry"
 	"github.com/scttfrdmn/globalfs/pkg/site"
@@ -881,6 +883,301 @@ type failingPutJobStore struct {
 
 func (f *failingPutJobStore) PutReplicationJob(_ context.Context, _ *metadata.ReplicationJob) error {
 	return errors.New("simulated storage failure")
+}
+
+// ─── Full replication queue (#79) ─────────────────────────────────────────────
+
+// TestCoordinator_Put_FullQueueDoesNotReportSuccess is the core #79 assertion:
+// a write whose replication was not queued must not be reported as replicated.
+// Before the fix, 40 sequential Puts at the shipped defaults all returned nil
+// and 9 reached the backup.
+func TestCoordinator_Put_FullQueueDoesNotReportSuccess(t *testing.T) {
+	t.Parallel()
+
+	primary, primaryClient := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Park the worker inside the destination Put so nothing ever drains the
+	// queue: whatever depth it has, it fills and stays full.
+	release := backupClient.blockPuts()
+	defer release()
+
+	const depth = 2
+	c := New(primary, backup)
+	c.SetWorkerQueueDepth(depth)
+	// Keep the test quick; the default 2 s budget × N Puts is not worth waiting for.
+	c.SetEnqueueBackpressure(50 * time.Millisecond)
+	c.Start(ctx)
+	// LIFO: release the blocked transfer before Stop, or Stop parks on a worker
+	// inside Put and the test hangs instead of failing (#83).
+	defer c.Stop()
+	defer release()
+
+	const total = 12
+	var dropped, ok int
+	for i := 0; i < total; i++ {
+		err := c.Put(ctx, fmt.Sprintf("obj-%02d", i), []byte("payload"))
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, ErrReplicationNotQueued):
+			dropped++
+		default:
+			t.Fatalf("Put %d: unexpected error: %v", i, err)
+		}
+	}
+
+	if dropped == 0 {
+		t.Fatalf("all %d Puts reported success with a permanently full queue of depth %d; "+
+			"the caller was told writes were replicated when they were not", total, depth)
+	}
+
+	// Every Put still stored the data on the primary — that is the whole point of
+	// calling it a partial success rather than a failure.
+	if got := len(primaryClient.keys()); got != total {
+		t.Errorf("primary holds %d keys, want %d — the synchronous write must always land", got, total)
+	}
+
+	t.Logf("depth=%d: %d Puts queued, %d reported ErrReplicationNotQueued", depth, ok, dropped)
+}
+
+// TestCoordinator_Put_ErrReplicationNotQueuedIsDistinguishable verifies that the
+// partial-success error is separable from a genuine write failure.  A caller
+// that cannot tell them apart cannot decide whether to retry or to alarm.
+func TestCoordinator_Put_ErrReplicationNotQueuedIsDistinguishable(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	release := backupClient.blockPuts()
+	defer release()
+
+	c := New(primary, backup)
+	c.SetWorkerQueueDepth(1)
+	c.SetEnqueueBackpressure(-1) // no waiting: fail the first full Enqueue
+	c.Start(ctx)
+	defer c.Stop()
+	defer release()
+
+	// First Put fills the queue (depth 1); the worker takes it and parks in Put.
+	if err := c.Put(ctx, "a", []byte("x")); err != nil {
+		t.Fatalf("first Put: %v", err)
+	}
+	// Keep going until one is refused — the worker may have dequeued the first.
+	var partial error
+	for i := 0; i < 10 && partial == nil; i++ {
+		if err := c.Put(ctx, fmt.Sprintf("b-%d", i), []byte("x")); err != nil {
+			partial = err
+		}
+	}
+	if partial == nil {
+		t.Fatal("no Put was refused with a full queue and no backpressure budget")
+	}
+	if !errors.Is(partial, ErrReplicationNotQueued) {
+		t.Errorf("full queue: expected ErrReplicationNotQueued, got %v", partial)
+	}
+	// It must not masquerade as a not-found or any other coordinator condition.
+	if errors.Is(partial, ErrNotFound) {
+		t.Errorf("full queue error should not wrap ErrNotFound: %v", partial)
+	}
+
+	// A genuine primary write failure is a different error entirely.
+	badPrimary := site.New("bad", types.SiteRolePrimary,
+		&memClient{putErr: errors.New("disk full"), objects: map[string][]byte{}})
+	writeErr := New(badPrimary).Put(ctx, "k", []byte("x"))
+	if writeErr == nil {
+		t.Fatal("expected an error when the primary write fails")
+	}
+	if errors.Is(writeErr, ErrReplicationNotQueued) {
+		t.Errorf("a failed primary write must not report ErrReplicationNotQueued: %v", writeErr)
+	}
+}
+
+// TestCoordinator_Put_BackpressureWaitsForRoom verifies the preferred behaviour:
+// a transient full queue is absorbed by waiting, not turned into an error.  A
+// burst against a depth-1 queue should be fully replicated.
+func TestCoordinator_Put_BackpressureWaitsForRoom(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := New(primary, backup)
+	c.SetWorkerQueueDepth(1) // pathologically small; the worker drains it fast
+	c.Start(ctx)
+	defer c.Stop()
+
+	const total = 20
+	for i := 0; i < total; i++ {
+		if err := c.Put(ctx, fmt.Sprintf("burst-%02d", i), []byte("payload")); err != nil {
+			t.Fatalf("Put %d: queue room should have been waited for, got %v", i, err)
+		}
+	}
+
+	// Every write should reach the backup; nothing was dropped.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(backupClient.keys()) == total {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Errorf("backup holds %d of %d objects — a burst was silently dropped", len(backupClient.keys()), total)
+}
+
+// TestCoordinator_Put_BackpressureRespectsContextCancellation verifies the wait
+// is abortable.  An unbounded or uncancellable wait would let one wedged
+// destination stall every writer, which is the reason the budget is finite.
+func TestCoordinator_Put_BackpressureRespectsContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	startCtx, startCancel := context.WithCancel(context.Background())
+	defer startCancel()
+
+	release := backupClient.blockPuts()
+	defer release()
+
+	c := New(primary, backup)
+	c.SetWorkerQueueDepth(1)
+	c.SetEnqueueBackpressure(time.Hour) // would hang without cancellation
+	c.Start(startCtx)
+	defer c.Stop()
+	defer release()
+
+	if err := c.Put(startCtx, "fill", []byte("x")); err != nil {
+		t.Fatalf("first Put: %v", err)
+	}
+
+	putCtx, putCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer putCancel()
+
+	done := make(chan error, 1)
+	go func() {
+		var err error
+		// Keep writing until one blocks on the full queue and the ctx expires.
+		for i := 0; i < 10; i++ {
+			if err = c.Put(putCtx, fmt.Sprintf("blocked-%d", i), []byte("x")); err != nil {
+				break
+			}
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected a Put to fail once the context expired")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("expected the context error to propagate, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Put did not honour context cancellation while waiting for queue room")
+	}
+}
+
+// TestCoordinator_Put_FullQueueIncrementsDroppedCounter verifies the drop is
+// observable.  The queue-depth gauge cannot serve: it only updates on job
+// settle, and it reads zero again once the backlog clears.
+func TestCoordinator_Put_FullQueueIncrementsDroppedCounter(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	release := backupClient.blockPuts()
+	defer release()
+
+	reg := prometheus.NewRegistry()
+	c := New(primary, backup)
+	c.SetMetrics(metrics.New(reg))
+	c.SetWorkerQueueDepth(1)
+	c.SetEnqueueBackpressure(-1)
+	c.Start(ctx)
+	defer c.Stop()
+	defer release()
+
+	for i := 0; i < 10; i++ {
+		_ = c.Put(ctx, fmt.Sprintf("k-%d", i), []byte("x"))
+	}
+
+	got := counterValue(t, reg, "globalfs_replication_dropped_total")
+	if got == 0 {
+		t.Error("globalfs_replication_dropped_total is 0 after dropped enqueues — " +
+			"a queue that discards writes has to be observable")
+	}
+	t.Logf("globalfs_replication_dropped_total = %v", got)
+}
+
+// counterValue reads a single unlabelled counter out of a registry.
+func counterValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, mtc := range f.GetMetric() {
+			return mtc.GetCounter().GetValue()
+		}
+	}
+	t.Fatalf("metric %q not found in registry", name)
+	return 0
+}
+
+// TestCoordinator_Put_NoStore_FullQueueStillReports covers the shipped
+// configuration: no metadata store, so nothing recovers a dropped job and the
+// error to the caller is the only signal that exists.
+func TestCoordinator_Put_NoStore_FullQueueStillReports(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	release := backupClient.blockPuts()
+	defer release()
+
+	c := New(primary, backup) // no SetStore
+	c.SetWorkerQueueDepth(1)
+	c.SetEnqueueBackpressure(-1)
+	c.Start(ctx)
+	defer c.Stop()
+	defer release()
+
+	var sawError bool
+	for i := 0; i < 10; i++ {
+		if err := c.Put(ctx, fmt.Sprintf("k-%d", i), []byte("x")); err != nil {
+			if !errors.Is(err, ErrReplicationNotQueued) {
+				t.Fatalf("Put: unexpected error: %v", err)
+			}
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Error("with no store and a full queue, Put reported success for an unreplicated write")
+	}
 }
 
 // ─── Shutdown while busy (#78) ────────────────────────────────────────────────

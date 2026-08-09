@@ -17,6 +17,7 @@ type Metrics struct {
 	sitesCurrent          prometheus.Gauge
 	replicationTotal      *prometheus.CounterVec
 	replicationQueueDepth prometheus.Gauge
+	replicationDropped    prometheus.Counter
 	cacheHits             prometheus.Counter
 	cacheMisses           prometheus.Counter
 	cacheEvictions        prometheus.Counter
@@ -58,6 +59,11 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "globalfs_replication_queue_depth",
 			Help: "Current number of jobs waiting in the replication queue.",
 		}),
+		replicationDropped: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "globalfs_replication_dropped_total",
+			Help: "Total number of replication jobs rejected because the queue was full. " +
+				"Non-zero means writes were not replicated; alert on any increase.",
+		}),
 		cacheHits: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "globalfs_cache_hits_total",
 			Help: "Total number of cache hits.",
@@ -81,6 +87,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.sitesCurrent,
 		m.replicationTotal,
 		m.replicationQueueDepth,
+		m.replicationDropped,
 		m.cacheHits,
 		m.cacheMisses,
 		m.cacheEvictions,
@@ -123,6 +130,20 @@ func (m *Metrics) SetReplicationQueueDepth(n int) {
 		return
 	}
 	m.replicationQueueDepth.Set(float64(n))
+}
+
+// RecordReplicationDropped increments the count of replication jobs that were
+// rejected because the queue was full.
+//
+// This is monotonic and never reset, unlike the queue-depth gauge: a drop is a
+// write that was not replicated, and the operator needs to see that it happened
+// even if the queue has since emptied.  Any non-zero value is a durability
+// event (#79).
+func (m *Metrics) RecordReplicationDropped() {
+	if m == nil {
+		return
+	}
+	m.replicationDropped.Inc()
 }
 
 // RecordCacheHit increments the cache hit counter.
