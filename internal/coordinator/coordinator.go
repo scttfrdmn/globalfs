@@ -25,12 +25,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
+	objectfserrors "github.com/scttfrdmn/objectfs/pkg/errors"
 	objectfstypes "github.com/scttfrdmn/objectfs/pkg/types"
+	objectfssdk "github.com/scttfrdmn/objectfs/sdks/go/objectfs"
 
 	"github.com/scttfrdmn/globalfs/internal/cache"
 	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
@@ -88,6 +91,76 @@ const defaultLeaseTTL = 15 * time.Second
 // defaultHealthTimeout is the maximum duration Health waits for all goroutines
 // when the caller supplies a context without a deadline.
 const defaultHealthTimeout = 30 * time.Second
+
+// ErrNotFound reports that an object does not exist at any of the routed sites.
+//
+// Get and Head return an error wrapping this sentinel when every site they
+// tried answered "no such key", as opposed to failing to answer at all.  The
+// distinction matters to callers: "absent" is a normal answer that deserves a
+// 404, while "every site errored" is a 502.  Before this existed the two were
+// indistinguishable (#77).
+//
+// It wraps [objectfssdk.ErrNotFound], so both of these hold for the error
+// returned by Get:
+//
+//	errors.Is(err, coordinator.ErrNotFound)
+//	errors.Is(err, objectfssdk.ErrNotFound)
+var ErrNotFound = fmt.Errorf("object not found at any site: %w", objectfssdk.ErrNotFound)
+
+// isSiteFailure reports whether err is evidence that the site itself is unwell,
+// as opposed to an ordinary answer to an ordinary request.
+//
+// The circuit breaker needs this distinction and cannot make it from the fact
+// that an error occurred.  A missing key means the site is up, reachable,
+// authenticating and answering correctly — counting it as a failure is how five
+// lookups of absent keys ejected a healthy site from routing for the whole
+// cooldown (#77).
+//
+// The authority is objectfs's [objectfserrors.IsServiceFailure], the same
+// function objectfs's own health tracker and circuit breaker consult, so
+// GlobalFS cannot drift from the classification objectfs makes one layer down.
+// It matches on the error *code*, so a backend error wrapped several times over
+// still resolves.
+//
+// An error carrying no objectfs code counts as a failure.  That direction is
+// deliberate and matches objectfs: the failure mode of misclassifying something
+// unknown is a breaker that opens too eagerly and recovers on its cooldown, not
+// one that never notices an outage.
+func isSiteFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// A caller who withdrew the request says nothing about the site.  objectfs
+	// classifies this as ErrCodeOperationCanceled (not a failure), but GlobalFS
+	// produces the bare context error itself — retry.Do returns ctx.Err()
+	// directly — so it arrives without an objectfs code and has to be named here.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	var objErr *objectfserrors.ObjectFSError
+	if errors.As(err, &objErr) {
+		return objectfserrors.IsServiceFailure(objErr.Code)
+	}
+	return true
+}
+
+// recordSiteResult updates the circuit breaker for one site attempt.
+//
+// A non-failure error records a *success*: the site was reached and it answered,
+// which is exactly what the breaker is trying to measure.  This mirrors
+// objectfs's defaultIsSuccessful.  No-op when cb is nil.
+func recordSiteResult(cb *circuitbreaker.Breaker, name string, err error) {
+	if cb == nil {
+		return
+	}
+	if isSiteFailure(err) {
+		cb.RecordFailure(name)
+		return
+	}
+	cb.RecordSuccess(name)
+}
 
 // ── Metrics helpers ───────────────────────────────────────────────────────────
 // These wrappers centralise the nil check so call sites stay clean.
@@ -216,6 +289,9 @@ func (c *Coordinator) SetWorkerQueueDepth(depth int) {
 // When set, sites whose circuit is open are skipped during read routing (Get,
 // Head).  Write operations (Put, Delete) always target their designated sites
 // but record success/failure to keep the breaker state current.
+//
+// Only errors that are evidence the site itself is unwell count as failures;
+// see isSiteFailure.  A missing key is an ordinary answer and records a success.
 //
 // If all circuits are open the breaker is bypassed so callers are never
 // completely blocked by a stale circuit state.  Pass nil to disable circuit
@@ -519,6 +595,10 @@ func (c *Coordinator) Health(ctx context.Context) map[string]error {
 // The policy engine determines site order; healthy sites (from the background
 // health cache) are then promoted to the front of that list so degraded sites
 // are only tried as a fallback.  The first successful read is returned.
+//
+// When every site tried answered "no such key", the returned error wraps
+// [ErrNotFound].  Callers should test for that before treating a failure as an
+// outage; a missing object is an answer, not a failure (#77).
 func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 	c.mu.RLock()
 	snapshot, pol, cb, retryCfg, oc := c.snapshotSites(), c.policy, c.cb, c.retryConfig, c.objCache
@@ -547,6 +627,10 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 	ordered = filterByCircuitBreaker(cb, ordered)
 
 	var lastErr error
+	// allNotFound stays true while every site tried has answered "no such key".
+	// It distinguishes "the object does not exist" from "no site could answer",
+	// which the API layer needs to tell a 404 from a 502 (#77).
+	allNotFound := true
 	for _, s := range ordered {
 		var data []byte
 		siteErr := doWithRetry(ctx, retryCfg, func() error {
@@ -554,12 +638,9 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 			data, err = s.Get(ctx, key, 0, 0)
 			return err
 		})
-		if cb != nil {
-			if siteErr == nil {
-				cb.RecordSuccess(s.Name())
-			} else {
-				cb.RecordFailure(s.Name())
-			}
+		recordSiteResult(cb, s.Name(), siteErr)
+		if siteErr != nil && !errors.Is(siteErr, objectfssdk.ErrNotFound) {
+			allNotFound = false
 		}
 		if siteErr == nil {
 			// Populate cache on successful site fetch.
@@ -573,6 +654,9 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 			return data, nil
 		}
 		lastErr = siteErr
+	}
+	if allNotFound {
+		return nil, fmt.Errorf("coordinator: Get %q: %w", key, ErrNotFound)
 	}
 	return nil, fmt.Errorf("coordinator: Get %q failed on all sites: %w", key, lastErr)
 }
@@ -609,14 +693,10 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 
 	for _, s := range primaries {
 		if err := s.Put(ctx, key, data); err != nil {
-			if cb != nil {
-				cb.RecordFailure(s.Name())
-			}
+			recordSiteResult(cb, s.Name(), err)
 			return fmt.Errorf("coordinator: Put %q to %q: %w", key, s.Name(), err)
 		}
-		if cb != nil {
-			cb.RecordSuccess(s.Name())
-		}
+		recordSiteResult(cb, s.Name(), nil)
 	}
 
 	// Enqueue async replication to remaining sites using the first primary
@@ -695,23 +775,16 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 
 	for _, s := range primaries {
 		if err := s.Delete(ctx, key); err != nil {
-			if cb != nil {
-				cb.RecordFailure(s.Name())
-			}
+			recordSiteResult(cb, s.Name(), err)
 			return fmt.Errorf("coordinator: Delete %q from primary %q: %w", key, s.Name(), err)
 		}
-		if cb != nil {
-			cb.RecordSuccess(s.Name())
-		}
+		recordSiteResult(cb, s.Name(), nil)
 	}
 	for _, s := range others {
-		if err := s.Delete(ctx, key); err != nil {
-			if cb != nil {
-				cb.RecordFailure(s.Name())
-			}
+		err := s.Delete(ctx, key)
+		recordSiteResult(cb, s.Name(), err)
+		if err != nil {
 			slog.Warn("coordinator: Delete from non-primary site", "key", key, "site", s.Name(), "error", err)
-		} else if cb != nil {
-			cb.RecordSuccess(s.Name())
 		}
 	}
 
@@ -755,6 +828,9 @@ func (c *Coordinator) List(ctx context.Context, prefix string, limit int) ([]obj
 // Head returns metadata for the object at key.
 // Sites are checked in policy-routed order with healthy sites promoted to the
 // front (same health-aware reordering as Get).  The first hit is returned.
+//
+// As with Get, the returned error wraps [ErrNotFound] when every site answered
+// "no such key" rather than failing to answer.
 func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.ObjectInfo, error) {
 	c.mu.RLock()
 	snapshot, pol, cb, retryCfg := c.snapshotSites(), c.policy, c.cb, c.retryConfig
@@ -773,6 +849,7 @@ func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.Obje
 	ordered = filterByCircuitBreaker(cb, ordered)
 
 	var lastErr error
+	allNotFound := true
 	for _, s := range ordered {
 		var info *objectfstypes.ObjectInfo
 		siteErr := doWithRetry(ctx, retryCfg, func() error {
@@ -780,17 +857,17 @@ func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.Obje
 			info, err = s.Head(ctx, key)
 			return err
 		})
-		if cb != nil {
-			if siteErr == nil {
-				cb.RecordSuccess(s.Name())
-			} else {
-				cb.RecordFailure(s.Name())
-			}
+		recordSiteResult(cb, s.Name(), siteErr)
+		if siteErr != nil && !errors.Is(siteErr, objectfssdk.ErrNotFound) {
+			allNotFound = false
 		}
 		if siteErr == nil {
 			return info, nil
 		}
 		lastErr = siteErr
+	}
+	if allNotFound {
+		return nil, fmt.Errorf("coordinator: Head %q: %w", key, ErrNotFound)
 	}
 	return nil, fmt.Errorf("coordinator: Head %q failed on all sites: %w", key, lastErr)
 }
@@ -921,11 +998,35 @@ func preferHealthySites(sites []*site.SiteMount, report map[string]error) []*sit
 // doWithRetry calls fn once when cfg is nil, or delegates to retry.Do when a
 // retry configuration is set.  This keeps the call sites readable and avoids
 // a nil-pointer dereference on the config.
+//
+// A "no such key" answer is never retried.  It is not transient: the site
+// answered, and it will answer the same way three times.  Retrying cost three
+// round trips and two backoff sleeps per absent key before #77 was fixed.
+//
+// Other error classes are still retried even when isSiteFailure says they are
+// not the site's fault.  Retryable and service-failure are separate questions
+// — objectfs makes the same split — and only not-found is unambiguously
+// pointless to repeat.
 func doWithRetry(ctx context.Context, cfg *retry.Config, fn func() error) error {
 	if cfg == nil {
 		return fn()
 	}
-	return retry.Do(ctx, *cfg, fn)
+	// retry.Do has no early-exit hook, so a terminal error is stashed here and
+	// the wrapper reports nil to break the loop.  The stashed error is what the
+	// caller sees, so the "success" is never observable outside this function.
+	var terminal error
+	err := retry.Do(ctx, *cfg, func() error {
+		fnErr := fn()
+		if fnErr != nil && errors.Is(fnErr, objectfssdk.ErrNotFound) {
+			terminal = fnErr
+			return nil
+		}
+		return fnErr
+	})
+	if terminal != nil {
+		return terminal
+	}
+	return err
 }
 
 // filterByCircuitBreaker returns a filtered subset of sites whose circuits

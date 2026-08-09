@@ -3,11 +3,14 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	objectfserrors "github.com/scttfrdmn/objectfs/pkg/errors"
 	objectfstypes "github.com/scttfrdmn/objectfs/pkg/types"
+	objectfssdk "github.com/scttfrdmn/objectfs/sdks/go/objectfs"
 
 	"github.com/scttfrdmn/globalfs/internal/cache"
 	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
@@ -46,6 +49,15 @@ func newMemClient(objs map[string][]byte) *memClient {
 	return &memClient{objects: objs}
 }
 
+// notFound returns the error a real objectfs client returns for an absent key.
+// It is code-matched by errors.Is against objectfssdk.ErrNotFound, including
+// through wrapping, which is what the coordinator's classification relies on.
+func notFound(key string) error {
+	return objectfserrors.NewError(objectfserrors.ErrCodeObjectNotFound, "object does not exist").
+		WithComponent("memclient").
+		WithContext("key", key)
+}
+
 func (m *memClient) Get(_ context.Context, key string, _, _ int64) ([]byte, error) {
 	// getFn takes precedence over the static error/objects behaviour.
 	if m.getFn != nil {
@@ -58,7 +70,7 @@ func (m *memClient) Get(_ context.Context, key string, _, _ int64) ([]byte, erro
 	defer m.mu.Unlock()
 	data, ok := m.objects[key]
 	if !ok {
-		return nil, errors.New("not found")
+		return nil, notFound(key)
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
@@ -116,7 +128,7 @@ func (m *memClient) Head(_ context.Context, key string) (*objectfstypes.ObjectIn
 	defer m.mu.Unlock()
 	data, ok := m.objects[key]
 	if !ok {
-		return nil, errors.New("not found")
+		return nil, notFound(key)
 	}
 	return &objectfstypes.ObjectInfo{
 		Key:          key,
@@ -1463,6 +1475,227 @@ func TestFilterByCircuitBreaker_NilBreakerPassesThrough(t *testing.T) {
 	if len(got) != 1 {
 		t.Errorf("nil cb: expected 1 site, got %d", len(got))
 	}
+}
+
+// ─── Not-found classification (#77) ───────────────────────────────────────────
+
+// TestCoordinator_Get_MissingKeyDoesNotTripBreaker verifies that reads of an
+// absent key leave the circuit closed.  Before #77 every non-nil error recorded
+// a failure, so five cache misses at the default threshold ejected a healthy
+// site from routing for the whole cooldown.
+func TestCoordinator_Get_MissingKeyDoesNotTripBreaker(t *testing.T) {
+	t.Parallel()
+
+	// The site is entirely healthy — it just does not hold this key.
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"present.bam": []byte("data"),
+	})
+
+	cb := circuitbreaker.New(5, time.Hour) // the shipped default threshold
+	c := New(primary)
+	c.SetCircuitBreaker(cb)
+
+	ctx := context.Background()
+	for i := 0; i < 10; i++ {
+		_, err := c.Get(ctx, "absent.bam")
+		if err == nil {
+			t.Fatal("Get of an absent key should return an error")
+		}
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Get of an absent key: error should wrap ErrNotFound, got %v", err)
+		}
+	}
+
+	if got := cb.State("primary"); got != circuitbreaker.StateClosed {
+		t.Errorf("circuit after 10 misses on a healthy site: got %v, want closed", got)
+	}
+
+	// The site must still be readable — the point of the bug was that it wasn't.
+	data, err := c.Get(ctx, "present.bam")
+	if err != nil {
+		t.Fatalf("Get of a present key after 10 misses: %v", err)
+	}
+	if string(data) != "data" {
+		t.Errorf("Get: got %q, want data", data)
+	}
+}
+
+// TestCoordinator_Head_MissingKeyDoesNotTripBreaker is the Head half of #77.
+func TestCoordinator_Head_MissingKeyDoesNotTripBreaker(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+
+	cb := circuitbreaker.New(5, time.Hour)
+	c := New(primary)
+	c.SetCircuitBreaker(cb)
+
+	ctx := context.Background()
+	for i := 0; i < 10; i++ {
+		if _, err := c.Head(ctx, "absent.bam"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Head of an absent key: error should wrap ErrNotFound, got %v", err)
+		}
+	}
+
+	if got := cb.State("primary"); got != circuitbreaker.StateClosed {
+		t.Errorf("circuit after 10 Head misses: got %v, want closed", got)
+	}
+}
+
+// TestCoordinator_Get_RealFailureStillTripsBreaker guards the other direction:
+// the classification must not have made the breaker inert.
+func TestCoordinator_Get_RealFailureStillTripsBreaker(t *testing.T) {
+	t.Parallel()
+
+	// A bare error carrying no objectfs code — the unclassifiable case, which
+	// counts as a failure by design.
+	client := &memClient{getErr: errors.New("S3 unreachable"), objects: map[string][]byte{}}
+	primary := site.New("primary", types.SiteRolePrimary, client)
+
+	cb := circuitbreaker.New(3, time.Hour)
+	c := New(primary)
+	c.SetCircuitBreaker(cb)
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		_, _ = c.Get(ctx, "key")
+	}
+
+	if got := cb.State("primary"); got != circuitbreaker.StateOpen {
+		t.Errorf("circuit after 3 genuine failures: got %v, want open", got)
+	}
+}
+
+// TestCoordinator_Get_NotFoundIsDistinguishableFromOutage verifies that the two
+// conditions produce different errors, which is what lets the API layer return
+// 404 for one and 502 for the other.
+func TestCoordinator_Get_NotFoundIsDistinguishableFromOutage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	absent, _ := makeMount("absent", types.SiteRolePrimary, nil)
+	_, err := New(absent).Get(ctx, "k")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("absent key: expected ErrNotFound, got %v", err)
+	}
+	// ErrNotFound wraps the objectfs sentinel, so callers may test either.
+	if !errors.Is(err, objectfssdk.ErrNotFound) {
+		t.Errorf("absent key: expected error to wrap objectfssdk.ErrNotFound, got %v", err)
+	}
+
+	down := site.New("down", types.SiteRolePrimary,
+		&memClient{getErr: errors.New("connection refused"), objects: map[string][]byte{}})
+	_, err = New(down).Get(ctx, "k")
+	if err == nil {
+		t.Fatal("unreachable site: expected an error")
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Errorf("unreachable site: must NOT report ErrNotFound, got %v", err)
+	}
+}
+
+// TestCoordinator_Get_MixedNotFoundAndFailureIsNotNotFound verifies that one
+// site failing to answer is enough to make the whole read an outage rather than
+// an absence: the object may well exist on the site that could not be reached.
+func TestCoordinator_Get_MixedNotFoundAndFailureIsNotNotFound(t *testing.T) {
+	t.Parallel()
+
+	absent, _ := makeMount("absent", types.SiteRolePrimary, nil)
+	down := site.New("down", types.SiteRoleBackup,
+		&memClient{getErr: errors.New("connection refused"), objects: map[string][]byte{}})
+
+	_, err := New(absent, down).Get(context.Background(), "k")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Errorf("one site unreachable: must not claim not-found, got %v", err)
+	}
+}
+
+// TestCoordinator_Get_NotFoundIsNotRetried verifies that a missing key costs one
+// round trip, not MaxAttempts.  Retrying an absent key is pointless: the site
+// answered, and it will answer the same way three times.
+func TestCoordinator_Get_NotFoundIsNotRetried(t *testing.T) {
+	t.Parallel()
+
+	client := &memClient{objects: map[string][]byte{}}
+	primary := site.New("primary", types.SiteRolePrimary, client)
+
+	calls := 0
+	client.getFn = func(key string) ([]byte, error) {
+		calls++
+		return nil, notFound(key)
+	}
+
+	c := New(primary)
+	c.SetRetryConfig(&retry.Config{
+		MaxAttempts:  3,
+		InitialDelay: time.Millisecond,
+		Multiplier:   1.0,
+	})
+
+	_, err := c.Get(context.Background(), "absent")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("absent key produced %d site calls, want 1 (not-found is not transient)", calls)
+	}
+}
+
+// TestIsSiteFailure_Classification pins the classification table directly.
+func TestIsSiteFailure_Classification(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"object not found", notFound("k"), false},
+		{"wrapped not found", fmt.Errorf("get from %q: %w", "primary", notFound("k")), false},
+		{"context canceled", context.Canceled, false},
+		{"wrapped context canceled", fmt.Errorf("site attempt: %w", context.Canceled), false},
+		{"access denied", objectfserrors.NewError(objectfserrors.ErrCodeAccessDenied, "denied"), true},
+		{"connection failed", objectfserrors.NewError(objectfserrors.ErrCodeConnectionFailed, "refused"), true},
+		{"uncoded error counts as a failure", errors.New("something went wrong"), true},
+	}
+	for _, tc := range tests {
+		if got := isSiteFailure(tc.err); got != tc.want {
+			t.Errorf("isSiteFailure(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestRecordSiteResult_NotFoundRecordsSuccess verifies that a non-failure error
+// records a success rather than merely skipping the failure.  The site was
+// reached and it answered, which is what the breaker measures — and it means a
+// site recovering via cache misses closes its circuit.
+func TestRecordSiteResult_NotFoundRecordsSuccess(t *testing.T) {
+	t.Parallel()
+
+	cb := circuitbreaker.New(3, time.Hour)
+	cb.RecordFailure("s")
+	cb.RecordFailure("s")
+
+	recordSiteResult(cb, "s", notFound("k"))
+
+	// The failure counter must have been reset: one more genuine failure should
+	// not be enough to open a threshold-3 circuit.
+	recordSiteResult(cb, "s", errors.New("boom"))
+	if got := cb.State("s"); got != circuitbreaker.StateClosed {
+		t.Errorf("state: got %v, want closed (not-found should have reset the counter)", got)
+	}
+}
+
+// TestRecordSiteResult_NilBreakerIsNoop guards the nil-breaker path.
+func TestRecordSiteResult_NilBreakerIsNoop(t *testing.T) {
+	t.Parallel()
+	recordSiteResult(nil, "s", errors.New("boom")) // must not panic
+	recordSiteResult(nil, "s", nil)
 }
 
 // ─── Retry tests ──────────────────────────────────────────────────────────────
