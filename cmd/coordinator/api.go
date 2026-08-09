@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -300,6 +301,147 @@ func decodeJSON(r *http.Request, dst any) error {
 	return dec.Decode(dst)
 }
 
+// ── S3 endpoint validation (SSRF guard) ───────────────────────────────────────
+
+// errEndpointRejected is the generic error returned to the caller when an
+// endpoint fails validation, replacing the transport error the handler used to
+// echo back.  The detail goes to the log instead: a 502 body containing
+// `malformed HTTP response "SSH-2.0-OpenSSH_9.6"` versus `connection refused`
+// distinguishes an open port from a closed one, which turns this endpoint into a
+// port scanner with an oracle (#76).
+var errEndpointRejected = errors.New("s3_endpoint is not permitted")
+
+// endpointResolver is the hook validateS3Endpoint uses to resolve a host to
+// addresses.  Overridable so tests can exercise the DNS-name-to-internal-address
+// case without depending on a resolver that returns a particular answer.
+type endpointResolver func(ctx context.Context, host string) ([]net.IPAddr, error)
+
+// defaultEndpointResolver resolves via the system resolver.
+func defaultEndpointResolver(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, host)
+}
+
+// isDisallowedAddr reports whether ip is in an address class a caller-supplied
+// S3 endpoint must not reach, and returns a short reason for the log.
+//
+// allowPrivate relaxes only the private classes (RFC1918, unique-local, CGNAT).
+// Loopback, link-local, unspecified, and multicast stay blocked regardless:
+// 169.254.169.254 is the highest-value target in this class and nothing that
+// serves S3 legitimately lives there.
+func isDisallowedAddr(ip net.IP, allowPrivate bool) (bool, string) {
+	switch {
+	case ip.IsUnspecified():
+		return true, "unspecified address"
+	case ip.IsLoopback():
+		return true, "loopback address"
+	case ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast():
+		// Covers 169.254.0.0/16 (and so IMDS) and fe80::/10.
+		return true, "link-local address"
+	case ip.IsInterfaceLocalMulticast(), ip.IsMulticast():
+		return true, "multicast address"
+	}
+	if !allowPrivate {
+		// net.IP.IsPrivate covers RFC1918 and RFC4193 unique-local.
+		if ip.IsPrivate() {
+			return true, "private address (set security.allow_private_endpoints to permit)"
+		}
+		// RFC6598 shared address space, 100.64.0.0/10 — not covered by IsPrivate
+		// and routable to carrier-internal infrastructure.
+		if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+			return true, "shared address space (set security.allow_private_endpoints to permit)"
+		}
+	}
+	return false, ""
+}
+
+// validateS3Endpoint checks a caller-supplied S3 endpoint before the coordinator
+// signs a request to it.  An empty endpoint means "use the AWS default" and is
+// always allowed.
+//
+// It returns errEndpointRejected for the caller and a detailed reason for the
+// log.  Requirements:
+//
+//   - absolute URL with an http or https scheme and a host;
+//   - no userinfo, and no path/query/fragment beyond "/" (an S3 endpoint is an
+//     origin; a path here is a sign the value is being used for something else);
+//   - every address the host resolves to passes isDisallowedAddr.
+//
+// Resolution happens rather than string matching, so "imds.attacker.example"
+// pointing at 169.254.169.254 is caught too, and *all* answers must pass — one
+// public A record does not license a second private one.
+//
+// Known limitation, called out in the issue: the gap between resolving here and
+// the SDK dialling is a DNS-rebinding window.  Closing it needs the connection
+// pinned to the address checked, i.e. a DialContext hook on the HTTP client the
+// S3 backend uses — and objectfs's SDK exposes no way to supply one
+// (sdks/go/objectfs/options.go has WithEndpoint/WithRegion/WithTLS and no
+// transport option).  So this narrows the attack from "any host by name" to "a
+// host whose DNS flips between two answers inside one HeadBucket", and the rest
+// belongs upstream.
+func validateS3Endpoint(ctx context.Context, endpoint string, sec config.SecurityConfig, resolve endpointResolver) (error, string) {
+	if endpoint == "" {
+		return nil, ""
+	}
+
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return errEndpointRejected, fmt.Sprintf("unparseable URL: %v", err)
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return errEndpointRejected, fmt.Sprintf("scheme %q is not http or https", u.Scheme)
+	}
+	if u.Host == "" {
+		return errEndpointRejected, "URL has no host"
+	}
+	if u.User != nil {
+		return errEndpointRejected, "URL must not contain userinfo"
+	}
+	if u.Path != "" && u.Path != "/" {
+		return errEndpointRejected, fmt.Sprintf("URL must not contain a path (got %q)", u.Path)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return errEndpointRejected, "URL must not contain a query or fragment"
+	}
+
+	host := u.Hostname()
+	if host == "" {
+		return errEndpointRejected, "URL has no host"
+	}
+
+	// Exact-match allowlist: the narrow escape hatch, and the only way to permit
+	// a loopback endpoint (LocalStack in a test harness, say).
+	for _, allowed := range sec.AllowedEndpointHosts {
+		if strings.EqualFold(strings.TrimSpace(allowed), host) {
+			return nil, ""
+		}
+	}
+
+	// An IP literal needs no resolution; check it directly so a bad literal is
+	// rejected without a DNS round trip.
+	if ip := net.ParseIP(host); ip != nil {
+		if bad, reason := isDisallowedAddr(ip, sec.AllowPrivateEndpoints); bad {
+			return errEndpointRejected, reason
+		}
+		return nil, ""
+	}
+
+	addrs, err := resolve(ctx, host)
+	if err != nil {
+		return errEndpointRejected, fmt.Sprintf("host does not resolve: %v", err)
+	}
+	if len(addrs) == 0 {
+		return errEndpointRejected, "host resolves to no addresses"
+	}
+	for _, a := range addrs {
+		if bad, reason := isDisallowedAddr(a.IP, sec.AllowPrivateEndpoints); bad {
+			return errEndpointRejected, fmt.Sprintf("resolves to %s: %s", a.IP, reason)
+		}
+	}
+	return nil, ""
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 // sitesListHandler handles GET /api/v1/sites — returns all sites with health.
@@ -314,7 +456,9 @@ func sitesListHandler(c *coordinator.Coordinator) http.HandlerFunc {
 }
 
 // addSiteHandler handles POST /api/v1/sites — register a new site at runtime.
-func addSiteHandler(daemonCtx context.Context, c *coordinator.Coordinator) http.HandlerFunc {
+//
+// sec constrains which s3_endpoint values are accepted; see validateS3Endpoint.
+func addSiteHandler(daemonCtx context.Context, c *coordinator.Coordinator, sec config.SecurityConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 		var req addSiteRequest
@@ -348,6 +492,26 @@ func addSiteHandler(daemonCtx context.Context, c *coordinator.Coordinator) http.
 			return
 		}
 
+		// Validate the endpoint before anything signs a request to it.  site
+		// .NewFromConfig performs a HeadBucket, so an unchecked endpoint means the
+		// coordinator sends its own credentials' SigV4 Authorization header to a
+		// host the caller chose (#76).
+		connectCtx, cancel := context.WithTimeout(daemonCtx, 30*time.Second)
+		defer cancel()
+
+		if err, reason := validateS3Endpoint(connectCtx, req.S3Endpoint, sec, defaultEndpointResolver); err != nil {
+			// The reason is logged, never returned: see errEndpointRejected.
+			slog.Warn("api: add site: endpoint rejected",
+				"name", req.Name,
+				"endpoint", req.S3Endpoint,
+				"reason", reason,
+				"request_id", requestIDFromCtx(r.Context()),
+				"remote_addr", r.RemoteAddr,
+			)
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
 		siteCfg := &config.SiteConfig{
 			Name: req.Name,
 			Role: req.Role,
@@ -358,13 +522,15 @@ func addSiteHandler(daemonCtx context.Context, c *coordinator.Coordinator) http.
 			},
 		}
 
-		connectCtx, cancel := context.WithTimeout(daemonCtx, 30*time.Second)
-		defer cancel()
-
 		mount, err := site.NewFromConfig(connectCtx, siteCfg)
 		if err != nil {
+			// Generic message: the transport error separates an open non-HTTP port
+			// ("malformed HTTP response \"SSH-2.0-...\"") from a closed one
+			// ("connection refused"), which is a scan oracle (#76).  Detail is
+			// logged for the operator, who can see it, rather than returned to the
+			// caller, who should not.
 			slog.Warn("api: add site: connect failed", "name", req.Name, "error", err)
-			writeError(w, http.StatusBadGateway, "failed to connect to site: "+err.Error())
+			writeError(w, http.StatusBadGateway, "failed to connect to site")
 			return
 		}
 
@@ -743,9 +909,10 @@ func buildHandler(mux *http.ServeMux, apiKey string) http.Handler {
 // registerAPIRoutes registers all /api/v1/* endpoints on mux.
 // daemonCtx is the coordinator's parent context, used for S3 connection setup.
 // m may be nil; when non-nil, object handler latency and status are recorded.
-func registerAPIRoutes(mux *http.ServeMux, daemonCtx context.Context, c *coordinator.Coordinator, m *metrics.Metrics) {
+// sec constrains which s3_endpoint values POST /api/v1/sites will accept.
+func registerAPIRoutes(mux *http.ServeMux, daemonCtx context.Context, c *coordinator.Coordinator, m *metrics.Metrics, sec config.SecurityConfig) {
 	mux.HandleFunc("GET /api/v1/sites", sitesListHandler(c))
-	mux.HandleFunc("POST /api/v1/sites", addSiteHandler(daemonCtx, c))
+	mux.HandleFunc("POST /api/v1/sites", addSiteHandler(daemonCtx, c, sec))
 	mux.HandleFunc("DELETE /api/v1/sites/{name}", removeSiteHandler(c))
 	mux.HandleFunc("POST /api/v1/replicate", replicateHandler(c))
 
