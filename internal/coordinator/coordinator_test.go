@@ -47,6 +47,9 @@ type memClient struct {
 	// started, and polling the destination for the key cannot tell it — the key
 	// only appears once the gate is released.
 	putsEntered int
+	// closes counts Close calls, so tests can assert that removing a site
+	// releases exactly the resources it took (#80).
+	closes int
 }
 
 func newMemClient(objs map[string][]byte) *memClient {
@@ -167,7 +170,22 @@ func (m *memClient) Health(_ context.Context) error {
 	defer m.mu.Unlock()
 	return m.healthErr
 }
-func (m *memClient) Close() error { return nil }
+
+func (m *memClient) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closes++
+	return nil
+}
+
+// closeCount reports how many times Close has been called.  Site removal must
+// close exactly what it removed: an unclosed SiteMount leaks a connection pool,
+// and closing one twice would be a double-free of the same pool.
+func (m *memClient) closeCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closes
+}
 
 func (m *memClient) setHealthErr(err error) {
 	m.mu.Lock()
@@ -457,6 +475,181 @@ func TestCoordinator_AddRemoveSite(t *testing.T) {
 	sites := c.Sites()
 	if len(sites) != 1 || sites[0].Name() != "b" {
 		t.Errorf("expected only site \"b\" after RemoveSite(\"a\"), got %v", sites)
+	}
+}
+
+// ─── Site removal with duplicate names (#80) ──────────────────────────────────
+
+// TestCoordinator_RemoveSite_DuplicateNamesRemovesExactlyOne is the core #80
+// assertion.  Before the fix, one RemoveSite call filtered out every match while
+// keeping only the last, so a coordinator with two sites named "primary" was
+// emptied by a single call and only one of the two was closed.
+func TestCoordinator_RemoveSite_DuplicateNamesRemovesExactlyOne(t *testing.T) {
+	t.Parallel()
+
+	first, firstClient := makeMount("primary", types.SiteRolePrimary, nil)
+	second, secondClient := makeMount("primary", types.SiteRolePrimary, nil)
+	other, otherClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	c := New(first, second, other)
+
+	if !c.RemoveSite("primary") {
+		t.Fatal("RemoveSite(\"primary\"): reported not found")
+	}
+
+	sites := c.Sites()
+	if len(sites) != 2 {
+		t.Fatalf("after one RemoveSite the coordinator holds %d sites, want 2 — "+
+			"a single call removed more than it was asked to; sites=%v", len(sites), siteNames(sites))
+	}
+	// The highest-priority match goes; the duplicate and the unrelated site stay.
+	if got := siteNames(sites); got[0] != "primary" || got[1] != "backup" {
+		t.Errorf("remaining sites = %v, want [primary backup]", got)
+	}
+	if sites[0] != second {
+		t.Error("the wrong duplicate was kept: removal should take the highest-priority match")
+	}
+
+	// Whatever was removed must be closed, and nothing else may be.
+	if got := firstClient.closeCount(); got != 1 {
+		t.Errorf("removed site closed %d times, want 1 — an unclosed SiteMount leaks its connection pool", got)
+	}
+	if got := secondClient.closeCount(); got != 0 {
+		t.Errorf("retained duplicate was closed %d times, want 0 — it is still in the routing set", got)
+	}
+	if got := otherClient.closeCount(); got != 0 {
+		t.Errorf("unrelated site was closed %d times, want 0", got)
+	}
+
+	// A second call takes the duplicate, so the state is still reachable.
+	if !c.RemoveSite("primary") {
+		t.Fatal("second RemoveSite(\"primary\"): reported not found")
+	}
+	if got := siteNames(c.Sites()); len(got) != 1 || got[0] != "backup" {
+		t.Errorf("after the second removal sites = %v, want [backup]", got)
+	}
+	if got := secondClient.closeCount(); got != 1 {
+		t.Errorf("duplicate closed %d times after its own removal, want 1", got)
+	}
+	if got := firstClient.closeCount(); got != 1 {
+		t.Errorf("first site closed %d times, want 1 — no double close", got)
+	}
+}
+
+// TestCoordinator_RemoveSite_ClosesTheSiteItRemoved covers the ordinary
+// unique-name case: removal is not just a list edit, it must release the
+// connection pool (#62).
+func TestCoordinator_RemoveSite_ClosesTheSiteItRemoved(t *testing.T) {
+	t.Parallel()
+
+	a, aClient := makeMount("a", types.SiteRolePrimary, nil)
+	b, bClient := makeMount("b", types.SiteRoleBackup, nil)
+	c := New(a, b)
+
+	if !c.RemoveSite("a") {
+		t.Fatal("RemoveSite(\"a\"): reported not found")
+	}
+	if got := aClient.closeCount(); got != 1 {
+		t.Errorf("removed site closed %d times, want 1", got)
+	}
+	if got := bClient.closeCount(); got != 0 {
+		t.Errorf("retained site closed %d times, want 0", got)
+	}
+
+	// A miss must not close anything.
+	if c.RemoveSite("nope") {
+		t.Error("RemoveSite(\"nope\"): reported a removal that did not happen")
+	}
+	if got := bClient.closeCount(); got != 0 {
+		t.Errorf("after a miss, retained site closed %d times, want 0", got)
+	}
+}
+
+// TestCoordinator_RemoveSite_ReplacesNamespaceView verifies the merged view is
+// rebuilt, not just the site slice: a removed site must stop answering List.
+func TestCoordinator_RemoveSite_ReplacesNamespaceView(t *testing.T) {
+	t.Parallel()
+
+	a, _ := makeMount("a", types.SiteRolePrimary, map[string][]byte{"only-on-a": []byte("x")})
+	b, _ := makeMount("b", types.SiteRoleBackup, map[string][]byte{"only-on-b": []byte("y")})
+	c := New(a, b)
+
+	if !c.RemoveSite("a") {
+		t.Fatal("RemoveSite(\"a\"): reported not found")
+	}
+	items, err := c.List(context.Background(), "", 0)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, it := range items {
+		if it.Key == "only-on-a" {
+			t.Error("a removed site still contributes to List — the namespace view was not rebuilt")
+		}
+	}
+}
+
+// TestCoordinator_AddSiteUnique_RejectsDuplicateName verifies the invariant is
+// enforced at the point of entry, so RemoveSite's ambiguity is unreachable in
+// the first place.
+func TestCoordinator_AddSiteUnique_RejectsDuplicateName(t *testing.T) {
+	t.Parallel()
+
+	first, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(first)
+
+	dup, dupClient := makeMount("primary", types.SiteRoleBackup, nil) // different role, same name
+	err := c.AddSiteUnique(dup)
+	if err == nil {
+		t.Fatal("AddSiteUnique accepted a duplicate name")
+	}
+	if !errors.Is(err, ErrDuplicateSite) {
+		t.Errorf("expected ErrDuplicateSite, got %v", err)
+	}
+	if got := len(c.Sites()); got != 1 {
+		t.Errorf("site count is %d after a rejected add, want 1", got)
+	}
+	// The rejected site belongs to the caller; AddSiteUnique must not close it.
+	if got := dupClient.closeCount(); got != 0 {
+		t.Errorf("rejected site was closed %d times, want 0 — ownership stays with the caller", got)
+	}
+
+	// A distinct name still works, and lands at lowest priority.
+	fresh, _ := makeMount("backup", types.SiteRoleBackup, nil)
+	if err := c.AddSiteUnique(fresh); err != nil {
+		t.Fatalf("AddSiteUnique with a fresh name: %v", err)
+	}
+	if got := siteNames(c.Sites()); len(got) != 2 || got[1] != "backup" {
+		t.Errorf("sites = %v, want [primary backup]", got)
+	}
+}
+
+// TestCoordinator_AddSiteUnique_Concurrent verifies the check and the append are
+// one atomic step: N racing adds of the same name must yield exactly one site.
+func TestCoordinator_AddSiteUnique_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	c := New()
+	const racers = 16
+	var wg sync.WaitGroup
+	accepted := make(chan struct{}, racers)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, _ := makeMount("primary", types.SiteRolePrimary, nil)
+			if err := c.AddSiteUnique(s); err == nil {
+				accepted <- struct{}{}
+			}
+		}()
+	}
+	wg.Wait()
+	close(accepted)
+
+	if got := len(accepted); got != 1 {
+		t.Errorf("%d concurrent adds of the same name were accepted, want 1", got)
+	}
+	if got := len(c.Sites()); got != 1 {
+		t.Errorf("coordinator holds %d sites after racing adds, want 1", got)
 	}
 }
 

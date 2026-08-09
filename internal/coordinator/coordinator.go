@@ -610,7 +610,14 @@ func (c *Coordinator) Close() error {
 	return c.ns.Close()
 }
 
-// AddSite appends a site at the lowest priority.
+// AddSite appends a site at the lowest priority, without checking whether its
+// name is already taken.
+//
+// Prefer [Coordinator.AddSiteUnique] anywhere the name comes from outside the
+// process.  Site names are the only handle every other operation has on a site —
+// RemoveSite, Replicate and the health report all address sites by name — so two
+// sites sharing one is an ambiguity none of them can resolve (#80).  Config
+// loading rejects duplicates; the HTTP API historically did not.
 func (c *Coordinator) AddSite(s *site.SiteMount) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -619,31 +626,71 @@ func (c *Coordinator) AddSite(s *site.SiteMount) {
 	c.metricsSiteCount(len(c.sites))
 }
 
-// RemoveSite removes the site with the given name.
-// If no site with that name exists, this is a no-op.
-// RemoveSite removes the named site and reports whether it was found.
+// ErrDuplicateSite reports that a site with the requested name is already
+// registered.  An HTTP layer should map it to 409 Conflict.
+var ErrDuplicateSite = errors.New("site name already registered")
+
+// AddSiteUnique appends a site at the lowest priority, or returns an error
+// wrapping [ErrDuplicateSite] if a site with the same name is already
+// registered.  The site is left untouched — not closed — when rejected, since
+// the caller constructed it and is better placed to decide.
+//
+// The check and the append happen under one lock hold, so a caller cannot be
+// beaten to the name between deciding and acting; the same reason RemoveSite
+// reports a bool instead of exposing an existence check (#58).
+func (c *Coordinator) AddSiteUnique(s *site.SiteMount) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, existing := range c.sites {
+		if existing.Name() == s.Name() {
+			return fmt.Errorf("coordinator: add site %q: %w", s.Name(), ErrDuplicateSite)
+		}
+	}
+	c.sites = append(c.sites, s)
+	c.ns.AddSite(s)
+	c.metricsSiteCount(len(c.sites))
+	return nil
+}
+
+// RemoveSite removes the named site, closes it, and reports whether it was
+// found.  If no site has that name this is a no-op returning false.
+//
 // Returning a bool allows callers to distinguish "not found" from "removed"
 // atomically, eliminating the TOCTOU race in the HTTP handler (#58).
+//
+// Exactly one site is removed per call, even if several share the name: the
+// highest-priority match goes and the rest stay, so a second call removes the
+// next one.  The loop used to run to completion, keeping only the *last* match
+// while filtering out *all* of them — one DELETE emptied the whole set and closed
+// one site, leaking the S3 connection pools of the others and reintroducing the
+// leak #62 fixed by another route (#80).  Duplicate names should not exist
+// (AddSiteUnique and config validation both refuse them), but this is the
+// function whose contract that leak fix rests on, so it does not assume it.
 func (c *Coordinator) RemoveSite(name string) bool {
 	var removed *site.SiteMount
 	c.mu.Lock()
-	filtered := make([]*site.SiteMount, 0, len(c.sites))
-	for _, s := range c.sites {
-		if s.Name() == name {
-			removed = s
-		} else {
-			filtered = append(filtered, s)
+	for i, s := range c.sites {
+		if s.Name() != name {
+			continue
 		}
+		removed = s
+		remaining := make([]*site.SiteMount, 0, len(c.sites)-1)
+		remaining = append(remaining, c.sites[:i]...)
+		remaining = append(remaining, c.sites[i+1:]...)
+		c.sites = remaining
+		break
 	}
 	if removed == nil {
 		c.mu.Unlock()
 		return false
 	}
-	c.sites = filtered
 	c.ns = namespace.New(c.sites...)
 	c.metricsSiteCount(len(c.sites))
 	c.mu.Unlock()
 
+	// Close outside the lock: Close talks to the network and can block, and
+	// holding c.mu across it stalls every read and write on the coordinator.
+	// Keep it that way (#95 exists because Close does not).
 	if err := removed.Close(); err != nil {
 		slog.Warn("coordinator: RemoveSite close", "site", name, "error", err)
 	}
