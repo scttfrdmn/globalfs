@@ -8,6 +8,11 @@
 // archive pipeline (tar.zst) for higher-throughput, compressed inter-site
 // transfers.
 //
+// A transfer re-checks the source immediately before the destination PUT and
+// abandons itself if the key has gone, so a delete that lands while the bytes are
+// in flight is not undone by the write that follows it (#92).  See transfer and
+// sourceStillHasKey for the residual window this leaves.
+//
 // # Lifecycle
 //
 // A Worker is single-use.  It moves through exactly three states, in one
@@ -77,6 +82,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -84,6 +90,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	objectfssdk "github.com/scttfrdmn/objectfs/sdks/go/objectfs"
 
 	"github.com/scttfrdmn/globalfs/pkg/site"
 )
@@ -624,6 +632,40 @@ func shortChecksum(s string) string {
 	return s[:n] + "..."
 }
 
+// sourceStillHasKey reports whether the source site still holds job.Key, as a
+// last check before the destination PUT.
+//
+// It is deliberately asymmetric.  Only an unambiguous "no such key" answers
+// false: the site was reached and it says the object is absent, which is the one
+// case where writing it to the destination would be a resurrection.  Every other
+// error — timeout, throttle, auth, a backend that reports absence without the
+// objectfs code — answers true and the transfer proceeds, because treating an
+// unreachable source as a delete would silently drop replication for the whole
+// duration of an outage.  The asymmetry follows from the costs: a spurious
+// abandonment loses a replica with no record beyond one log line and no retry,
+// while a spurious PUT re-creates an object the caller was told was erased.  The
+// second is worse, but only the first is *caused* by guessing wrong about a
+// source that is merely unwell.
+//
+// This narrows the resurrection window from the whole GET → PUT span — which can
+// be minutes for a large object, or the queue wait plus two retry backoffs — to
+// the Head → Put gap.  It does not close it.  A delete that lands inside that gap
+// still resurrects the object, and no amount of re-checking fixes that: the fix
+// is for Delete to invalidate the queued jobs for the key, which needs a durable
+// record of the delete that no shipped deployment has (#92).
+func sourceStillHasKey(ctx context.Context, job ReplicationJob) bool {
+	_, err := job.SourceSite.Head(ctx, job.Key)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, objectfssdk.ErrNotFound) {
+		return false
+	}
+	slog.Warn("replication: pre-PUT source check failed; proceeding with the transfer",
+		"key", job.Key, "src", job.SourceSite.Name(), "error", err)
+	return true
+}
+
 // transfer performs the actual byte movement: GET from source, PUT to dest.
 // Returns the SHA-256 hex of the transferred content and any error.
 //
@@ -635,6 +677,25 @@ func shortChecksum(s string) string {
 // v0.1.0 slow path: simple GET → PUT over the SiteMount interface.
 // Future: replace with CargoShip streaming archive pipeline for large-scale,
 // compressed inter-site transfers (tracked in globalfs #3 follow-on).
+//
+// # Concurrent delete
+//
+// Between the GET and the PUT the object can be deleted, and a PUT that lands
+// after the delete completed everywhere re-creates it at the destination — a
+// site the operator was not looking at, with no error anywhere, which
+// Coordinator.Get then serves from because any replica satisfies a read (#92).
+// The source is therefore re-checked immediately before the PUT and the transfer
+// is abandoned if the key is gone.  See sourceStillHasKey for what that check
+// can and cannot establish, and why it is a narrowing rather than a fix: the
+// Head → Put gap remains, and closing it needs the delete path to invalidate
+// queued jobs, which needs somewhere durable to record delete state.
+//
+// An abandoned transfer is not an error.  It returns ("", nil), so the job
+// settles as EventCompleted with no content hash: there is nothing left to
+// transfer, nothing for the retry loop to achieve, and no hash to record for
+// dedup because no bytes were written.  Reporting it as a failure would spend
+// three attempts and two backoffs re-discovering the same absence and would
+// show an ordinary race as a replication fault.
 func transfer(ctx context.Context, job ReplicationJob) (string, error) {
 	// Fast path: compare checksums before transferring.
 	srcInfo, srcErr := job.SourceSite.Head(ctx, job.Key)
@@ -654,6 +715,18 @@ func transfer(ctx context.Context, job ReplicationJob) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("get from %q: %w", job.SourceSite.Name(), err)
 	}
+
+	// Re-check the source before writing.  The GET above may have returned
+	// minutes ago — the job could have waited in the queue, and each retry
+	// re-runs this whole function — and a Delete in that window has already
+	// removed the object from every site by the time we get here (#92).
+	if !sourceStillHasKey(ctx, job) {
+		slog.Info("replication: abandoning transfer; the object is gone from the source",
+			"key", job.Key, "src", job.SourceSite.Name(), "dst", job.DestSite.Name(),
+			"bytes", len(data))
+		return "", nil
+	}
+
 	if err := job.DestSite.Put(ctx, job.Key, data); err != nil {
 		return "", fmt.Errorf("put to %q: %w", job.DestSite.Name(), err)
 	}
