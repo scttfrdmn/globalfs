@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -104,6 +105,80 @@ func (e *APIError) Error() string {
 // apiKeyHeader is the HTTP request header used for authentication.
 const apiKeyHeader = "X-GlobalFS-API-Key"
 
+// ErrUnexpectedRedirect reports that the coordinator answered with a redirect,
+// which this client refuses to follow.
+//
+// The GlobalFS API has no legitimate redirects, so one is either a
+// misconfiguration — a reverse proxy in front of the coordinator rewriting or
+// canonicalising the path — or an attempt to steer a request somewhere else.
+// Both are better reported to the caller than transparently obeyed.
+//
+// Following one is not neutral.  Go's http.Client replays the method *and* the
+// X-GlobalFS-API-Key header on a 307, so a redirect turns into a second,
+// differently-targeted, still-authenticated request.  That is the mechanism that
+// made #73 exploitable: against a server that path-cleaned ".." into a 307,
+// DeleteObject(ctx, "../sites/primary") followed the redirect and deregistered a
+// site, returning nil.  #73 closed that on the server, so this is hardening for
+// a pre-#73 or misconfigured coordinator rather than a live hole against a
+// current one — but the credential is carried by the client, and the client is
+// where the decision to hand it to a new target is made.
+//
+// The error names the redirect target, since a proxy misconfiguration is the
+// likely cause and the Location is the thing that identifies it.
+var ErrUnexpectedRedirect = errors.New("coordinator returned an unexpected redirect")
+
+// ErrInvalidKey reports that an object key was rejected locally, before any
+// request was sent.
+//
+// The rule matches the coordinator's own validateObjectKey — no ".." path
+// components and no null bytes — deliberately: a client should not send a
+// request it already knows the server must refuse, and a local failure is
+// immediate and unambiguous where a 400 from a coordinator the caller may not
+// control is neither.  Against a server that does *not* refuse it, this is the
+// check that stops the request being made at all.
+var ErrInvalidKey = errors.New("invalid object key")
+
+// validateKey rejects object keys that could escape their intended path.
+//
+// Same rule, and same reasoning, as cmd/coordinator's validateObjectKey: a ".."
+// component can be path-cleaned by an intermediary or a server's mux into a
+// different route, and a null byte truncates the key for anything downstream
+// written in C.  Both are checked on the literal key the caller passed, which is
+// the only spelling this client has — it does not percent-encode the key when
+// building the URL, so nothing here can hide behind an escape.
+func validateKey(key string) error {
+	if strings.Contains(key, "\x00") {
+		return fmt.Errorf("%w %q: contains null byte", ErrInvalidKey, key)
+	}
+	for _, part := range strings.Split(key, "/") {
+		if part == ".." {
+			return fmt.Errorf("%w %q: contains path traversal component", ErrInvalidKey, key)
+		}
+	}
+	return nil
+}
+
+// refuseRedirects is the http.Client CheckRedirect policy: never follow, and
+// report where the redirect pointed.
+//
+// Returning an error rather than http.ErrUseLastResponse is the choice that makes
+// the condition impossible to miss.  ErrUseLastResponse would surface the 307 as
+// an ordinary *APIError, which every call site would then have to recognise as a
+// redirect on its own; an error here means no follow-up request is ever built —
+// CheckRedirect runs before it is sent — and so the API key is never put on the
+// wire a second time.
+//
+// via[0] is the original request, which is the useful thing to name alongside the
+// target: "this is where you asked to go, this is where you were sent".
+func refuseRedirects(req *http.Request, via []*http.Request) error {
+	from := ""
+	if len(via) > 0 && via[0].URL != nil {
+		from = via[0].URL.String()
+	}
+	return fmt.Errorf("%w: %s -> %s (not followed; the API key is not replayed)",
+		ErrUnexpectedRedirect, from, req.URL)
+}
+
 // ── Client ────────────────────────────────────────────────────────────────────
 
 // Client communicates with a GlobalFS coordinator over HTTP.
@@ -117,6 +192,13 @@ type Client struct {
 type Option func(*Client)
 
 // WithHTTPClient replaces the default *http.Client.
+//
+// The supplied client is not used directly: New takes a shallow copy and, if the
+// copy has no CheckRedirect of its own, installs the no-redirect policy on it.
+// The copy shares the Transport, so connection pooling and any custom
+// RoundTripper are preserved, and the caller's client is left unmodified.  A
+// caller that sets CheckRedirect keeps it — including one that deliberately
+// follows redirects, which is then their decision and not a default.
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
 }
@@ -141,6 +223,11 @@ func (c *Client) setAPIKey(req *http.Request) {
 
 // New creates a Client that speaks to the coordinator at coordinatorAddr.
 // coordinatorAddr should include scheme and host, e.g. "http://localhost:8090".
+//
+// The returned Client does not follow HTTP redirects: a 3xx with a Location is
+// reported as an error wrapping [ErrUnexpectedRedirect] rather than obeyed, so
+// the API key is never replayed to a target the coordinator (or an intermediary)
+// chose.  See ErrUnexpectedRedirect for why that matters (#132).
 func New(coordinatorAddr string, opts ...Option) *Client {
 	c := &Client{
 		baseURL:    strings.TrimRight(coordinatorAddr, "/"),
@@ -148,6 +235,19 @@ func New(coordinatorAddr string, opts ...Option) *Client {
 	}
 	for _, o := range opts {
 		o(c)
+	}
+	// Applied after the options, so a client supplied by WithHTTPClient is covered
+	// too — that is the path a caller most plausibly uses to install a custom
+	// Transport, and it would otherwise silently opt out of the policy.  Copying
+	// rather than mutating keeps the caller's own *http.Client untouched: it may be
+	// shared with unrelated code that does want redirects.
+	if c.httpClient == nil {
+		c.httpClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	if c.httpClient.CheckRedirect == nil {
+		hc := *c.httpClient
+		hc.CheckRedirect = refuseRedirects
+		c.httpClient = &hc
 	}
 	return c
 }
@@ -269,7 +369,13 @@ func (c *Client) Status(ctx context.Context) (StatusResponse, error) {
 // mid-body, or a body shorter than the advertised Content-Length, is reported as
 // an error and the partial bytes are discarded (#74).  Callers can therefore
 // treat a nil error as meaning the returned slice is the whole object.
+//
+// A key containing a ".." component or a null byte is rejected locally, without
+// any request being sent; the returned error wraps [ErrInvalidKey] (#132).
 func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
+	if err := validateKey(key); err != nil {
+		return nil, err
+	}
 	resp, err := c.doGet(ctx, "/api/v1/objects/"+key)
 	if err != nil {
 		return nil, err
@@ -304,7 +410,12 @@ func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 }
 
 // PutObject stores data under key. It returns nil on success.
+//
+// An invalid key is rejected locally; see GetObject and [ErrInvalidKey].
 func (c *Client) PutObject(ctx context.Context, key string, data []byte) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
 	resp, err := c.doPut(ctx, "/api/v1/objects/"+key, data)
 	if err != nil {
 		return err
@@ -315,7 +426,12 @@ func (c *Client) PutObject(ctx context.Context, key string, data []byte) error {
 
 // HeadObject returns metadata for the object at key without fetching its
 // content. The returned ObjectInfo is populated from HTTP response headers.
+//
+// An invalid key is rejected locally; see GetObject and [ErrInvalidKey].
 func (c *Client) HeadObject(ctx context.Context, key string) (*ObjectInfo, error) {
+	if err := validateKey(key); err != nil {
+		return nil, err
+	}
 	resp, err := c.doHead(ctx, "/api/v1/objects/"+key)
 	if err != nil {
 		return nil, err
@@ -342,7 +458,14 @@ func (c *Client) HeadObject(ctx context.Context, key string) (*ObjectInfo, error
 }
 
 // DeleteObject removes the object at key. It returns nil on success.
+//
+// An invalid key is rejected locally, without a request being sent — this is the
+// method the #73 exploit used, as DeleteObject(ctx, "../sites/primary"), and the
+// destructive one of the four.  See [ErrInvalidKey].
 func (c *Client) DeleteObject(ctx context.Context, key string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
 	resp, err := c.doDelete(ctx, "/api/v1/objects/"+key)
 	if err != nil {
 		return err

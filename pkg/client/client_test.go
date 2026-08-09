@@ -971,3 +971,320 @@ func TestWithAPIKey_SetsHeaderOnAllMethods(t *testing.T) {
 		t.Errorf("expected 4 requests, got %d", len(gotKeys))
 	}
 }
+
+// ── Redirects are not followed (#132) ─────────────────────────────────────────
+
+// TestRedirect_NotFollowed is the core #132 assertion: a coordinator that answers
+// with a redirect gets an error, not a second request.
+//
+// The redirect target here is the site route, which is the #73 shape exactly: a
+// server that path-cleans "../sites/primary" answers 307 with
+// Location=/api/v1/sites/primary, and Go's default policy replays both the method
+// and X-GlobalFS-API-Key, turning an object DELETE into a site deregistration
+// that returns nil.  #73 closed that on the server, so this is the client half —
+// what keeps the same exploit from working against a pre-#73 or misconfigured
+// coordinator.
+//
+// The assertion is a request count of one.  A status-code assertion would not
+// distinguish "refused to follow" from "followed, and the target answered".
+func TestRedirect_NotFollowed(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if strings.HasPrefix(r.URL.Path, "/api/v1/objects/") {
+			http.Redirect(w, r, "/api/v1/sites/primary", http.StatusTemporaryRedirect)
+			return
+		}
+		// The redirect target: succeeds if it is ever reached, so a followed
+		// redirect shows up as a nil error rather than an incidental failure.
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL)
+	err := c.DeleteObject(context.Background(), "data/x")
+	if err == nil {
+		t.Fatal("DeleteObject returned nil against a 307 — the redirect was followed and " +
+			"the deregistration it pointed at reported success (#132)")
+	}
+	if !errors.Is(err, client.ErrUnexpectedRedirect) {
+		t.Errorf("error does not wrap ErrUnexpectedRedirect: %v", err)
+	}
+	// The Location is named, because a proxy in front of the coordinator is the
+	// likely cause and the target is what identifies it.
+	if !strings.Contains(err.Error(), "/api/v1/sites/primary") {
+		t.Errorf("error does not name the redirect target, which is what diagnoses a "+
+			"misconfigured proxy: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != 1 {
+		t.Fatalf("server saw %d requests, want 1: %v", len(paths), paths)
+	}
+	if paths[0] != "/api/v1/objects/data/x" {
+		t.Errorf("first request path = %q, want the object path", paths[0])
+	}
+}
+
+// TestRedirect_APIKeyNotReplayed is the credential half of #132.  Go strips
+// sensitive headers when a redirect crosses to a different host, but not on a
+// same-host redirect, and it gives a custom Authorization-style header like
+// X-GlobalFS-API-Key no special treatment at all — so pre-fix the key was handed
+// to whatever Location the server named.
+//
+// Both assertions matter: one request total, and the key present on that one.  A
+// client that stopped sending the key at all would also satisfy "never appears on
+// a second request".
+func TestRedirect_APIKeyNotReplayed(t *testing.T) {
+	const key = "secret-key"
+	var mu sync.Mutex
+	var keysSeen []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keysSeen = append(keysSeen, r.Header.Get("X-GlobalFS-API-Key"))
+		mu.Unlock()
+		http.Redirect(w, r, "/api/v1/sites/primary", http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, client.WithAPIKey(key))
+	if _, err := c.GetObject(context.Background(), "data/x"); err == nil {
+		t.Fatal("GetObject returned nil against a 307")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keysSeen) != 1 {
+		t.Fatalf("the API key was sent on %d requests, want 1 — a redirect must not "+
+			"replay the credential (#132): %v", len(keysSeen), keysSeen)
+	}
+	if keysSeen[0] != key {
+		t.Errorf("first request carried key %q, want %q; the test would pass vacuously "+
+			"if the key were never sent at all", keysSeen[0], key)
+	}
+}
+
+// TestRedirect_AllMethodsRefuse covers every method, not only the one #73 used.
+// The policy lives on the http.Client, so this is really a guard against a future
+// doX helper being given its own client or its own policy.
+func TestRedirect_AllMethodsRefuse(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		http.Redirect(w, r, "/api/v1/sites/primary", http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL)
+	ctx := context.Background()
+
+	calls := map[string]func() error{
+		"GetObject":    func() error { _, err := c.GetObject(ctx, "k"); return err },
+		"PutObject":    func() error { return c.PutObject(ctx, "k", []byte("v")) },
+		"DeleteObject": func() error { return c.DeleteObject(ctx, "k") },
+		"HeadObject":   func() error { _, err := c.HeadObject(ctx, "k"); return err },
+		"ListObjects":  func() error { _, err := c.ListObjects(ctx, "", 0); return err },
+		"ListSites":    func() error { _, err := c.ListSites(ctx); return err },
+		"AddSite":      func() error { _, err := c.AddSite(ctx, client.AddSiteRequest{Name: "s"}); return err },
+		"RemoveSite":   func() error { return c.RemoveSite(ctx, "s") },
+		"Replicate":    func() error { _, err := c.Replicate(ctx, client.ReplicateRequest{Key: "k"}); return err },
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			err := call()
+			if err == nil {
+				t.Fatalf("%s returned nil against a 307", name)
+			}
+			if !errors.Is(err, client.ErrUnexpectedRedirect) {
+				t.Errorf("%s: error does not wrap ErrUnexpectedRedirect: %v", name, err)
+			}
+		})
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != len(calls) {
+		t.Errorf("server saw %d requests for %d calls; a followed redirect makes more "+
+			"than one request per call", requests, len(calls))
+	}
+}
+
+// TestRedirect_PolicyAppliesToWithHTTPClient covers the path a caller most
+// plausibly uses to install a custom Transport.  A client supplied through
+// WithHTTPClient must not silently opt out of the policy — that would make the
+// hardening depend on which constructor options happened to be used.
+func TestRedirect_PolicyAppliesToWithHTTPClient(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		http.Redirect(w, r, "/api/v1/sites/primary", http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	supplied := &http.Client{Timeout: 5 * time.Second}
+	c := client.New(srv.URL, client.WithHTTPClient(supplied))
+
+	if err := c.DeleteObject(context.Background(), "k"); !errors.Is(err, client.ErrUnexpectedRedirect) {
+		t.Errorf("WithHTTPClient bypassed the redirect policy: %v", err)
+	}
+	// The caller's own client must be left alone: it may be shared with code that
+	// does want redirects.
+	if supplied.CheckRedirect != nil {
+		t.Error("New mutated the caller's *http.Client instead of copying it")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 1 {
+		t.Errorf("server saw %d requests, want 1", requests)
+	}
+}
+
+// TestRedirect_CallerCheckRedirectIsRespected is the escape hatch.  A caller who
+// sets CheckRedirect has made a decision, and New must not override it — the
+// no-redirect policy is a default, not a prohibition.
+func TestRedirect_CallerCheckRedirectIsRespected(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		n := requests
+		mu.Unlock()
+		if n == 1 {
+			http.Redirect(w, r, "/api/v1/objects/elsewhere", http.StatusTemporaryRedirect)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	follow := &http.Client{
+		Timeout:       5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return nil },
+	}
+	c := client.New(srv.URL, client.WithHTTPClient(follow))
+
+	if err := c.DeleteObject(context.Background(), "k"); err != nil {
+		t.Errorf("a caller-supplied CheckRedirect was overridden: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 2 {
+		t.Errorf("server saw %d requests, want 2 (the redirect should have been followed)", requests)
+	}
+}
+
+// ── Client-side key validation (#132) ─────────────────────────────────────────
+
+// TestObjectKey_TraversalRejectedLocally asserts that a key the server must
+// refuse is never sent.  The first case is the #73 exploit's own argument:
+// DeleteObject(ctx, "../sites/primary").
+//
+// A request count of zero is the assertion, not a status code.  Making the
+// request and getting a 400 back would produce an error too, and against a
+// coordinator that does *not* refuse it would produce a site deregistration.
+func TestObjectKey_TraversalRejectedLocally(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		// Stands in for a pre-#73 coordinator: obeys whatever it is asked.
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL)
+	ctx := context.Background()
+
+	keys := []string{
+		"../sites/primary",
+		"a/../../sites/primary",
+		"data/..",
+		"..",
+		"data/\x00/x",
+		"\x00",
+	}
+	for _, key := range keys {
+		t.Run(strconv.Quote(key), func(t *testing.T) {
+			for name, call := range map[string]func() error{
+				"DeleteObject": func() error { return c.DeleteObject(ctx, key) },
+				"GetObject":    func() error { _, err := c.GetObject(ctx, key); return err },
+				"PutObject":    func() error { return c.PutObject(ctx, key, []byte("v")) },
+				"HeadObject":   func() error { _, err := c.HeadObject(ctx, key); return err },
+			} {
+				err := call()
+				if err == nil {
+					t.Errorf("%s(%q) returned nil", name, key)
+					continue
+				}
+				if !errors.Is(err, client.ErrInvalidKey) {
+					t.Errorf("%s(%q): error does not wrap ErrInvalidKey: %v", name, key, err)
+				}
+			}
+		})
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 0 {
+		t.Errorf("the client sent %d request(s) for keys it knows the server must refuse; "+
+			"against a pre-#73 coordinator each one is the traversal (#132)", requests)
+	}
+}
+
+// TestObjectKey_LegitimateKeysStillWork is the regression guard on the check
+// above.  ".." as a substring rather than a whole path component is a legal S3
+// key, and so is a leading dot; rejecting those would break real callers to fix a
+// traversal they are not.
+func TestObjectKey_LegitimateKeysStillWork(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL)
+	keys := []string{
+		"data/genome.bam",
+		"data/..hidden",
+		"data/file..bak",
+		"data/...",
+		"a..b/c",
+		".hidden",
+	}
+	for _, key := range keys {
+		if err := c.DeleteObject(context.Background(), key); err != nil {
+			t.Errorf("DeleteObject(%q) rejected a legal S3 key: %v", key, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != len(keys) {
+		t.Errorf("server saw %d requests for %d legal keys: %v", len(paths), len(keys), paths)
+	}
+}
