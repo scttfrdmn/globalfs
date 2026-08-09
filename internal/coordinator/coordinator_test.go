@@ -2180,9 +2180,12 @@ func TestFilterByCircuitBreaker_AllowsClosedSites(t *testing.T) {
 	s2, _ := makeMount("b", types.SiteRoleBackup, nil)
 	cb := circuitbreaker.New(1, time.Hour)
 
-	got := filterByCircuitBreaker(cb, []*site.SiteMount{s1, s2})
+	got, bypass := filterByCircuitBreaker(cb, []*site.SiteMount{s1, s2})
 	if len(got) != 2 {
 		t.Errorf("expected 2 sites, got %d", len(got))
+	}
+	if bypass {
+		t.Error("all circuits closed: breaker should not be bypassed")
 	}
 }
 
@@ -2196,9 +2199,12 @@ func TestFilterByCircuitBreaker_FiltersOpenCircuit(t *testing.T) {
 	cb := circuitbreaker.New(1, time.Hour)
 	cb.RecordFailure("a") // open circuit for "a"
 
-	got := filterByCircuitBreaker(cb, []*site.SiteMount{s1, s2})
+	got, bypass := filterByCircuitBreaker(cb, []*site.SiteMount{s1, s2})
 	if len(got) != 1 || got[0].Name() != "b" {
 		t.Errorf("expected only site-b, got %v", siteNames(got))
+	}
+	if bypass {
+		t.Error("one usable circuit remains: breaker should not be bypassed")
 	}
 }
 
@@ -2213,9 +2219,15 @@ func TestFilterByCircuitBreaker_FallbackWhenAllOpen(t *testing.T) {
 	cb.RecordFailure("a")
 	cb.RecordFailure("b")
 
-	got := filterByCircuitBreaker(cb, []*site.SiteMount{s1, s2})
+	got, bypass := filterByCircuitBreaker(cb, []*site.SiteMount{s1, s2})
 	if len(got) != 2 {
 		t.Errorf("all-open fallback: expected 2 sites, got %d", len(got))
+	}
+	// The read loops must be told to stop consulting the breaker for this set,
+	// or they would ask permission of the very circuits it just judged unusable
+	// and attempt nothing at all (#94).
+	if !bypass {
+		t.Error("all-open fallback: expected bypass=true")
 	}
 }
 
@@ -2225,9 +2237,12 @@ func TestFilterByCircuitBreaker_NilBreakerPassesThrough(t *testing.T) {
 	t.Parallel()
 
 	s1, _ := makeMount("a", types.SiteRolePrimary, nil)
-	got := filterByCircuitBreaker(nil, []*site.SiteMount{s1})
+	got, bypass := filterByCircuitBreaker(nil, []*site.SiteMount{s1})
 	if len(got) != 1 {
 		t.Errorf("nil cb: expected 1 site, got %d", len(got))
+	}
+	if !bypass {
+		t.Error("nil cb: expected bypass=true so callers skip the breaker entirely")
 	}
 }
 
@@ -3863,5 +3878,307 @@ func TestCoordinator_Get_ConcurrentWritesNeverLeaveStaleCache(t *testing.T) {
 	if string(data) != final {
 		t.Errorf("final Get returned %q, want %q: a read-through fill outlived a "+
 			"later write, and with TTL defaulting to 0 nothing ages it out (#89)", data, final)
+	}
+}
+
+// ─── Circuit-breaker probe permits (#94) ───────────────────────────────────────
+//
+// Allow is a permit acquisition, not a predicate: on a HalfOpen circuit it takes
+// the single probe permit, which only a recorded outcome releases.  Asking it
+// about every candidate while the read paths use only the first site that answers
+// stranded a permit per unused site, and a stranded permit is never released — the
+// site was ejected from routing for the process lifetime while reporting HalfOpen,
+// so it did not even look tripped.
+
+// halfOpenBreaker returns a breaker in which name is Open with the cooldown
+// already elapsed, i.e. the next Allow would transition it to HalfOpen and take
+// its probe.  Built with a zero cooldown rather than a sleep so the test is not
+// timing-dependent.
+func halfOpenBreaker(name string) *circuitbreaker.Breaker {
+	cb := circuitbreaker.New(1, 0)
+	cb.RecordFailure(name) // → Open, cooldown 0, so immediately probe-eligible
+	return cb
+}
+
+// TestCoordinator_Get_UnusedSiteKeepsItsProbePermit is the #94 acceptance test.
+//
+// An earlier site answers, so a later site whose circuit is probe-eligible is
+// never read.  Its permit must still be available afterwards.  Before the fix the
+// up-front Allow consumed it, nothing recorded an outcome, and the site was
+// unroutable from then on.
+func TestCoordinator_Get_UnusedSiteKeepsItsProbePermit(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"k": []byte("from-primary"),
+	})
+	backup, _ := makeMount("backup", types.SiteRoleBackup, map[string][]byte{
+		"k": []byte("from-backup"),
+	})
+
+	cb := halfOpenBreaker("backup")
+	c := New(primary, backup)
+	c.SetCircuitBreaker(cb)
+	ctx := context.Background()
+
+	data, err := c.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(data) != "from-primary" {
+		t.Fatalf("precondition: expected the primary to answer, got %q", data)
+	}
+
+	// The backup was never read, so its probe permit was never spent.
+	if !cb.Allow("backup") {
+		t.Fatal("backup's probe permit was consumed by a Get that never read it; " +
+			"the site is now unroutable until the process restarts (#94)")
+	}
+	cb.RecordSuccess("backup")
+
+	// And the permit is real: a Get that has to fall through reaches the site.
+	primaryClient := &memClient{getErr: errors.New("primary down"), objects: map[string][]byte{}}
+	c2 := New(site.New("primary", types.SiteRolePrimary, primaryClient), backup)
+	c2.SetCircuitBreaker(cb)
+	got, err := c2.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("fall-through Get: %v", err)
+	}
+	if string(got) != "from-backup" {
+		t.Errorf("fall-through Get: got %q, want from-backup", got)
+	}
+}
+
+// TestCoordinator_Get_RepeatedReadsDoNotExhaustUnusedSites is the cumulative form
+// of the same bug: the permit leak was permanent, so under the old behaviour the
+// unused site was unroutable after the *first* Get and stayed that way.
+func TestCoordinator_Get_RepeatedReadsDoNotExhaustUnusedSites(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"k": []byte("from-primary"),
+	})
+	backup, _ := makeMount("backup", types.SiteRoleBackup, map[string][]byte{
+		"k": []byte("from-backup"),
+	})
+
+	cb := halfOpenBreaker("backup")
+	c := New(primary, backup)
+	c.SetCircuitBreaker(cb)
+	ctx := context.Background()
+
+	for i := 0; i < 10; i++ {
+		if _, err := c.Get(ctx, "k"); err != nil {
+			t.Fatalf("Get %d: %v", i, err)
+		}
+	}
+
+	// Allow is the assertion, not State.  State cannot see this bug: it persists
+	// the Open → HalfOpen transition itself once the cooldown has elapsed, so it
+	// reports HalfOpen for a healthy probe-eligible site and for one holding a
+	// stranded permit alike.  Only Allow distinguishes them, which is exactly why
+	// the leak did not look like a tripped breaker to an operator reading
+	// /api/v1/sites (#94).
+	if !cb.Allow("backup") {
+		t.Error("backup refuses a probe after 10 reads that never touched it; the " +
+			"permit taken by the first Get was never released and never will be (#94)")
+	}
+}
+
+// TestCoordinator_Head_UnusedSiteKeepsItsProbePermit covers the same shape in
+// Head, which is first-hit-wins for the same reason and leaked the same way.
+func TestCoordinator_Head_UnusedSiteKeepsItsProbePermit(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"k": []byte("data"),
+	})
+	backup, _ := makeMount("backup", types.SiteRoleBackup, map[string][]byte{
+		"k": []byte("data"),
+	})
+
+	cb := halfOpenBreaker("backup")
+	c := New(primary, backup)
+	c.SetCircuitBreaker(cb)
+
+	if _, err := c.Head(context.Background(), "k"); err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+	if !cb.Allow("backup") {
+		t.Error("backup's probe permit was consumed by a Head that never read it (#94)")
+	}
+}
+
+// TestCoordinator_List_DoesNotConsumeProbePermits covers the worst case of the
+// three, which the filed issue did not mention: List called Allow for every
+// candidate and then handed the whole set to the Namespace merge, recording an
+// outcome for none of them.  Every probe-eligible site in a routed set leaked.
+//
+// List is now a pure consumer of breaker state — it filters Open circuits and
+// takes no permits.  See the List doc comment for why recording outcomes there is
+// not a viable alternative.
+func TestCoordinator_List_DoesNotConsumeProbePermits(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"data/a": []byte("a"),
+	})
+	backup, _ := makeMount("backup", types.SiteRoleBackup, map[string][]byte{
+		"data/b": []byte("b"),
+	})
+
+	cb := circuitbreaker.New(1, 0)
+	cb.RecordFailure("primary")
+	cb.RecordFailure("backup")
+
+	c := New(primary, backup)
+	c.SetCircuitBreaker(cb)
+
+	items, err := c.List(context.Background(), "data/", 0)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(items) != 2 {
+		t.Errorf("List: got %d items, want 2 (%v)", len(items), items)
+	}
+
+	for _, name := range []string{"primary", "backup"} {
+		if !cb.Allow(name) {
+			t.Errorf("%s's probe permit was consumed by List, which records no "+
+				"outcome for any site and so could never release it (#94)", name)
+		}
+		cb.RecordSuccess(name)
+	}
+}
+
+// TestCoordinator_Get_ProbeOutcomeIsRecordedForTheSiteRead verifies the other half
+// of the pairing: a permit that *is* taken must be released.  A read whose probe
+// succeeds closes the circuit.
+func TestCoordinator_Get_ProbeOutcomeIsRecordedForTheSiteRead(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"k": []byte("v"),
+	})
+	cb := halfOpenBreaker("primary")
+
+	c := New(primary)
+	c.SetCircuitBreaker(cb)
+
+	if _, err := c.Get(context.Background(), "k"); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := cb.State("primary"); got != circuitbreaker.StateClosed {
+		t.Errorf("circuit after a successful probe read: got %v, want closed", got)
+	}
+}
+
+// TestCoordinator_Get_MissingKeyDoesNotFailTheProbe is the #77 interaction the
+// issue flagged: the outcome recorded for a probe must not count a not-found as a
+// failure, or the fix trades a permit leak for a breaker that re-opens on every
+// lookup of an absent key.
+func TestCoordinator_Get_MissingKeyDoesNotFailTheProbe(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil) // empty site
+	cb := halfOpenBreaker("primary")
+
+	c := New(primary)
+	c.SetCircuitBreaker(cb)
+
+	_, err := c.Get(context.Background(), "absent")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get of an absent key: got %v, want ErrNotFound", err)
+	}
+	if got := cb.State("primary"); got != circuitbreaker.StateClosed {
+		t.Errorf("circuit after a probe that answered \"no such key\": got %v, "+
+			"want closed — the site answered, which is what the breaker measures "+
+			"(#77, #94)", got)
+	}
+}
+
+// TestCoordinator_Get_AllCircuitsBusyStillReadsASite covers the case the lazy
+// acquisition introduced that the up-front filter could not have: every candidate
+// passes the Open check when the list is built, then refuses the attempt because a
+// concurrent goroutine holds its probe.  The read must still reach a site — a read
+// that attempted nothing cannot tell "absent" from "unreachable", and reporting
+// ErrNotFound for an object that exists is the one answer it must never give.
+func TestCoordinator_Get_AllCircuitsBusyStillReadsASite(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"k": []byte("v"),
+	})
+	cb := circuitbreaker.New(1, 0)
+	cb.RecordFailure("primary")
+	// Take the probe as a concurrent reader would, and never record an outcome.
+	// State is now HalfOpen (so the site survives the Open filter) but Allow
+	// refuses (so the attempt has no permit).
+	if !cb.Allow("primary") {
+		t.Fatal("precondition: expected the probe to be available")
+	}
+	if got := cb.State("primary"); got != circuitbreaker.StateHalfOpen {
+		t.Fatalf("precondition: expected HalfOpen, got %v", got)
+	}
+
+	c := New(primary)
+	c.SetCircuitBreaker(cb)
+
+	data, err := c.Get(context.Background(), "k")
+	if err != nil {
+		t.Fatalf("Get with every candidate's probe outstanding: %v", err)
+	}
+	if string(data) != "v" {
+		t.Errorf("got %q, want v", data)
+	}
+}
+
+// TestCoordinator_Get_ConcurrentReadsDoNotStrandPermits is the unsynchronised
+// check: many concurrent reads against a probe-eligible multi-site set, where the
+// first site always answers.  Whatever the interleaving, no site may be left
+// holding a permit once the reads are done.
+func TestCoordinator_Get_ConcurrentReadsDoNotStrandPermits(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"k": []byte("v"),
+	})
+	backup, _ := makeMount("backup", types.SiteRoleBackup, map[string][]byte{
+		"k": []byte("v"),
+	})
+	burst, _ := makeMount("burst", types.SiteRoleBurst, map[string][]byte{
+		"k": []byte("v"),
+	})
+
+	cb := circuitbreaker.New(1, 0)
+	for _, name := range []string{"primary", "backup", "burst"} {
+		cb.RecordFailure(name)
+	}
+
+	c := New(primary, backup, burst)
+	c.SetCircuitBreaker(cb)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				if _, err := c.Get(ctx, "k"); err != nil {
+					t.Errorf("Get: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, name := range []string{"primary", "backup", "burst"} {
+		if !cb.Allow(name) {
+			t.Errorf("%s is holding a stranded probe permit after 160 concurrent "+
+				"reads (#94)", name)
+		}
+		cb.RecordSuccess(name)
 	}
 }

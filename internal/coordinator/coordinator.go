@@ -68,6 +68,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"iter"
 	"log/slog"
 	"sync"
 	"time"
@@ -1262,14 +1263,14 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 
 	healthReport, _ := c.HealthStatus()
 	ordered = preferHealthySites(ordered, healthReport)
-	ordered = filterByCircuitBreaker(cb, ordered)
+	ordered, cbBypass := filterByCircuitBreaker(cb, ordered)
 
 	var lastErr error
 	// allNotFound stays true while every site tried has answered "no such key".
 	// It distinguishes "the object does not exist" from "no site could answer",
 	// which the API layer needs to tell a 404 from a 502 (#77).
 	allNotFound := true
-	for _, s := range ordered {
+	for s := range attemptableSites(cb, ordered, cbBypass) {
 		var data []byte
 		siteErr := doWithRetry(ctx, retryCfg, func() error {
 			var err error
@@ -1537,6 +1538,24 @@ func (c *Coordinator) Delete(ctx context.Context, key string) error {
 // rules, health state, and breaker state all apply consistently to List —
 // the same way they do for Get and Head.
 // Pass limit ≤ 0 to retrieve all matching objects.
+//
+// # Circuit breaker
+//
+// List reads breaker state but never acquires a probe permit, and records no
+// outcomes.  It is a pure consumer of the state Get, Head, Put and Delete
+// maintain.  That is deliberate rather than an omission (#94):
+//
+//   - It cannot leak permits, which is what it used to do worst of all the read
+//     paths — it asked Allow for every candidate and then handed the whole set to
+//     the Namespace merge, recording nothing for any of them.
+//   - It could not reliably record them either.  [namespace.Namespace.List] folds
+//     per-site failures into one joined error for the merge, so List cannot
+//     attribute an outcome back to the site it came from without reimplementing
+//     the merge.
+//   - A HalfOpen site therefore stays listable while its probe is outstanding.
+//     Including it can only add keys to a merged listing that already tolerates
+//     unreachable sites, whereas excluding it silently truncates the namespace —
+//     the failure mode List must not have.
 func (c *Coordinator) List(ctx context.Context, prefix string, limit int) ([]objectfstypes.ObjectInfo, error) {
 	c.mu.RLock()
 	snapshot, pol, cb := c.snapshotSites(), c.policy, c.cb
@@ -1551,7 +1570,7 @@ func (c *Coordinator) List(ctx context.Context, prefix string, limit int) ([]obj
 
 	healthReport, _ := c.HealthStatus()
 	routed = preferHealthySites(routed, healthReport)
-	routed = filterByCircuitBreaker(cb, routed)
+	routed, _ = filterByCircuitBreaker(cb, routed)
 
 	// Merge from the policy-selected sites only.
 	ns := namespace.New(routed...)
@@ -1579,11 +1598,14 @@ func (c *Coordinator) Head(ctx context.Context, key string) (*objectfstypes.Obje
 
 	healthReport, _ := c.HealthStatus()
 	ordered = preferHealthySites(ordered, healthReport)
-	ordered = filterByCircuitBreaker(cb, ordered)
+	ordered, cbBypass := filterByCircuitBreaker(cb, ordered)
 
 	var lastErr error
 	allNotFound := true
-	for _, s := range ordered {
+	// Lazy permit acquisition, paired one-to-one with recordSiteResult below.  Head
+	// has the same first-hit-wins shape as Get and leaked probe permits the same
+	// way (#94).
+	for s := range attemptableSites(cb, ordered, cbBypass) {
 		var info *objectfstypes.ObjectInfo
 		siteErr := doWithRetry(ctx, retryCfg, func() error {
 			var err error
@@ -1763,26 +1785,100 @@ func doWithRetry(ctx context.Context, cfg *retry.Config, fn func() error) error 
 }
 
 // filterByCircuitBreaker returns a filtered subset of sites whose circuits
-// are not open.  For HalfOpen sites, Allow is called which marks them as
-// probing so only one probe is in flight at a time.
+// are not open, and whether the breaker is being bypassed for that subset.
 //
-// If cb is nil, or if every site's circuit is open, the original slice is
-// returned unchanged so callers are never completely blocked by stale state.
-func filterByCircuitBreaker(cb *circuitbreaker.Breaker, sites []*site.SiteMount) []*site.SiteMount {
+// bypass is true when cb is nil, or when every site's circuit is open — in which
+// case the original slice is returned unchanged so callers are never completely
+// blocked by stale state.  That fallback is load-bearing: without it a window in
+// which every site had failed once would be a total read outage no recovery could
+// clear, because a site that is never tried never records the success that would
+// close its circuit.  Callers must not ask the breaker for permission when bypass
+// is set; the sites in the returned slice have already been judged unusable and
+// asking would refuse every one of them.
+//
+// The membership test is [circuitbreaker.Breaker.State], not Allow.  Allow is not
+// a predicate — on a HalfOpen circuit it *takes* the single probe permit, which
+// only a recorded outcome releases.  Asking it about every candidate while the
+// read paths use just the first site that answers leaked one permit per unused
+// site and ejected those sites from routing for the process lifetime, reporting
+// HalfOpen so they did not even look tripped (#94).  State answers the same
+// routing question and takes nothing; the permit is now acquired per attempt, in
+// the read loops, where it is paired with a recordSiteResult that releases it.
+func filterByCircuitBreaker(cb *circuitbreaker.Breaker, sites []*site.SiteMount) (allowed []*site.SiteMount, bypass bool) {
 	if cb == nil {
-		return sites
+		return sites, true
 	}
-	allowed := make([]*site.SiteMount, 0, len(sites))
+	allowed = make([]*site.SiteMount, 0, len(sites))
 	for _, s := range sites {
-		if cb.Allow(s.Name()) {
+		if cb.State(s.Name()) != circuitbreaker.StateOpen {
 			allowed = append(allowed, s)
 		}
 	}
 	if len(allowed) == 0 {
 		// All circuits open — fall back to all sites to avoid blocking callers.
-		return sites
+		return sites, true
 	}
-	return allowed
+	return allowed, false
+}
+
+// attemptableSites yields the sites a first-hit-wins read may try, in order,
+// having acquired each one's circuit-breaker probe permit as it is yielded.
+//
+// The caller must call [recordSiteResult] exactly once for every site it
+// receives, and must not skip a yielded site for any other reason.  That pairing
+// is what releases the permit and is the whole of the fix for #94: acquiring
+// permits for the whole candidate list up-front, as filterByCircuitBreaker used
+// to, stranded one for every site the read did not reach — and a stranded
+// HalfOpen permit is never released, so the site was excluded from routing for
+// the process lifetime while reporting HalfOpen rather than Open.
+//
+// Breaking out of the range (which every successful read does) simply stops the
+// iteration; no permit is taken for a site that is never yielded.
+//
+// bypass comes from filterByCircuitBreaker and means "do not consult the
+// breaker": either there is none, or every circuit was open and the caller is
+// deliberately ignoring them.
+//
+// If the breaker refuses every candidate, the sites are yielded a second time
+// with no permit required.  This is the lazy equivalent of
+// filterByCircuitBreaker's all-open fallback, and it is needed because the two
+// decisions are no longer simultaneous: a site that was non-Open when the
+// candidate list was built can refuse the attempt a moment later, and without the
+// second pass a read that reached no site at all would report the object as
+// absent — a 404 for data that exists.  Recording an outcome for a site whose
+// permit we did not hold can release a concurrent probe early, which the old
+// all-open fallback also did; the outcome is real evidence about the site either
+// way, and the alternative is worse.
+func attemptableSites(cb *circuitbreaker.Breaker, sites []*site.SiteMount, bypass bool) iter.Seq[*site.SiteMount] {
+	return func(yield func(*site.SiteMount) bool) {
+		if bypass {
+			for _, s := range sites {
+				if !yield(s) {
+					return
+				}
+			}
+			return
+		}
+
+		attempted := 0
+		for _, s := range sites {
+			if !cb.Allow(s.Name()) {
+				continue
+			}
+			attempted++
+			if !yield(s) {
+				return
+			}
+		}
+		if attempted > 0 {
+			return
+		}
+		for _, s := range sites {
+			if !yield(s) {
+				return
+			}
+		}
+	}
 }
 
 // partitionByRole splits sites into primary-role and non-primary slices,
