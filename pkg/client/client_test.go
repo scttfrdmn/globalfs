@@ -439,17 +439,19 @@ func rawServer(t *testing.T, response string) *client.Client {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			// Consume the request head; we do not care what it says.
-			conn.Read(make([]byte, 4096))
-			conn.Write([]byte(response))
-			conn.Close()
+			// Consume the request head; we do not care what it says.  Every
+			// error here is ignored on purpose: the client is the subject of the
+			// test, and a failure on this side surfaces as a client-side error.
+			_, _ = conn.Read(make([]byte, 4096))
+			_, _ = conn.Write([]byte(response))
+			_ = conn.Close()
 		}
 	}()
 	return client.New("http://" + ln.Addr().String())
@@ -569,7 +571,7 @@ func TestGetObject_ExactContentLength(t *testing.T) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
 		w.WriteHeader(http.StatusOK)
-		w.Write(payload)
+		_, _ = w.Write(payload)
 	})
 	c := newServer(t, mux)
 
@@ -620,11 +622,13 @@ func TestGetObject_ServerWriteTimeout(t *testing.T) {
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
 			w.WriteHeader(http.StatusOK)
-			w.Write(payload) // fails partway once WriteTimeout fires
+			// The error is expected — WriteTimeout fires partway through — and
+			// is asserted on the client side, which is the subject here.
+			_, _ = w.Write(payload)
 		}),
 	}
-	go srv.Serve(ln)
-	t.Cleanup(func() { srv.Close() })
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
 
 	// Throttle the client's reads so the server's write deadline expires while
 	// the body is still in flight.
