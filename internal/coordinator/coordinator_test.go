@@ -4182,3 +4182,59 @@ func TestCoordinator_Get_ConcurrentReadsDoNotStrandPermits(t *testing.T) {
 		cb.RecordSuccess(name)
 	}
 }
+
+// ── Put cache invalidation on the error path (#91) ────────────────────────────
+
+// TestCoordinator_Put_ErrorPathStillInvalidatesCache covers the three-way
+// disagreement in #91: with two primaries where the second fails, primary-1 holds
+// the new value, primary-2 holds the old one, Put reports failure — and the cache
+// went on serving the pre-Put value, because the invalidation sat after the early
+// return that the error path takes.
+//
+// The caller, the sites and the cache all disagreed, and with TTL defaulting to 0
+// the cache's version of events was permanent.
+func TestCoordinator_Put_ErrorPathStillInvalidatesCache(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	p1Client := newMemClient(map[string][]byte{"k": []byte("A")})
+	p1 := site.New("primary-1", types.SiteRolePrimary, p1Client)
+	p2Client := &memClient{putErr: errors.New("disk full"), objects: map[string][]byte{"k": []byte("A")}}
+	p2 := site.New("primary-2", types.SiteRolePrimary, p2Client)
+
+	c := New(p1, p2)
+	c.SetCache(cache.New(cache.Config{MaxBytes: 1024}))
+
+	// Populate the cache with the pre-Put value.
+	data, err := c.Get(ctx, "k")
+	if err != nil || string(data) != "A" {
+		t.Fatalf("priming Get: data=%q err=%v", data, err)
+	}
+
+	if err := c.Put(ctx, "k", []byte("B")); err == nil {
+		t.Fatal("Put: expected an error when the second primary refuses the write")
+	}
+
+	// primary-1 accepted the write, so "A" is no longer anything's current value.
+	// Read it through the mount rather than the map: the client's own lock is what
+	// makes that safe.
+	onPrimary1, err := p1.Get(ctx, "k", 0, 0)
+	if err != nil {
+		t.Fatalf("reading primary-1 directly: %v", err)
+	}
+	if string(onPrimary1) != "B" {
+		t.Fatalf("test setup is wrong: primary-1 should hold the new value, has %q", onPrimary1)
+	}
+
+	got, err := c.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("Get after the failed Put: %v", err)
+	}
+	if string(got) == "A" {
+		t.Error("Get served the pre-Put value from a cache that was never invalidated, even " +
+			"though primary-1 had already been mutated; with TTL 0 that is indefinite (#91)")
+	}
+	if string(got) != "B" {
+		t.Errorf("Get returned %q, want primary-1's %q", got, "B")
+	}
+}
