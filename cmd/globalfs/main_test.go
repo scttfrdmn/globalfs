@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/scttfrdmn/globalfs/pkg/client"
@@ -1038,5 +1039,151 @@ func TestFormatUptime(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("formatUptime(%v): got %q, want %q", tc.secs, got, tc.want)
 		}
+	}
+}
+
+// ─── object put: partial replication (#130) ───────────────────────────────────
+
+// runCmdSplit is runCmd with stdout and stderr captured separately, which the
+// tests below need: the point of the warning is that it does *not* land on
+// stdout, and a merged buffer cannot show that.  Stdin is a fixed payload so
+// `--input -` never reaches the real os.Stdin.
+func runCmdSplit(t *testing.T, addr string, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	root := buildRoot()
+	var out, errBuf bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&errBuf)
+	root.SetIn(strings.NewReader("payload"))
+	root.SetArgs(append([]string{"--coordinator-addr", addr}, args...))
+	err = root.Execute()
+	return out.String(), errBuf.String(), err
+}
+
+// putCounter counts PUTs seen by a test server.  Guarded because the handler runs
+// on the server's goroutine and the assertion on the test's.
+type putCounter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (p *putCounter) inc() {
+	p.mu.Lock()
+	p.n++
+	p.mu.Unlock()
+}
+
+func (p *putCounter) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.n
+}
+
+// putPartialServer answers every PUT with the coordinator's 202 for a stored but
+// un-replicated write, and counts requests so a retry is visible.
+func putPartialServer(t *testing.T, requests *putCounter) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		requests.inc()
+		w.Header().Set("X-GlobalFS-Replication", "pending")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, `{"key":"`+r.PathValue("key")+`",`+
+			`"status":"stored; replication incomplete",`+
+			`"detail":"stored on primaries but replication not queued for [backup]"}`)
+	})
+	return newTestServer(t, mux)
+}
+
+// TestObjectPut_ReplicationPendingIsNotAFailure is the end of the #130 round
+// trip: a 202 from the coordinator must reach the operator as a stored object
+// with a caveat, not as an error, and must exit 0 so `set -e` scripts do not
+// treat a committed write as a failed step.
+func TestObjectPut_ReplicationPendingIsNotAFailure(t *testing.T) {
+	var requests putCounter
+	addr := putPartialServer(t, &requests)
+
+	stdout, stderr, err := runCmdSplit(t, addr, "object", "put", "uploads/x", "--input", "-")
+	if err != nil {
+		t.Fatalf("object put reported a committed write as a failure: %v", err)
+	}
+	if !strings.Contains(stdout, "stored") {
+		t.Errorf("stdout does not report the object as stored: %q", stdout)
+	}
+	if !strings.Contains(stderr, "replication") {
+		t.Errorf("stderr does not mention the pending replication: %q", stderr)
+	}
+	if !strings.Contains(stderr, "do not re-upload") {
+		t.Errorf("stderr does not tell the operator the write is committed: %q", stderr)
+	}
+	// The caveat belongs on stderr; stdout stays the success line so anything
+	// parsing it is unaffected.
+	if strings.Contains(stdout, "warning") {
+		t.Errorf("the warning contaminated stdout: %q", stdout)
+	}
+	if got := requests.count(); got != 1 {
+		t.Errorf("server saw %d PUTs, want 1: a committed write must not be retried", got)
+	}
+}
+
+// TestObjectPut_ReplicationPendingJSON pins the machine-readable form, and that
+// the field is absent on an ordinary success so existing --json consumers are
+// unaffected.
+func TestObjectPut_ReplicationPendingJSON(t *testing.T) {
+	var requests putCounter
+	addr := putPartialServer(t, &requests)
+
+	stdout, _, err := runCmdSplit(t, addr, "object", "put", "k", "--input", "-", "--json")
+	if err != nil {
+		t.Fatalf("object put --json: %v", err)
+	}
+	var result objectPutResult
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("unmarshal %q: %v", stdout, err)
+	}
+	if !result.ReplicationPending {
+		t.Error("replication_pending is false for a 202")
+	}
+	if result.Detail == "" {
+		t.Error("detail is empty for a 202")
+	}
+	if result.Key != "k" {
+		t.Errorf("key = %q, want k", result.Key)
+	}
+
+	// An ordinary 201 must not grow the new fields.
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	})
+	okAddr := newTestServer(t, mux)
+
+	stdout, _, err = runCmdSplit(t, okAddr, "object", "put", "k", "--input", "-", "--json")
+	if err != nil {
+		t.Fatalf("object put --json (201): %v", err)
+	}
+	if strings.Contains(stdout, "replication_pending") {
+		t.Errorf("a fully replicated write emitted replication_pending: %q", stdout)
+	}
+}
+
+// TestObjectPut_RealFailureStillFails is the other half: the new success path
+// must not swallow a genuine write failure.
+func TestObjectPut_RealFailureStillFails(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"error":"disk full"}`)
+	})
+	addr := newTestServer(t, mux)
+
+	stdout, _, err := runCmdSplit(t, addr, "object", "put", "k", "--input", "-")
+	if err == nil {
+		t.Fatal("object put returned nil for a 502: a failed write would be reported as stored")
+	}
+	if strings.Contains(stdout, "stored") {
+		t.Errorf("a failed write printed the success line: %q", stdout)
 	}
 }
