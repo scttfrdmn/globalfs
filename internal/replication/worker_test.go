@@ -948,3 +948,431 @@ func TestWorker_PanicInTransfer_FailsJobAndKeepsWorkerAlive(t *testing.T) {
 	}
 	t.Error("worker did not process a job after recovering from a panic")
 }
+
+// ─── #93: the events buffer and terminal-event droppability ────────────────────
+
+// fillEvents pushes n synthetic events straight into w.events, bypassing emit,
+// so a test can put the buffer into an exactly-known state.
+func fillEvents(t *testing.T, w *Worker, n int) {
+	t.Helper()
+	src, _ := makeMount("filler-src", types.SiteRolePrimary, nil)
+	dst, _ := makeMount("filler-dst", types.SiteRoleBackup, nil)
+	for i := 0; i < n; i++ {
+		select {
+		case w.events <- ReplicationEvent{
+			Job:  ReplicationJob{SourceSite: src, DestSite: dst, Key: "filler"},
+			Type: EventStarted,
+		}:
+		default:
+			t.Fatalf("fillEvents: buffer full after %d of %d (cap %d)", i, n, cap(w.events))
+		}
+	}
+}
+
+// drainTerminalEvents reads events until the channel has been quiet for the
+// given settle period, returning the terminal events seen keyed by object key.
+func drainTerminalEvents(w *Worker, settle time.Duration) map[string]int {
+	seen := make(map[string]int)
+	for {
+		select {
+		case ev := <-w.Events():
+			if ev.Type == EventCompleted || ev.Type == EventFailed {
+				seen[ev.Job.Key]++
+			}
+		case <-time.After(settle):
+			return seen
+		}
+	}
+}
+
+// TestWorker_BurstBeyondHalfDepth_NoTerminalEventLost is the #93 regression.
+//
+// The events channel used to be sized to the queue depth, but processJob emits
+// two events per job (EventStarted then a terminal one), so only depth/2 jobs'
+// worth of completions fitted and the rest were discarded with a warn log.  A
+// discarded completion is durable corruption, not a lost log line: the
+// coordinator deletes the persisted job and records the dedup content hash only
+// when it receives one.
+//
+// The consumer here reads nothing until every job has landed on the
+// destination, which is exactly the shipped daemon's worst case — the drain
+// goroutine descheduled while a burst of writes goes through.
+func TestWorker_BurstBeyondHalfDepth_NoTerminalEventLost(t *testing.T) {
+	t.Parallel()
+
+	const depth = 8 // the shipped default (Performance.MaxConcurrentTransfers)
+	keys := make([]string, depth)
+	srcObjs := make(map[string][]byte, depth)
+	for i := range keys {
+		keys[i] = string(rune('a'+i)) + ".bam"
+		srcObjs[keys[i]] = []byte(keys[i] + "-data")
+	}
+
+	src, _ := makeMount("src", types.SiteRolePrimary, srcObjs)
+	dst, dstClient := makeMount("dst", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := fastWorker(depth)
+	w.Start(ctx)
+	defer w.Stop()
+
+	for _, k := range keys {
+		if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: k}); err != nil {
+			t.Fatalf("Enqueue %q: unexpected error: %v", k, err)
+		}
+	}
+
+	// Deliberately read nothing until the transfers have all happened.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		all := true
+		for _, k := range keys {
+			if !dstClient.hasKey(k) {
+				all = false
+				break
+			}
+		}
+		if all {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for _, k := range keys {
+		if !dstClient.hasKey(k) {
+			t.Fatalf("transfer of %q did not happen; test cannot judge event delivery", k)
+		}
+	}
+
+	seen := drainTerminalEvents(w, 500*time.Millisecond)
+	for _, k := range keys {
+		if seen[k] != 1 {
+			t.Errorf("terminal events for %q: got %d, want exactly 1", k, seen[k])
+		}
+	}
+	if len(seen) != depth {
+		t.Errorf("jobs with a terminal event: got %d, want %d (buffer cap %d)",
+			len(seen), depth, cap(w.events))
+	}
+	if got := w.DroppedTerminalEvents(); got != 0 {
+		t.Errorf("DroppedTerminalEvents: got %d, want 0", got)
+	}
+}
+
+// TestEventBufferSize_HoldsAWholeQueuesEvents pins the sizing relationship
+// itself, so raising the queue depth or adding a third emit site to processJob
+// cannot silently reintroduce the half-depth ceiling.
+func TestEventBufferSize_HoldsAWholeQueuesEvents(t *testing.T) {
+	t.Parallel()
+
+	for _, depth := range []int{1, 2, 8, 64, DefaultQueueDepth} {
+		if got, min := eventBufferSize(depth), depth*eventsPerJob; got < min {
+			t.Errorf("eventBufferSize(%d) = %d, want ≥ %d (%d events per job)",
+				depth, got, min, eventsPerJob)
+		}
+	}
+
+	w := NewWorker(8)
+	if got := cap(w.events); got < 8*eventsPerJob {
+		t.Errorf("NewWorker(8) events cap: got %d, want ≥ %d", got, 8*eventsPerJob)
+	}
+	if got := cap(w.queue); got != 8 {
+		t.Errorf("NewWorker(8) queue cap: got %d, want 8", got)
+	}
+}
+
+// TestWorker_EventStartedNeverConsumesTheTerminalReserve verifies the asymmetry
+// the fix rests on: with one slot left, a non-terminal event is refused and a
+// terminal event takes it.  Without the reserve a job's own EventStarted can
+// occupy the last slot and force its completion into the bounded wait.
+func TestWorker_EventStartedNeverConsumesTheTerminalReserve(t *testing.T) {
+	t.Parallel()
+
+	src, _ := makeMount("src", types.SiteRolePrimary, nil)
+	dst, _ := makeMount("dst", types.SiteRoleBackup, nil)
+	job := ReplicationJob{SourceSite: src, DestSite: dst, Key: "reserved"}
+
+	w := NewWorker(4)
+	fillEvents(t, w, cap(w.events)-terminalReserveSlots)
+	before := len(w.events)
+
+	w.emit(ReplicationEvent{Job: job, Type: EventStarted, Attempt: 1})
+	if got := len(w.events); got != before {
+		t.Errorf("EventStarted took a reserved slot: buffered %d → %d (cap %d)",
+			before, got, cap(w.events))
+	}
+
+	w.emit(ReplicationEvent{Job: job, Type: EventCompleted, Attempt: 1, ContentHash: "abc"})
+	if got := len(w.events); got != before+1 {
+		t.Errorf("EventCompleted did not use the reserved slot: buffered %d → %d", before, got)
+	}
+	if got := w.DroppedTerminalEvents(); got != 0 {
+		t.Errorf("DroppedTerminalEvents: got %d, want 0", got)
+	}
+}
+
+// TestWorker_TerminalEventWaitsForRoom verifies that a full buffer makes a
+// terminal event wait rather than vanish, and that it is delivered as soon as
+// the consumer catches up.
+func TestWorker_TerminalEventWaitsForRoom(t *testing.T) {
+	t.Parallel()
+
+	src, _ := makeMount("src", types.SiteRolePrimary, nil)
+	dst, _ := makeMount("dst", types.SiteRoleBackup, nil)
+
+	w := NewWorker(2)
+	w.terminalBudget = 5 * time.Second
+	fillEvents(t, w, cap(w.events))
+
+	// A consumer that is late, not absent.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		<-w.Events()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.emit(ReplicationEvent{
+			Job:         ReplicationJob{SourceSite: src, DestSite: dst, Key: "late"},
+			Type:        EventCompleted,
+			Attempt:     1,
+			ContentHash: "hash",
+		})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("emit of a terminal event did not return within 5s")
+	}
+
+	if got := w.DroppedTerminalEvents(); got != 0 {
+		t.Fatalf("DroppedTerminalEvents: got %d, want 0 (event should have waited, not dropped)", got)
+	}
+
+	var found bool
+	for i := 0; i < cap(w.events); i++ {
+		ev, ok := drainEvent(t, w, time.Second)
+		if !ok {
+			break
+		}
+		if ev.Type == EventCompleted && ev.Job.Key == "late" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("the delayed EventCompleted was never delivered")
+	}
+}
+
+// TestWorker_TerminalEventDropIsCounted covers the case the bounded wait cannot
+// save: a consumer that never reads at all.  The event is lost — the budget is
+// finite on purpose, since an unbounded send would let that consumer wedge the
+// worker goroutine and therefore Stop — but it must be counted, not merely
+// warned about, so the resulting phantom job is attributable after the fact.
+func TestWorker_TerminalEventDropIsCounted(t *testing.T) {
+	t.Parallel()
+
+	src, _ := makeMount("src", types.SiteRolePrimary, nil)
+	dst, _ := makeMount("dst", types.SiteRoleBackup, nil)
+
+	w := NewWorker(2)
+	w.terminalBudget = 50 * time.Millisecond
+	fillEvents(t, w, cap(w.events))
+
+	start := time.Now()
+	w.emit(ReplicationEvent{
+		Job:     ReplicationJob{SourceSite: src, DestSite: dst, Key: "doomed"},
+		Type:    EventFailed,
+		Attempt: MaxRetries,
+		Err:     errors.New("nobody is listening"),
+	})
+	elapsed := time.Since(start)
+
+	if elapsed < 50*time.Millisecond {
+		t.Errorf("emit gave up after %v, want ≥ the 50ms budget", elapsed)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("emit took %v; the budget must bound it", elapsed)
+	}
+	if got := w.DroppedTerminalEvents(); got != 1 {
+		t.Errorf("DroppedTerminalEvents: got %d, want 1", got)
+	}
+
+	// Monotonic, and only terminal drops count.
+	w.emit(ReplicationEvent{
+		Job:  ReplicationJob{SourceSite: src, DestSite: dst, Key: "ignored"},
+		Type: EventStarted,
+	})
+	if got := w.DroppedTerminalEvents(); got != 1 {
+		t.Errorf("a dropped EventStarted changed the terminal counter: got %d, want 1", got)
+	}
+}
+
+// TestWorker_TerminalEmitIgnoresStopWhileWaiting pins a deliberate decision: the
+// wait for buffer room does not select on w.done.  Stop means "let the in-flight
+// job settle", and the terminal event *is* the record that it settled, so
+// abandoning it on Stop would reintroduce #78's phantom job in a narrower
+// window.  Stop's exposure is bounded at one budget because the worker is
+// serial.
+func TestWorker_TerminalEmitIgnoresStopWhileWaiting(t *testing.T) {
+	t.Parallel()
+
+	src, _ := makeMount("src", types.SiteRolePrimary, nil)
+	dst, _ := makeMount("dst", types.SiteRoleBackup, nil)
+
+	w := NewWorker(2)
+	w.terminalBudget = 5 * time.Second
+	fillEvents(t, w, cap(w.events))
+	close(w.done) // as if Stop had been called
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		<-w.Events()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.emit(ReplicationEvent{
+			Job:         ReplicationJob{SourceSite: src, DestSite: dst, Key: "settling"},
+			Type:        EventCompleted,
+			Attempt:     1,
+			ContentHash: "hash",
+		})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("emit did not return within 5s")
+	}
+	if got := w.DroppedTerminalEvents(); got != 0 {
+		t.Errorf("terminal event abandoned because done was closed: dropped %d, want 0", got)
+	}
+
+	var found bool
+	for i := 0; i < cap(w.events); i++ {
+		ev, ok := drainEvent(t, w, time.Second)
+		if !ok {
+			break
+		}
+		if ev.Type == EventCompleted && ev.Job.Key == "settling" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("the terminal event of a job settling during Stop was never delivered")
+	}
+}
+
+// TestWorker_StalledConsumerBecomesBackpressure verifies the failure mode the
+// bounded wait produces under a genuinely stalled consumer: the worker stops
+// consuming its queue, rather than racing ahead transferring objects whose
+// bookkeeping is being discarded.
+//
+// That is the behavioural difference the fix buys beyond buffer sizing.  With
+// the old non-blocking emit the worker ran at full speed against a stalled
+// consumer, so the objects landed on the destination and the coordinator never
+// heard about any of them.  Now the backlog is visible where callers can act on
+// it: the queue fills, Enqueue reports it, and Put's backpressure path (#79)
+// surfaces it to writers.
+func TestWorker_StalledConsumerBecomesBackpressure(t *testing.T) {
+	t.Parallel()
+
+	const nJobs = 12
+	keys := make([]string, nJobs)
+	srcObjs := make(map[string][]byte, nJobs)
+	for i := range keys {
+		keys[i] = string(rune('a' + i))
+		srcObjs[keys[i]] = []byte("x")
+	}
+	src, _ := makeMount("src", types.SiteRolePrimary, srcObjs)
+	dst, dstClient := makeMount("dst", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A queue big enough for every job, so a full queue can only come from the
+	// worker having stopped draining it.
+	w := fastWorker(nJobs)
+	w.terminalBudget = time.Second
+	// Pre-fill the events buffer so the very first terminal event has to wait.
+	fillEvents(t, w, cap(w.events))
+	w.Start(ctx)
+	defer w.Stop()
+
+	// Nothing ever reads Events().
+	for _, k := range keys {
+		if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: k}); err != nil {
+			t.Fatalf("Enqueue %q: unexpected error: %v", k, err)
+		}
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	var transferred int
+	for _, k := range keys {
+		if dstClient.hasKey(k) {
+			transferred++
+		}
+	}
+	// The worker parks in emitTerminal on the first job it settles, so at most
+	// one transfer gets through.  Allowing two absorbs a slow scheduler.
+	if transferred > 2 {
+		t.Errorf("worker transferred %d of %d objects while its event consumer was stalled; "+
+			"it should have blocked on delivering the first terminal event", transferred, nJobs)
+	}
+	if got := w.QueueDepth(); got == 0 {
+		t.Error("queue drained to empty with a stalled consumer; the backlog is not visible to callers")
+	}
+	if got := w.DroppedTerminalEvents(); got != 0 {
+		t.Errorf("DroppedTerminalEvents: got %d, want 0 within the budget", got)
+	}
+}
+
+// TestWorker_StopCompletesWithNoEventConsumer is the safety property that makes
+// the bounded wait acceptable: waiting for buffer room must not let an absent
+// consumer wedge shutdown.  Stop waits on the worker goroutine, so if the wait
+// were an unbounded blocking send this would hang forever instead of finishing
+// with one counted drop.
+func TestWorker_StopCompletesWithNoEventConsumer(t *testing.T) {
+	t.Parallel()
+
+	src, _ := makeMount("src", types.SiteRolePrimary, map[string][]byte{"k": []byte("v")})
+	dst, _ := makeMount("dst", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := fastWorker(1)
+	w.terminalBudget = 200 * time.Millisecond
+	fillEvents(t, w, cap(w.events)) // full buffer, and nothing will ever read it
+	w.Start(ctx)
+
+	if err := w.Enqueue(ReplicationJob{SourceSite: src, DestSite: dst, Key: "k"}); err != nil {
+		t.Fatalf("Enqueue: unexpected error: %v", err)
+	}
+
+	stopped := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		w.Stop()
+		stopped <- time.Since(start)
+	}()
+
+	select {
+	case elapsed := <-stopped:
+		// The queue holds one job, so Stop's exposure is one budget plus the
+		// transfer.  The generous ceiling is about not deadlocking, not timing.
+		if elapsed > 5*time.Second {
+			t.Errorf("Stop took %v with no event consumer; the budget must bound it", elapsed)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Stop did not return with no event consumer: a blocking terminal send wedged shutdown")
+	}
+}

@@ -37,9 +37,31 @@
 //
 // For each job the worker emits an EventStarted before the first attempt and
 // either EventCompleted or EventFailed when the job settles.  Drain the
-// channel returned by Events to observe progress.  The channel is buffered to
-// the same depth as the work queue; if it fills, events are dropped (logged)
-// rather than blocking the worker.
+// channel returned by Events to observe progress.
+//
+// The two kinds are not equally droppable, and the worker does not treat them
+// as if they were (#93).  A terminal event is the only signal that the job
+// finished: the coordinator deletes the durable job record and writes the
+// dedup content hash when it receives one, so losing it leaves a phantom job
+// that is re-enqueued on the next restart and a successful transfer that the
+// content-hash index does not know about.  An EventStarted, by contrast, has no
+// consumer that acts on it.  So:
+//
+//   - The buffer is sized from the number of emit sites per job, not from the
+//     queue depth (see eventBufferSize).  Sizing alone is not a guarantee —
+//     a stalled consumer overruns any fixed buffer — it just makes the
+//     guarantee below rarely need to do anything.
+//   - EventStarted is admitted only while the buffer is below its reserve (see
+//     terminalReserveSlots), so it can never be the reason a terminal event has
+//     nowhere to go.
+//   - A terminal event waits for room, bounded by terminalEmitBudget, instead
+//     of being discarded on the first full buffer.  The wait is deliberately
+//     not cancellable by Stop or by the job's context: Stop exists to let the
+//     in-flight job settle, and settling is precisely what emitting the
+//     terminal event means.
+//   - If the budget elapses the event is lost, and that is reported at Error
+//     with the consequence named, plus a monotonic counter
+//     (DroppedTerminalEvents) so the loss is observable after the log scrolls.
 //
 // # Panic containment
 //
@@ -60,6 +82,7 @@ import (
 	"math"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/scttfrdmn/globalfs/pkg/site"
@@ -109,6 +132,32 @@ const (
 	MaxRetries = 3
 
 	defaultBaseBackoff = 100 * time.Millisecond
+
+	// eventsPerJob is how many events processJob emits for one job: an
+	// EventStarted, then exactly one of EventCompleted/EventFailed.  It is a
+	// property of the emit sites in processJob, not a tuning knob — if a third
+	// emit site is added, this is the number that has to change with it.
+	eventsPerJob = 2
+
+	// eventBufferSlack is extra room beyond one full queue's worth of events.
+	// The queue is not the only source of jobs the consumer has to keep up with:
+	// a job leaves the queue the moment the serial worker picks it up, so
+	// callers can refill the queue while earlier jobs' events are still
+	// unconsumed.  The slack absorbs that overlap so that the bounded wait in
+	// emitTerminal stays a backstop for a genuinely stalled consumer rather
+	// than something ordinary bursts reach.
+	eventBufferSlack = 64
+
+	// terminalEmitBudget bounds how long a terminal event waits for buffer room
+	// before it is abandoned.  It is finite because the alternative — an
+	// unbounded blocking send — makes any wedged consumer wedge the worker
+	// goroutine, and Stop waits on that goroutine, trading a lost event for a
+	// shutdown that never completes.  Ten seconds is orders of magnitude beyond
+	// what a consumer that is running at all needs to service one event (the
+	// coordinator's handler does two 5 s-bounded store calls at worst), and
+	// Stop only ever waits on one job, so it bounds shutdown's exposure at one
+	// budget.
+	terminalEmitBudget = 10 * time.Second
 )
 
 // workerState is the Worker's position in its one-directional lifecycle.
@@ -137,6 +186,19 @@ func (s workerState) String() string {
 	}
 }
 
+// eventBufferSize returns the capacity for the events channel given a job queue
+// depth.
+//
+// It is deliberately not depth.  Every job emits eventsPerJob events into this
+// channel while occupying one queue slot, so a channel of depth held only
+// depth/eventsPerJob jobs' worth of terminal events — at the shipped default
+// depth of 8, a burst of five writes was enough to start discarding completions
+// (#93).  Sizing it at depth*eventsPerJob restores the intended relationship,
+// and the slack covers jobs that have already left the queue.
+func eventBufferSize(depth int) int {
+	return depth*eventsPerJob + eventBufferSlack
+}
+
 // Worker processes ReplicationJobs from a bounded FIFO queue.
 //
 // Each job is attempted up to MaxRetries times with exponential backoff
@@ -158,6 +220,15 @@ type Worker struct {
 	// baseBackoff controls the initial retry delay.  Defaults to
 	// defaultBaseBackoff; may be overridden in tests.
 	baseBackoff time.Duration
+
+	// terminalBudget bounds the wait for buffer room when emitting a terminal
+	// event.  Zero means terminalEmitBudget; may be shortened in tests.
+	terminalBudget time.Duration
+
+	// droppedTerminal counts terminal events that were abandoned because the
+	// consumer did not free buffer room within the budget.  Each one is a job
+	// the coordinator will never learn settled.
+	droppedTerminal atomic.Uint64
 }
 
 // NewWorker creates a Worker with the given queue depth.
@@ -168,7 +239,7 @@ func NewWorker(depth int) *Worker {
 	}
 	return &Worker{
 		queue:       make(chan ReplicationJob, depth),
-		events:      make(chan ReplicationEvent, depth),
+		events:      make(chan ReplicationEvent, eventBufferSize(depth)),
 		done:        make(chan struct{}),
 		baseBackoff: defaultBaseBackoff,
 	}
@@ -176,10 +247,28 @@ func NewWorker(depth int) *Worker {
 
 // Events returns the read-only channel of ReplicationEvents.
 //
-// Events are buffered to the same depth as the work queue.  Drain this
-// channel or use a select with context.Done to avoid event drops.
+// The buffer holds eventBufferSize(depth) events, which is more than the queue
+// depth because each job emits several (see the package Events section).  Drain
+// this channel or use a select with context.Done: a consumer that stops reading
+// for longer than terminalEmitBudget still loses events, and losing a terminal
+// event corrupts the coordinator's job bookkeeping.
 func (w *Worker) Events() <-chan ReplicationEvent {
 	return w.events
+}
+
+// DroppedTerminalEvents returns the monotonic count of EventCompleted and
+// EventFailed events the worker could not deliver because the events buffer
+// stayed full for terminalEmitBudget.
+//
+// A non-zero value means the coordinator's view of replication is wrong: for
+// each drop there is a job record that will never be deleted (and is replayed
+// on the next restart) and, for a completion, a content hash that was never
+// written, so the same bytes will be transferred again.  It is exposed rather
+// than only logged so the loss remains visible after the log line scrolls
+// away; wiring it to a Prometheus counter belongs to the coordinator, which
+// owns the metrics registry.
+func (w *Worker) DroppedTerminalEvents() uint64 {
+	return w.droppedTerminal.Load()
 }
 
 // QueueDepth returns the number of jobs currently waiting in the queue.
@@ -385,12 +474,117 @@ func (w *Worker) processJob(ctx context.Context, job ReplicationJob) {
 	})
 }
 
+// isTerminal reports whether ev settles a job, i.e. whether the coordinator
+// acts on it.  Only terminal events delete the durable job record and record
+// the dedup content hash.
+func isTerminal(t EventType) bool {
+	return t == EventCompleted || t == EventFailed
+}
+
+// emit delivers ev to the events channel.
+//
+// The two kinds of event get different guarantees, because the cost of losing
+// them differs by more than a log line (#93).  Terminal events go through
+// emitTerminal, which waits for room; EventStarted is admitted non-blocking and
+// only while the buffer is below the reserve, so a flood of started events
+// cannot be the reason a completion has nowhere to go.
 func (w *Worker) emit(ev ReplicationEvent) {
+	if isTerminal(ev.Type) {
+		w.emitTerminal(ev)
+		return
+	}
+
+	// Non-terminal: droppable by design.  Its only consumer is metrics, and the
+	// coordinator's handleWorkerEvent ignores it outright.
+	if len(w.events)+terminalReserveSlots >= cap(w.events) {
+		slog.Debug("replication: events buffer near capacity; dropping non-terminal event",
+			"type", ev.Type, "key", ev.Job.Key,
+			"buffered", len(w.events), "capacity", cap(w.events))
+		return
+	}
 	select {
 	case w.events <- ev:
 	default:
-		slog.Warn("replication: events channel full; dropping event", "type", ev.Type, "key", ev.Job.Key)
+		// Lost the race for the last unreserved slot.  Same outcome as above.
+		slog.Debug("replication: events buffer full; dropping non-terminal event",
+			"type", ev.Type, "key", ev.Job.Key)
 	}
+}
+
+// terminalReserveSlots is the number of buffer slots withheld from
+// EventStarted so that a terminal event always has somewhere to go.
+//
+// One is sufficient because the worker is serial: Start guards the run
+// goroutine with sync.Once and run calls runJob sequentially, so at most one
+// job is between its EventStarted and its terminal event at any instant.  If
+// the worker ever grows a concurrent pool, this has to become that pool's size
+// — the invariant is one reserved slot per in-flight job, not one overall.
+const terminalReserveSlots = 1
+
+// emitTerminal delivers a job's settling event, waiting up to the terminal
+// budget for buffer room rather than discarding it on a full buffer.
+//
+// The wait deliberately does not select on w.done or the job's context.  Both
+// mean "stop working", and this event is the record that the work already
+// finished; abandoning it on cancellation would reintroduce #78's phantom job
+// in a narrower window.  Stop waits for the in-flight job, and there is only
+// ever one, so the worst case Stop inherits from this is a single budget.
+//
+// The budget is finite because an unbounded send would let a consumer that has
+// stopped reading wedge the worker goroutine permanently, and Stop waits on
+// that goroutine — trading a lost event for a shutdown that never completes.
+// Under a stalled consumer the wait instead degrades into backpressure: the
+// worker slows to one job per budget, the queue fills, and Put's enqueue
+// backpressure (#79) reports the condition to writers, which is a far better
+// failure mode than silently losing bookkeeping.
+func (w *Worker) emitTerminal(ev ReplicationEvent) {
+	// Fast path: room right now, which is the overwhelmingly common case given
+	// eventBufferSize and the reserve above.
+	select {
+	case w.events <- ev:
+		return
+	default:
+	}
+
+	budget := w.terminalBudget
+	if budget <= 0 {
+		budget = terminalEmitBudget
+	}
+
+	slog.Warn("replication: events buffer full; waiting to deliver terminal event",
+		"type", ev.Type, "key", ev.Job.Key,
+		"dest", ev.Job.DestSite.Name(),
+		"capacity", cap(w.events), "budget", budget)
+
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+
+	// A select with a send case blocks until the send can proceed, so no polling
+	// is needed: this parks the worker until either room appears or the budget
+	// expires.
+	select {
+	case w.events <- ev:
+		return
+	case <-deadline.C:
+	}
+
+	// The timer and the send can both become ready in the same window, and
+	// select picks at random between them, so try once more before giving up.
+	select {
+	case w.events <- ev:
+		return
+	default:
+	}
+
+	w.droppedTerminal.Add(1)
+	slog.Error("replication: dropped terminal replication event; "+
+		"the job record will not be deleted and will be re-enqueued on restart, "+
+		"and its content hash was not recorded so the object will be transferred again",
+		"type", ev.Type, "key", ev.Job.Key,
+		"src", ev.Job.SourceSite.Name(), "dst", ev.Job.DestSite.Name(),
+		"attempt", ev.Attempt, "waited", budget,
+		"capacity", cap(w.events),
+		"dropped_total", w.droppedTerminal.Load())
 }
 
 // safeTransfer calls transfer and converts a panic into an ordinary error so
