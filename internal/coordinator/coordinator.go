@@ -469,14 +469,38 @@ func (c *Coordinator) start(ctx context.Context) {
 // finish the current job.  If a leader lease is held it is released so that a
 // standby coordinator can take over immediately.  Calling Stop before Start is
 // safe.
+//
+// # Teardown order
+//
+// The producer is stopped before its consumer.  worker.Stop waits for the
+// in-flight transfer to finish, and that transfer emits a terminal event; if the
+// drain goroutine is torn down first there is nobody left to read it, and the
+// job stays in the store as a phantom while its content hash is lost (#78).
 func (c *Coordinator) Stop() {
 	c.mu.Lock()
 	storeCancel := c.storeCancel
 	leaderCancel := c.leaderCancel
 	l := c.leaderLease
+	store := c.store
 	c.mu.Unlock()
 
-	// Cancel both contexts: stops the drain goroutine and keepalive goroutine.
+	// 1. Stop the producer.  Returns once the in-flight job has settled, so
+	//    every terminal event it will ever emit is buffered by the time this
+	//    returns.  The events channel is buffered to the queue depth, so emit
+	//    cannot block even with no reader currently scheduled.
+	c.worker.Stop()
+
+	// 2. Now the consumer.  Cancelling these stops the drain goroutine, the
+	//    health poller, and the lease keepalive.
+	//
+	//    Note for #83: leaderCancel used to run first, and because leaderCtx is
+	//    the worker's ctx that gave the in-flight transfer a cancellation path.
+	//    It no longer does — deliberately, since aborting the transfer is the
+	//    opposite of letting it settle.  Bounding a transfer against an
+	//    unresponsive site is #83's job and wants a real timeout; it was never
+	//    covered in the no-lease-manager case anyway, which is every shipped
+	//    deployment.  cmd/coordinator cancels the root context before calling
+	//    Close, so the transfer ctx is already done by the time Stop is entered.
 	if leaderCancel != nil {
 		leaderCancel()
 	}
@@ -484,7 +508,19 @@ func (c *Coordinator) Stop() {
 		storeCancel()
 	}
 	c.storeWg.Wait()
-	c.worker.Stop()
+
+	// 3. Final flush on this goroutine.  storeWg.Wait above guarantees the drain
+	//    goroutine has returned, so there is no concurrent reader.
+	//
+	//    Step 1 plus the drain's own flush covers the common case, but not the
+	//    one the shipped daemon actually produces: cmd/coordinator cancels the
+	//    root context and *then* calls Close, so the drain can already have
+	//    exited on ctx.Done before Stop is ever entered — and the same is true
+	//    after a lost leader lease, which cancels leaderCtx with no Stop
+	//    involved.  Flushing here makes the guarantee independent of who
+	//    cancelled what first, which is worth more than the one non-blocking
+	//    channel read it costs when the buffer is empty.
+	c.flushWorkerEvents(store)
 
 	// Release the leader lease last so a standby can take over quickly.
 	if l != nil {
@@ -1107,6 +1143,11 @@ func (c *Coordinator) recoverPendingJobs(ctx context.Context, store metadata.Sto
 // drainWorkerEvents processes replication job events.
 // It removes completed/failed jobs from the store (when set) and updates metrics.
 // Runs in a goroutine until ctx is cancelled.
+//
+// On cancellation it flushes whatever is already buffered before returning.
+// Exiting on the first ctx.Done would discard events the worker has already
+// emitted, which is the same loss #78 describes in a narrower window: the
+// buffered EventCompleted of a transfer that finished a moment before shutdown.
 func (c *Coordinator) drainWorkerEvents(ctx context.Context, store metadata.Store) {
 	for {
 		select {
@@ -1114,42 +1155,74 @@ func (c *Coordinator) drainWorkerEvents(ctx context.Context, store metadata.Stor
 			if !ok {
 				return
 			}
-			if ev.Type == replication.EventCompleted || ev.Type == replication.EventFailed {
-				if store != nil {
-					id := makeJobID(ev.Job.SourceSite.Name(), ev.Job.DestSite.Name(), ev.Job.Key)
-					// Use a fresh context: ctx may already be cancelled if
-					// Stop() fired while this event was being processed.
-					// A cancelled ctx would leave the job in the store and
-					// cause it to be re-enqueued on the next restart (#61).
-					deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 5*time.Second)
-					err := store.DeleteJob(deleteCtx, id)
-					deleteCancel()
-					if err != nil {
-						slog.Warn("coordinator: delete job from store", "job_id", id, "error", err)
-					}
-				}
-				// Record content hash on successful transfer for future
-				// coordinator-level dedup.
-				if store != nil && ev.Type == replication.EventCompleted && ev.ContentHash != "" {
-					recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
-					recErr := store.PutReplicatedObject(recCtx, &metadata.ReplicatedObject{
-						Site:         ev.Job.DestSite.Name(),
-						Key:          ev.Job.Key,
-						ContentHash:  ev.ContentHash,
-						ReplicatedAt: time.Now(),
-					})
-					recCancel()
-					if recErr != nil {
-						slog.Warn("coordinator: record replicated object", "key", ev.Job.Key, "error", recErr)
-					}
-				}
-				if c.m != nil {
-					c.m.RecordReplication(string(ev.Type))
-					c.m.SetReplicationQueueDepth(c.worker.QueueDepth())
-				}
-			}
+			c.handleWorkerEvent(ev, store)
 		case <-ctx.Done():
+			c.flushWorkerEvents(store)
 			return
 		}
+	}
+}
+
+// flushWorkerEvents processes every event currently buffered in the worker's
+// events channel and returns as soon as it is empty.  It never blocks waiting
+// for an event that has not been emitted yet.
+//
+// Callers must ensure no other goroutine is reading Events() concurrently, or
+// the two will split the buffer between them.
+func (c *Coordinator) flushWorkerEvents(store metadata.Store) {
+	for {
+		select {
+		case ev, ok := <-c.worker.Events():
+			if !ok {
+				return
+			}
+			c.handleWorkerEvent(ev, store)
+		default:
+			return
+		}
+	}
+}
+
+// handleWorkerEvent applies one replication event to the store and to metrics.
+// Non-terminal events (EventStarted) are ignored.
+func (c *Coordinator) handleWorkerEvent(ev replication.ReplicationEvent, store metadata.Store) {
+	if ev.Type != replication.EventCompleted && ev.Type != replication.EventFailed {
+		return
+	}
+
+	if store != nil {
+		id := makeJobID(ev.Job.SourceSite.Name(), ev.Job.DestSite.Name(), ev.Job.Key)
+		// Use a fresh context: the drain's ctx may already be cancelled if
+		// Stop() fired while this event was being processed.  A cancelled ctx
+		// would leave the job in the store and cause it to be re-enqueued on
+		// the next restart (#61).
+		deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := store.DeleteJob(deleteCtx, id)
+		deleteCancel()
+		if err != nil {
+			slog.Warn("coordinator: delete job from store", "job_id", id, "error", err)
+		}
+	}
+	// Record content hash on successful transfer for future coordinator-level dedup.
+	if store != nil && ev.Type == replication.EventCompleted && ev.ContentHash != "" {
+		recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		recErr := store.PutReplicatedObject(recCtx, &metadata.ReplicatedObject{
+			Site:         ev.Job.DestSite.Name(),
+			Key:          ev.Job.Key,
+			ContentHash:  ev.ContentHash,
+			ReplicatedAt: time.Now(),
+		})
+		recCancel()
+		if recErr != nil {
+			slog.Warn("coordinator: record replicated object", "key", ev.Job.Key, "error", recErr)
+		}
+	}
+
+	c.mu.RLock()
+	m := c.m
+	c.mu.RUnlock()
+	if m != nil {
+		m.RecordReplication(string(ev.Type))
+		m.SetReplicationQueueDepth(c.worker.QueueDepth())
 	}
 }

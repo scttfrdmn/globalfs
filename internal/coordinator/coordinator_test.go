@@ -40,6 +40,11 @@ type memClient struct {
 	// the transfer held open; without it the worker and the drain goroutine can
 	// run to completion before the assertion executes.
 	putGate chan struct{}
+	// putsEntered counts calls that have reached the gate.  A test that wants to
+	// act *while* a transfer is in flight has to know the transfer has actually
+	// started, and polling the destination for the key cannot tell it — the key
+	// only appears once the gate is released.
+	putsEntered int
 }
 
 func newMemClient(objs map[string][]byte) *memClient {
@@ -85,6 +90,7 @@ func (m *memClient) Put(_ context.Context, key string, data []byte) error {
 	// m.mu would deadlock any concurrent hasKey/keys call.
 	m.mu.Lock()
 	gate := m.putGate
+	m.putsEntered++
 	m.mu.Unlock()
 	if gate != nil {
 		<-gate
@@ -176,6 +182,23 @@ func (m *memClient) blockPuts() (release func()) {
 	m.mu.Unlock()
 	var once sync.Once
 	return func() { once.Do(func() { close(gate) }) }
+}
+
+// waitForPut blocks until at least n Put calls have reached the gate, or the
+// timeout elapses (reported as a fatal test failure).
+func (m *memClient) waitForPut(t *testing.T, n int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		entered := m.putsEntered
+		m.mu.Unlock()
+		if entered >= n {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("no Put reached the client within %v — the transfer never started", timeout)
 }
 
 func makeMount(name string, role types.SiteRole, objs map[string][]byte) (*site.SiteMount, *memClient) {
@@ -858,6 +881,162 @@ type failingPutJobStore struct {
 
 func (f *failingPutJobStore) PutReplicationJob(_ context.Context, _ *metadata.ReplicationJob) error {
 	return errors.New("simulated storage failure")
+}
+
+// ─── Shutdown while busy (#78) ────────────────────────────────────────────────
+
+// TestCoordinator_Stop_WhileTransferInFlight_SettlesTheJob is the test the suite
+// did not have: Stop() against a coordinator with a transfer genuinely in
+// flight.  Before #78, Stop() cancelled the event drain and only then called
+// worker.Stop(), so the EventCompleted the finishing transfer emitted had no
+// reader — the job stayed in the store as a phantom to be re-enqueued on the
+// next boot, and the v0.2.0 dedup hash was lost.
+func TestCoordinator_Stop_WhileTransferInFlight_SettlesTheJob(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Hold the destination write open so the transfer is still running when
+	// Stop() is entered.
+	release := backupClient.blockPuts()
+	defer release() // safety net: never leave the worker parked if we fail early
+
+	store := metadata.NewMemoryStore()
+	c := New(primary, backup)
+	c.SetStore(store)
+	c.Start(ctx)
+
+	const key = "data/sample.bam"
+	if err := c.Put(ctx, key, []byte("genome")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// The transfer must actually have begun, otherwise this test would pass
+	// against the buggy ordering by shutting down before there was any event.
+	backupClient.waitForPut(t, 1, 2*time.Second)
+
+	// Stop() runs on its own goroutine because it blocks on the in-flight
+	// transfer, and the transfer cannot finish until this goroutine releases it.
+	stopped := make(chan struct{})
+	go func() {
+		c.Stop()
+		close(stopped)
+	}()
+
+	// Let Stop() get as far as it can, then let the transfer complete.  This is
+	// the SIGTERM-mid-transfer case: the shutdown is under way and the transfer
+	// then succeeds.
+	time.Sleep(50 * time.Millisecond)
+	release()
+
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() did not return within 5s")
+	}
+
+	// The transfer succeeded, so the object is at the destination.
+	if !backupClient.hasKey(key) {
+		t.Fatal("backup did not receive the object — the transfer did not complete")
+	}
+
+	// Terminal event must have been consumed: no phantom job left behind.
+	jobs, err := store.GetPendingJobs(ctx)
+	if err != nil {
+		t.Fatalf("GetPendingJobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("store has %d pending job(s) after Stop; the completion event was lost, "+
+			"so this job would be re-enqueued and the object transferred again: %v", len(jobs), jobs)
+	}
+
+	// ...and the dedup hash must have been recorded.
+	rec, err := store.GetReplicatedObject(ctx, "backup", key)
+	if err != nil {
+		t.Fatalf("GetReplicatedObject: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("no ReplicatedObject recorded for backup/" + key +
+			"; the content-hash index now disagrees with reality")
+	}
+	if rec.ContentHash == "" {
+		t.Error("ReplicatedObject recorded with an empty ContentHash")
+	}
+}
+
+// TestCoordinator_Stop_DrainFlushesBufferedEvents covers the narrower window
+// that ordering alone does not close: an event already emitted and sitting in
+// the buffer when the drain's context is cancelled.  The shipped daemon produces
+// exactly this — cmd/coordinator cancels the root context and then calls Close,
+// so the drain can be gone before Stop is entered.
+func TestCoordinator_Stop_DrainFlushesBufferedEvents(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	release := backupClient.blockPuts()
+	defer release()
+
+	store := metadata.NewMemoryStore()
+	c := New(primary, backup)
+	c.SetStore(store)
+	c.Start(ctx)
+
+	const key = "reads.fastq"
+	if err := c.Put(ctx, key, []byte("sequence")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	backupClient.waitForPut(t, 1, 2*time.Second)
+
+	// Kill the drain goroutine first, the way the daemon does, and only then
+	// release the transfer.  The completion event is emitted into a buffer with
+	// no live reader; Stop's final flush is the only thing that can consume it.
+	cancel()
+	// Wait for the drain and the health poller to observe the cancellation.
+	c.storeWg.Wait()
+	release()
+
+	c.Stop()
+
+	jobs, err := store.GetPendingJobs(ctx)
+	if err != nil {
+		t.Fatalf("GetPendingJobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("store has %d pending job(s); a buffered terminal event went unread: %v", len(jobs), jobs)
+	}
+	if rec, _ := store.GetReplicatedObject(context.Background(), "backup", key); rec == nil {
+		t.Error("dedup hash not recorded from the buffered completion event")
+	}
+}
+
+// TestCoordinator_Stop_BeforeStart guards the ordering change against the
+// Stop-before-Start path (tracked separately as #84): worker.Stop() now runs
+// first, on a worker that was never started.
+func TestCoordinator_Stop_BeforeStart(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	c := New(primary)
+
+	done := make(chan struct{})
+	go func() {
+		c.Stop() // must not panic and must not block
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() before Start() did not return within 2s")
+	}
 }
 
 // ─── Lease manager tests ──────────────────────────────────────────────────────
