@@ -48,6 +48,69 @@ import (
 // never reports a real release version.
 var version = "dev"
 
+// coordinatorShutdownTimeout bounds coordinator teardown after the HTTP server
+// has drained.  It is the outer half of #83: the coordinator bounds its own
+// waits, and this bounds the whole of CloseContext including the site closes that
+// follow the stop, so SIGTERM returns even if a site's connection-pool drain
+// never does.
+//
+// 30 s matches internal/coordinator's own defaultStopTimeout and the HTTP drain
+// window above, which keeps the worst case a caller has to reason about at two
+// windows rather than three.  See newShutdownContext for why this is still
+// load-bearing rather than redundant with the coordinator's own default.
+const coordinatorShutdownTimeout = 30 * time.Second
+
+// newShutdownContext returns the context used to bound coordinator teardown.
+//
+// It deliberately derives from context.Background() and *not* from the daemon's
+// root context, which the shutdown path has already cancelled.  A context derived
+// from a cancelled parent is born cancelled — Err() is non-nil immediately — so
+// passing one to CloseContext would make every bounded wait inside it return at
+// once: Worker.StopContext would abandon the in-flight transfer instead of
+// letting it settle, and its terminal event would go unemitted with the drain
+// already gone.  That is exactly the phantom-job condition #78 fixed, so
+// deriving here would reintroduce it while appearing to add a safety bound.
+//
+// The cancellation of the root context is still what tells the worker's run loop
+// to stop accepting new jobs; the point is that the *deadline for observing the
+// current one finishing* has to be independent of it.
+//
+// This is a function rather than three inline lines so the derivation can be
+// asserted in a test.  It is the kind of detail that reads as obviously correct
+// either way and is only obviously wrong at 3 a.m. during a rolling restart.
+func newShutdownContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), coordinatorShutdownTimeout)
+}
+
+// mustConfigure exits the daemon if a coordinator configuration call was refused.
+//
+// Every Set* call in main runs during boot, before Start, where the coordinator's
+// contract is to return nil.  A non-nil error therefore cannot be caused by
+// anything the operator wrote in the config file: it means the call arrived after
+// Start, which at this point in main is unreachable and so is a programming error
+// in this file — a reordering that moved a setter below Start.
+//
+// It is fatal rather than logged-and-continued because the failure is otherwise
+// invisible in the way that matters.  The value came from the config file, so
+// `config show` would keep reporting it while the daemon ran on the default —
+// exactly the divergence between reported and effective configuration that #81
+// and the yaml-tag bug produced, and the reason those were worth fixing.  A
+// deployment is better off failing to start than running with a queue depth, a
+// lease TTL, or a health cadence that nobody chose.
+//
+// The label is the operator-facing name of the setting rather than the Go method,
+// since the person reading the log is likelier to be holding the YAML than the
+// source.  internal/coordinator also logs the method name itself.
+func mustConfigure(what string, err error) {
+	if err == nil {
+		return
+	}
+	slog.Error("coordinator configuration was refused; this is a bug in the daemon's boot order, "+
+		"not a problem with your configuration file",
+		"setting", what, "error", err)
+	os.Exit(1)
+}
+
 func main() {
 	configPath := flag.String("config", "", "Path to YAML configuration file")
 	logLevelStr := flag.String("log-level", "INFO", "Log level: DEBUG, INFO, WARN, ERROR")
@@ -130,17 +193,18 @@ func main() {
 	c := coordinator.New(mounts...)
 
 	m := metrics.New(prometheus.DefaultRegisterer)
-	c.SetMetrics(m)
+	mustConfigure("metrics", c.SetMetrics(m))
 
 	// ── Leader lease TTL (from coordinator.lease_timeout) ─────────────────────
 	if cfg.Coordinator.LeaseTimeout > 0 {
-		c.SetLeaseTTL(cfg.Coordinator.LeaseTimeout)
+		mustConfigure("leader lease TTL", c.SetLeaseTTL(cfg.Coordinator.LeaseTimeout))
 		slog.Info("leader lease TTL configured", "ttl", cfg.Coordinator.LeaseTimeout)
 	}
 
 	// ── Replication worker queue depth (from performance.max_concurrent_transfers) ─
 	if cfg.Performance.MaxConcurrentTransfers > 0 {
-		c.SetWorkerQueueDepth(cfg.Performance.MaxConcurrentTransfers)
+		mustConfigure("replication worker queue depth",
+			c.SetWorkerQueueDepth(cfg.Performance.MaxConcurrentTransfers))
 		slog.Info("replication worker depth configured", "depth", cfg.Performance.MaxConcurrentTransfers)
 	}
 
@@ -156,7 +220,7 @@ func main() {
 		}
 	}
 	if healthPoll > 0 {
-		c.SetHealthPollInterval(healthPoll)
+		mustConfigure("health poll interval", c.SetHealthPollInterval(healthPoll))
 		slog.Info("health polling configured", "interval", healthPoll)
 	}
 
@@ -232,7 +296,18 @@ func main() {
 		slog.Info("policy engine loaded", "rules", len(cfg.Policy.Rules))
 	}
 
-	c.Start(ctx)
+	// A refused Start is fatal.  Under the lifecycle contract Start returns an
+	// error wrapping ErrStopped, and a daemon that continued past it would serve
+	// HTTP with no replication worker and no health poller: writes would reach
+	// primaries and be reported as stored, /healthz would answer from a cache
+	// nothing refreshes, and nothing in the log would say why.  That is #84's
+	// silent-standby failure with a process supervisor keeping it alive.  Exiting
+	// non-zero lets the supervisor restart into a fresh coordinator, which is the
+	// only recovery a single-use lifecycle allows.
+	if err := c.Start(ctx); err != nil {
+		slog.Error("failed to start coordinator", "error", err)
+		os.Exit(1)
+	}
 	slog.Info("coordinator started",
 		"sites", len(mounts),
 		"cluster", cfg.Global.ClusterName,
@@ -287,8 +362,13 @@ func main() {
 	sig := <-sigCh
 	slog.Info("shutdown signal received", "signal", sig)
 
-	// Stop accepting new HTTP requests (30s drain window).
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Stop accepting new HTTP requests.  Same budget as the coordinator teardown
+	// below, and the two are sequential, so the worst-case time from signal to exit
+	// is 2 × coordinatorShutdownTimeout.  That matters for the termination grace
+	// period configured in whatever supervises this process: at 60 s total it must
+	// be higher than that, or the supervisor's SIGKILL arrives first and the
+	// bounded shutdown never gets to run.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), coordinatorShutdownTimeout)
 	defer shutdownCancel()
 
 	exitCode := 0
@@ -298,11 +378,27 @@ func main() {
 		exitCode = 1
 	}
 
-	// Cancel the main context so the replication worker exits its loop,
-	// then stop the coordinator (waits for the current job to finish).
+	// Cancel the main context so the replication worker stops taking new jobs,
+	// then tear the coordinator down under a bound of our own.
+	//
+	// c.Close() would self-bound at the same 30 s, but the budget has to start
+	// here rather than inside: Close's own default begins when Close is entered,
+	// which is fine today and stops being fine the moment anything is added
+	// between the cancel and the teardown.  Passing an explicit context also makes
+	// the deadline visible at the call site instead of being a property of the
+	// callee, and is the only way to make the derivation testable — see
+	// newShutdownContext for why it must not descend from the cancelled ctx.
 	cancel()
-	if err := c.Close(); err != nil {
-		slog.Error("error closing coordinator", "error", err)
+	closeCtx, closeCancel := newShutdownContext()
+	defer closeCancel()
+	if err := c.CloseContext(closeCtx); err != nil {
+		// Non-zero exit on a timed-out teardown is deliberate (#69's reasoning
+		// applied to #83): the process is terminating either way, but a transfer
+		// abandoned mid-flight or a site left unclosed is not a clean shutdown, and
+		// an orchestrator or an operator reading $? is entitled to know the
+		// difference.
+		slog.Error("error closing coordinator; shutdown was not clean",
+			"timeout", coordinatorShutdownTimeout, "error", err)
 		exitCode = 1
 	}
 
