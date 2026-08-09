@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/coordinator"
+	"github.com/scttfrdmn/globalfs/pkg/config"
 	"github.com/scttfrdmn/globalfs/pkg/site"
 	"github.com/scttfrdmn/globalfs/pkg/types"
 )
@@ -424,7 +426,7 @@ func TestObjectHead_CoordinatorError(t *testing.T) {
 func TestObjectAPI_FullRoundtrip(t *testing.T) {
 	c, _ := makeTestCoordinator(t, nil)
 	mux := http.NewServeMux()
-	registerAPIRoutes(mux, context.Background(), c, nil)
+	registerAPIRoutes(mux, context.Background(), c, nil, config.SecurityConfig{})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
@@ -1045,7 +1047,7 @@ func TestAddSite_MissingName(t *testing.T) {
 	body := `{"s3_bucket":"bucket","s3_region":"us-west-2"}`
 	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader(body))
 	w := httptest.NewRecorder()
-	addSiteHandler(context.Background(), c)(w, req)
+	addSiteHandler(context.Background(), c, config.SecurityConfig{})(w, req)
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("missing name: expected 400, got %d", w.Code)
@@ -1059,7 +1061,7 @@ func TestAddSite_MissingBucket(t *testing.T) {
 	body := `{"name":"site2","s3_region":"us-west-2"}`
 	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader(body))
 	w := httptest.NewRecorder()
-	addSiteHandler(context.Background(), c)(w, req)
+	addSiteHandler(context.Background(), c, config.SecurityConfig{})(w, req)
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("missing bucket: expected 400, got %d", w.Code)
@@ -1073,7 +1075,7 @@ func TestAddSite_InvalidRole(t *testing.T) {
 	body := `{"name":"site2","s3_bucket":"b","s3_region":"us-west-2","role":"invalid"}`
 	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader(body))
 	w := httptest.NewRecorder()
-	addSiteHandler(context.Background(), c)(w, req)
+	addSiteHandler(context.Background(), c, config.SecurityConfig{})(w, req)
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("invalid role: expected 400, got %d", w.Code)
@@ -1086,7 +1088,7 @@ func TestAddSite_InvalidJSON(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader("{not json}"))
 	w := httptest.NewRecorder()
-	addSiteHandler(context.Background(), c)(w, req)
+	addSiteHandler(context.Background(), c, config.SecurityConfig{})(w, req)
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("invalid JSON: expected 400, got %d", w.Code)
@@ -1096,6 +1098,13 @@ func TestAddSite_InvalidJSON(t *testing.T) {
 func TestAddSite_S3Unreachable_Returns502(t *testing.T) {
 	// Provides a syntactically valid request that will fail to connect.
 	// We use a context with a short timeout so the test does not hang.
+	//
+	// The endpoint is loopback, which the #76 SSRF guard blocks by default — so
+	// this test now allowlists that host explicitly. That is the point of the
+	// allowlist: reaching an unreachable loopback port is a legitimate thing for
+	// an operator to configure, and an unremarkable thing for a caller to be
+	// denied. Without the allowlist entry this request is a 400, and
+	// TestAddSite_EndpointRejected_Loopback asserts exactly that.
 	c, _ := makeTestCoordinator(t, nil)
 
 	body := `{"name":"remote","s3_bucket":"bucket","s3_region":"us-east-1","s3_endpoint":"http://127.0.0.1:19999"}`
@@ -1103,10 +1112,258 @@ func TestAddSite_S3Unreachable_Returns502(t *testing.T) {
 	defer cancel()
 	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader(body)).WithContext(ctx)
 	w := httptest.NewRecorder()
-	addSiteHandler(context.Background(), c)(w, req)
+	sec := config.SecurityConfig{AllowedEndpointHosts: []string{"127.0.0.1"}}
+	addSiteHandler(context.Background(), c, sec)(w, req)
 
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("unreachable S3: expected 502, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// The 502 body must not carry the transport error: an open non-HTTP port and
+	// a closed one produce different messages, which is a scan oracle (#76).
+	body502 := w.Body.String()
+	for _, leak := range []string{"connection refused", "dial tcp", "127.0.0.1", "malformed HTTP response"} {
+		if strings.Contains(body502, leak) {
+			t.Errorf("502 body leaks transport detail %q: %s", leak, body502)
+		}
+	}
+}
+
+// ── s3_endpoint SSRF guard (#76) ──────────────────────────────────────────────
+
+// TestAddSite_EndpointRejected_NoSignedRequestSent is the end-to-end assertion
+// for #76: pointing s3_endpoint at a listener the caller controls must not cause
+// the coordinator to send it anything.
+//
+// Pre-fix the handler passed the endpoint straight to objectfssdk.WithEndpoint
+// and site.NewFromConfig performed a HeadBucket against it, delivering a live
+// SigV4 Authorization header derived from the coordinator's own AWS credentials.
+// The listener here stands in for the attacker's host: receiving *any* request
+// on it is the failure, so the assertion is a request count of zero rather than
+// a status code. It is allowlisted so that only the address checks are out of
+// the way — the guard's URL-shape rules still apply, and the endpoint is
+// otherwise a perfectly ordinary one.
+func TestAddSite_EndpointRejected_NoSignedRequestSent(t *testing.T) {
+	var mu sync.Mutex
+	var received []string
+
+	victim := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		received = append(received, r.Method+" "+r.URL.Path+" auth="+r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer victim.Close()
+
+	c, _ := makeTestCoordinator(t, nil)
+
+	// Not allowlisted, and loopback: must be rejected before anything is signed.
+	body := `{"name":"probe","s3_bucket":"probe","s3_region":"us-west-2","s3_endpoint":"` + victim.URL + `"}`
+	req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	addSiteHandler(context.Background(), c, config.SecurityConfig{})(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 0 {
+		t.Errorf("coordinator sent %d request(s) to a caller-chosen host — SSRF with "+
+			"signed credentials (#76): %v", len(received), received)
+	}
+}
+
+// TestAddSite_EndpointRejected covers the endpoint shapes the handler must refuse
+// before signing anything, and asserts the response body carries no detail about
+// why (the reason goes to the log; see errEndpointRejected).
+func TestAddSite_EndpointRejected(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		endpoint string
+	}{
+		{"link-local IMDS", "http://169.254.169.254"},
+		{"IMDS with path", "http://169.254.169.254/latest/meta-data/"},
+		{"loopback v4", "http://127.0.0.1:9000"},
+		{"loopback name", "http://localhost:9000"},
+		{"loopback v6", "http://[::1]:9000"},
+		{"private RFC1918 10/8", "http://10.0.0.5:9000"},
+		{"private RFC1918 192.168/16", "http://192.168.1.10:9000"},
+		{"private RFC1918 172.16/12", "http://172.16.0.1:9000"},
+		{"CGNAT 100.64/10", "http://100.64.0.1:9000"},
+		{"IPv6 link-local", "http://[fe80::1]:9000"},
+		{"IPv6 unique-local", "http://[fd00::1]:9000"},
+		{"unspecified v4", "http://0.0.0.0:9000"},
+		{"file scheme", "file:///etc/passwd"},
+		{"gopher scheme", "gopher://10.0.0.1:70"},
+		{"no scheme", "169.254.169.254"},
+		{"scheme only", "http://"},
+		{"userinfo", "http://user:pass@s3.example.com"},
+		{"query string", "http://s3.example.com?x=1"},
+		{"fragment", "http://s3.example.com#f"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, _ := makeTestCoordinator(t, nil)
+
+			body := `{"name":"x","s3_bucket":"b","s3_region":"us-west-2","s3_endpoint":"` + tc.endpoint + `"}`
+			req := httptest.NewRequest("POST", "/api/v1/sites", strings.NewReader(body))
+			w := httptest.NewRecorder()
+			addSiteHandler(context.Background(), c, config.SecurityConfig{})(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("endpoint %q: got %d, want 400: %s", tc.endpoint, w.Code, w.Body.String())
+			}
+			// The response must not explain itself: "connection refused" vs
+			// "malformed HTTP response" vs "link-local" are all distinguishing
+			// signals a scanner can read.
+			for _, leak := range []string{"link-local", "loopback", "private", "resolve", "dial"} {
+				if strings.Contains(strings.ToLower(w.Body.String()), leak) {
+					t.Errorf("endpoint %q: response body leaks the reason %q: %s",
+						tc.endpoint, leak, w.Body.String())
+				}
+			}
+			if got := len(c.Sites()); got != 1 {
+				t.Errorf("site count changed to %d; the rejected site was registered", got)
+			}
+		})
+	}
+}
+
+// TestValidateS3Endpoint_Allowed covers the values that must keep working: an
+// empty endpoint (use AWS's default), an ordinary public host, and the two
+// escape hatches operators need.
+func TestValidateS3Endpoint_Allowed(t *testing.T) {
+	t.Parallel()
+
+	// A resolver that answers deterministically, so the test does not depend on
+	// DNS. "public.example" is public; "internal.example" is RFC1918.
+	resolve := func(_ context.Context, host string) ([]net.IPAddr, error) {
+		switch host {
+		case "public.example":
+			return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+		case "internal.example":
+			return []net.IPAddr{{IP: net.ParseIP("10.1.2.3")}}, nil
+		}
+		return nil, errors.New("no such host")
+	}
+
+	cases := []struct {
+		name     string
+		endpoint string
+		sec      config.SecurityConfig
+	}{
+		{"empty means AWS default", "", config.SecurityConfig{}},
+		{"public host", "https://public.example", config.SecurityConfig{}},
+		{"public host with trailing slash", "https://public.example/", config.SecurityConfig{}},
+		{"public IP literal", "https://93.184.216.34", config.SecurityConfig{}},
+		{"private allowed by opt-in", "http://10.0.0.5:9000",
+			config.SecurityConfig{AllowPrivateEndpoints: true}},
+		{"private DNS name allowed by opt-in", "http://internal.example:9000",
+			config.SecurityConfig{AllowPrivateEndpoints: true}},
+		{"loopback allowed by allowlist", "http://127.0.0.1:4566",
+			config.SecurityConfig{AllowedEndpointHosts: []string{"127.0.0.1"}}},
+		{"allowlist is case-insensitive", "http://MinIO.Local:9000",
+			config.SecurityConfig{AllowedEndpointHosts: []string{"minio.local"}}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if err, reason := validateS3Endpoint(context.Background(), tc.endpoint, tc.sec, resolve); err != nil {
+				t.Errorf("validateS3Endpoint(%q) = %v (%s), want nil", tc.endpoint, err, reason)
+			}
+		})
+	}
+}
+
+// TestValidateS3Endpoint_ResolvedAddressIsChecked is the half of #76 that string
+// matching would miss: a public-looking DNS name whose A record points into
+// private or link-local space. The check runs after resolution, and every answer
+// must pass — one public address does not license a second internal one.
+func TestValidateS3Endpoint_ResolvedAddressIsChecked(t *testing.T) {
+	t.Parallel()
+
+	resolve := func(_ context.Context, host string) ([]net.IPAddr, error) {
+		switch host {
+		case "imds.attacker.example":
+			return []net.IPAddr{{IP: net.ParseIP("169.254.169.254")}}, nil
+		case "internal.attacker.example":
+			return []net.IPAddr{{IP: net.ParseIP("10.0.0.1")}}, nil
+		case "mixed.attacker.example":
+			// One public answer and one internal: must still be rejected.
+			return []net.IPAddr{
+				{IP: net.ParseIP("93.184.216.34")},
+				{IP: net.ParseIP("169.254.169.254")},
+			}, nil
+		case "empty.example":
+			return nil, nil
+		}
+		return nil, errors.New("no such host")
+	}
+
+	for _, host := range []string{
+		"imds.attacker.example",
+		"internal.attacker.example",
+		"mixed.attacker.example",
+		"empty.example",
+		"nxdomain.example",
+	} {
+		endpoint := "https://" + host
+		err, reason := validateS3Endpoint(context.Background(), endpoint, config.SecurityConfig{}, resolve)
+		if err == nil {
+			t.Errorf("validateS3Endpoint(%q) = nil, want rejection — a DNS name pointing at "+
+				"an internal address must be caught after resolution (#76)", endpoint)
+			continue
+		}
+		if !errors.Is(err, errEndpointRejected) {
+			t.Errorf("validateS3Endpoint(%q) returned %v, want errEndpointRejected", endpoint, err)
+		}
+		if reason == "" {
+			t.Errorf("validateS3Endpoint(%q) gave no reason to log", endpoint)
+		}
+	}
+}
+
+// TestIsDisallowedAddr_PrivateOptInDoesNotUnblockLinkLocal pins the deliberate
+// asymmetry in the opt-in: allow_private_endpoints exists for in-cluster MinIO on
+// an RFC1918 address, and must not thereby open 169.254.169.254 or loopback.
+func TestIsDisallowedAddr_PrivateOptInDoesNotUnblockLinkLocal(t *testing.T) {
+	t.Parallel()
+
+	stillBlocked := []string{
+		"169.254.169.254", // IMDS
+		"127.0.0.1",
+		"::1",
+		"fe80::1",
+		"0.0.0.0",
+		"224.0.0.1", // multicast
+	}
+	for _, s := range stillBlocked {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			t.Fatalf("bad test address %q", s)
+		}
+		if bad, _ := isDisallowedAddr(ip, true); !bad {
+			t.Errorf("isDisallowedAddr(%s, allowPrivate=true) = false; "+
+				"the private opt-in must not unblock this class (#76)", s)
+		}
+	}
+
+	// And the addresses the opt-in is actually for do become allowed.
+	for _, s := range []string{"10.0.0.5", "192.168.1.1", "172.16.0.1", "fd00::1", "100.64.0.1"} {
+		ip := net.ParseIP(s)
+		if bad, _ := isDisallowedAddr(ip, false); !bad {
+			t.Errorf("isDisallowedAddr(%s, allowPrivate=false) = false, want blocked", s)
+		}
+		if bad, reason := isDisallowedAddr(ip, true); bad {
+			t.Errorf("isDisallowedAddr(%s, allowPrivate=true) = true (%s), want allowed", s, reason)
+		}
 	}
 }
 
@@ -1379,7 +1636,7 @@ func makeTestServer(t *testing.T, objs map[string][]byte, apiKey string) (*httpt
 	t.Helper()
 	c, mc := makeTestCoordinator(t, objs)
 	mux := http.NewServeMux()
-	registerAPIRoutes(mux, context.Background(), c, nil)
+	registerAPIRoutes(mux, context.Background(), c, nil, config.SecurityConfig{})
 	srv := httptest.NewServer(buildHandler(mux, apiKey))
 	t.Cleanup(srv.Close)
 	return srv, c, mc

@@ -247,7 +247,7 @@ func main() {
 	mux.HandleFunc("/readyz", readyzHandler())
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("GET /api/v1/info", infoHandler(c, version, startTime))
-	registerAPIRoutes(mux, ctx, c, m)
+	registerAPIRoutes(mux, ctx, c, m, cfg.Security)
 
 	// buildHandler applies the middleware chain; see its doc comment for the
 	// order and why the path-traversal guard has to wrap the mux directly.

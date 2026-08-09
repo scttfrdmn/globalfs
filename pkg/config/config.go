@@ -91,6 +91,39 @@ type CacheConfig struct {
 	TTL time.Duration `yaml:"ttl"`
 }
 
+// SecurityConfig groups settings that constrain what the coordinator will do on
+// behalf of an API caller.
+//
+// It exists because POST /api/v1/sites accepts an s3_endpoint and the
+// coordinator then signs a HeadBucket against it with its own AWS credentials.
+// Unconstrained, that is an SSRF primitive that hands a live SigV4
+// Authorization header to any host the caller names, including link-local IMDS
+// (#76).  The defaults below block that; these fields are the escape hatch for
+// operators whose storage genuinely is on a private address.
+//
+// Endpoints in the `sites:` block of a config file are not subject to these
+// checks.  A config file is operator-supplied input, the API is not.
+type SecurityConfig struct {
+	// AllowPrivateEndpoints permits site endpoints that resolve into private
+	// address space (RFC1918, RFC4193 unique-local, RFC6598 CGNAT) — the case
+	// for an in-cluster MinIO.  Default false.
+	//
+	// It deliberately does not unblock loopback, link-local, unspecified, or
+	// multicast addresses: 169.254.169.254 is the highest-value target here and
+	// no legitimate S3 endpoint lives there.  Use AllowedEndpointHosts for
+	// those.
+	AllowPrivateEndpoints bool `yaml:"allow_private_endpoints"`
+
+	// AllowedEndpointHosts is an exact-match allowlist of endpoint hosts that
+	// skip address checks entirely.  Compared case-insensitively against the
+	// URL host with any port removed; a hostname or an IP literal both work.
+	//
+	// This is the narrow escape hatch — naming one host is a much smaller grant
+	// than unblocking a whole address class, and it is the only way to permit a
+	// loopback endpoint.
+	AllowedEndpointHosts []string `yaml:"allowed_endpoint_hosts"`
+}
+
 // ResilienceConfig groups fault-tolerance and health-monitoring settings.
 type ResilienceConfig struct {
 	// HealthPollInterval sets the background site health check cadence.
@@ -130,6 +163,10 @@ type Configuration struct {
 
 	// Cache configures the in-memory LRU object cache.
 	Cache CacheConfig `yaml:"cache"`
+
+	// Security constrains what the API will accept from a caller — currently
+	// which S3 endpoints a runtime site registration may point at.
+	Security SecurityConfig `yaml:"security"`
 }
 
 // GlobalConfig contains global settings.
@@ -251,6 +288,12 @@ func NewDefault() *Configuration {
 			Enabled:  false,
 			MaxBytes: 64 * 1024 * 1024, // 64 MiB
 			TTL:      0,
+		},
+		Security: SecurityConfig{
+			// Deny by default: an operator who needs an in-cluster endpoint opts
+			// in, rather than every deployment shipping an SSRF primitive so that
+			// the MinIO case works unconfigured.
+			AllowPrivateEndpoints: false,
 		},
 	}
 }

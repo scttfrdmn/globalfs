@@ -276,6 +276,39 @@ Put and Delete invalidate the affected key so stale data is never returned.
 | `transfer_chunk_size` | int | `16777216` | Transfer chunk size in bytes (16 MiB) |
 | `cache_size` | string | `1GB` | Passed to ObjectFS (informational) |
 
+### `security`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allow_private_endpoints` | bool | `false` | Permit API-supplied `s3_endpoint` values that resolve into private address space |
+| `allowed_endpoint_hosts` | []string | _(empty)_ | Exact-match hosts exempt from endpoint address checks |
+
+These apply only to `s3_endpoint` in `POST /api/v1/sites`, not to the `sites:`
+block of a config file — a config file is operator input, the API is not.
+
+`POST /api/v1/sites` makes the coordinator sign a `HeadBucket` to the endpoint
+with its own AWS credentials, so an unconstrained endpoint would hand a valid
+SigV4 `Authorization` header to any host a caller names. Endpoints must be
+absolute `http`/`https` origins, and are rejected if they resolve to loopback,
+link-local (including IMDS at `169.254.169.254`), unspecified, or multicast
+addresses — checked after DNS resolution, so a public name pointing at an
+internal address is caught too.
+
+Set `allow_private_endpoints: true` for in-cluster MinIO on an RFC1918 address.
+It does **not** unblock loopback or link-local; use `allowed_endpoint_hosts` for
+those:
+
+```yaml
+security:
+  allow_private_endpoints: true
+  allowed_endpoint_hosts:
+    - minio.storage.svc.cluster.local
+```
+
+Known gap: the interval between resolving the host and the S3 SDK connecting is
+a DNS-rebinding window. Closing it requires pinning the connection to the
+resolved address, which the ObjectFS SDK does not currently expose.
+
 ---
 
 ## CLI Reference
@@ -541,6 +574,12 @@ Register a new site. Returns `201 Created`.
   "s3_endpoint": ""
 }
 ```
+
+`s3_endpoint` is optional; empty means the AWS default for the region. When
+supplied it must be an absolute `http`/`https` origin (no userinfo, path, query,
+or fragment) that does not resolve into a blocked address range — see
+[`security`](#security). Rejected endpoints return `400`; a reachability failure
+returns `502` with a generic message, the detail going to the coordinator log.
 
 #### `DELETE /api/v1/sites/{name}`
 
