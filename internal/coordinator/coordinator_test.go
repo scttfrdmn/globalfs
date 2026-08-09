@@ -3540,3 +3540,328 @@ func makeMountOnly(name string) *site.SiteMount {
 	m, _ := makeMount(name, types.SiteRoleBackup, nil)
 	return m
 }
+
+// ─── Cache/write races (#89, #90) ──────────────────────────────────────────────
+//
+// The bug these cover is a read-through fill that is not atomic with the read it
+// caches.  Reproducing it needs a site read parked *between* the two halves of
+// Get — after s.Get has produced bytes, before the cache is populated — with a
+// Put or Delete completing in the window.  memClient can gate Put, Health and
+// Close but not Get, and a getFn hook cannot express "block, then release"
+// without the coordination below, so this is its own client.
+
+// gatedGetClient is an ObjectFSClient whose Get blocks until released, so a test
+// can hold a read-through fill open across a concurrent write or delete.
+//
+// Put and Delete deliberately do *not* block: the point is to let the writer run
+// to completion while the reader is parked.
+type gatedGetClient struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+	// gate is closed to release parked Gets.  Reads take a snapshot of the value
+	// they will return *before* waiting, which is what makes the reader hold
+	// pre-write bytes: a Get that re-read the map after the gate opened would
+	// observe the new value and the race would be untestable.
+	gate    chan struct{}
+	entered chan struct{} // buffered; one token per Get that reached the gate
+	// delay, when non-zero, is slept after the snapshot instead of waiting on the
+	// gate.  It gives the unsynchronised test a fill window wide enough to hit:
+	// against in-memory sites the read and the fill are microseconds apart, so
+	// unaided concurrency reproduces the race far too rarely to be a regression
+	// test.
+	delay time.Duration
+}
+
+func newGatedGetClient(objs map[string][]byte) *gatedGetClient {
+	if objs == nil {
+		objs = make(map[string][]byte)
+	}
+	return &gatedGetClient{
+		objects: objs,
+		gate:    make(chan struct{}),
+		entered: make(chan struct{}, 16),
+	}
+}
+
+// newSlowGetClient returns a client whose Get snapshots its value, waits delay,
+// and then returns it — a site read with a realistic window between "the bytes
+// were current" and "the bytes reach the caller", with no test coordination.
+func newSlowGetClient(objs map[string][]byte, delay time.Duration) *gatedGetClient {
+	g := newGatedGetClient(objs)
+	g.delay = delay
+	close(g.gate) // never parks; the delay is the window
+	return g
+}
+
+func (g *gatedGetClient) Get(_ context.Context, key string, _, _ int64) ([]byte, error) {
+	g.mu.Lock()
+	data, ok := g.objects[key]
+	var snapshot []byte
+	if ok {
+		snapshot = make([]byte, len(data))
+		copy(snapshot, data)
+	}
+	g.mu.Unlock()
+
+	// Signal before waiting, so the test knows the read is in flight and the
+	// bytes are already determined.
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	if g.delay > 0 {
+		time.Sleep(g.delay)
+	}
+	<-g.gate
+
+	if !ok {
+		return nil, notFound(key)
+	}
+	return snapshot, nil
+}
+
+func (g *gatedGetClient) Put(_ context.Context, key string, data []byte) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	g.objects[key] = cp
+	return nil
+}
+
+func (g *gatedGetClient) Delete(_ context.Context, key string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.objects, key)
+	return nil
+}
+
+func (g *gatedGetClient) List(_ context.Context, prefix string, _ int) ([]objectfstypes.ObjectInfo, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var out []objectfstypes.ObjectInfo
+	for k, v := range g.objects {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, objectfstypes.ObjectInfo{Key: k, Size: int64(len(v))})
+		}
+	}
+	return out, nil
+}
+
+func (g *gatedGetClient) Head(_ context.Context, key string) (*objectfstypes.ObjectInfo, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	data, ok := g.objects[key]
+	if !ok {
+		return nil, notFound(key)
+	}
+	return &objectfstypes.ObjectInfo{Key: key, Size: int64(len(data))}, nil
+}
+
+func (g *gatedGetClient) Health(context.Context) error { return nil }
+func (g *gatedGetClient) Close() error                 { return nil }
+
+// hasKey reports whether the site still holds key.
+func (g *gatedGetClient) hasKey(key string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	_, ok := g.objects[key]
+	return ok
+}
+
+// waitForGet blocks until a Get has reached the gate, so the test can be sure
+// the read is parked with its bytes already chosen.
+func (g *gatedGetClient) waitForGet(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	select {
+	case <-g.entered:
+	case <-time.After(timeout):
+		t.Fatalf("no Get reached the gate within %v", timeout)
+	}
+}
+
+// release unparks every waiting Get.  Safe to call more than once.
+func (g *gatedGetClient) release() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	select {
+	case <-g.gate:
+		// already closed
+	default:
+		close(g.gate)
+	}
+}
+
+// TestCoordinator_Get_StaleFillAfterPutIsNotCached is the #89 acceptance test.
+//
+// A Get is parked mid-site-read holding "v1"; a Put commits "v2" at the site and
+// invalidates the cache — finding nothing, because the entry does not exist yet;
+// the reader is then released.  Before the generation fence the reader's fill
+// reinstated "v1" with no expiry (TTL defaults to 0), and every later Get was a
+// cache hit on overwritten bytes for the process lifetime.
+func TestCoordinator_Get_StaleFillAfterPutIsNotCached(t *testing.T) {
+	t.Parallel()
+
+	gc := newGatedGetClient(map[string][]byte{"k": []byte("v1")})
+	primary := site.New("primary", types.SiteRolePrimary, gc)
+
+	c := New(primary)
+	c.SetCache(cache.New(cache.Config{MaxBytes: 1 << 20})) // TTL 0: no expiry
+	ctx := context.Background()
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		// The value this read returns is legitimately the pre-write one — it was
+		// current when the read began.  What must not happen is it being cached.
+		_, _ = c.Get(ctx, "k")
+	}()
+
+	gc.waitForGet(t, 5*time.Second)
+
+	// The writer runs to completion while the reader is parked.
+	if err := c.Put(ctx, "k", []byte("v2")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	gc.release()
+	<-readDone
+
+	// The site now holds v2, and the gate is open, so the only way to see v1 is
+	// from the cache.
+	data, err := c.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("Get after Put: %v", err)
+	}
+	if string(data) != "v2" {
+		t.Errorf("Get after a committed Put returned %q, want v2: the parked read's "+
+			"fill reinstated pre-write bytes the Put had already invalidated (#89)", data)
+	}
+}
+
+// TestCoordinator_Get_StaleFillAfterDeleteIsNotCached is the #90 acceptance test.
+//
+// Same race, sharper post-condition: after a Delete that succeeded at every site,
+// the object must be *unreadable*, not merely current.  The cache is the only
+// copy left, so a fill that lands after the delete means a deletion the system
+// reported as fully successful did not make the data unreadable.
+func TestCoordinator_Get_StaleFillAfterDeleteIsNotCached(t *testing.T) {
+	t.Parallel()
+
+	gc := newGatedGetClient(map[string][]byte{"phi/record": []byte("SENSITIVE")})
+	primary := site.New("primary", types.SiteRolePrimary, gc)
+
+	c := New(primary)
+	c.SetCache(cache.New(cache.Config{MaxBytes: 1 << 20}))
+	ctx := context.Background()
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		_, _ = c.Get(ctx, "phi/record")
+	}()
+
+	gc.waitForGet(t, 5*time.Second)
+
+	if err := c.Delete(ctx, "phi/record"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if gc.hasKey("phi/record") {
+		t.Fatal("precondition: the delete did not remove the object from the site")
+	}
+
+	gc.release()
+	<-readDone
+
+	data, err := c.Get(ctx, "phi/record")
+	if err == nil {
+		t.Fatalf("a fully-deleted object is still readable: Get returned %q (#90)", data)
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get after Delete: got %v, want an error wrapping ErrNotFound", err)
+	}
+}
+
+// TestCoordinator_Get_UncontendedFillStillPopulatesCache guards the other
+// direction of the fence.  If it over-refused, the cache would never populate and
+// the fix would be a silent performance regression that no correctness test
+// notices.
+func TestCoordinator_Get_UncontendedFillStillPopulatesCache(t *testing.T) {
+	t.Parallel()
+
+	primary, mc := makeMount("primary", types.SiteRolePrimary, map[string][]byte{
+		"k": []byte("v"),
+	})
+	c := New(primary)
+	c.SetCache(cache.New(cache.Config{MaxBytes: 1 << 20}))
+	ctx := context.Background()
+
+	if _, err := c.Get(ctx, "k"); err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+
+	// Remove the object from the site.  A second Get can now only succeed from
+	// the cache, so serving it proves the first Get's fill was accepted.
+	if err := mc.Delete(ctx, "k"); err != nil {
+		t.Fatalf("site Delete: %v", err)
+	}
+	data, err := c.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("second Get: the read-through fill was refused even with no "+
+			"concurrent invalidation: %v", err)
+	}
+	if string(data) != "v" {
+		t.Errorf("cached read: got %q, want v", data)
+	}
+}
+
+// TestCoordinator_Get_ConcurrentWritesNeverLeaveStaleCache is the unsynchronised
+// version: readers and writers on one key with no gate holding an interleaving
+// open, under -race.  It exists because the gated tests pin one ordering and the
+// fix has to hold for all of them.
+//
+// The site read carries a millisecond of latency, which is what makes this a
+// regression test rather than a coin flip: against a purely in-memory site the
+// read and the fill are microseconds apart and the window is almost never hit.
+// The invariant asserted is the one that matters — once the writes have settled, a
+// read must not return an earlier value.
+func TestCoordinator_Get_ConcurrentWritesNeverLeaveStaleCache(t *testing.T) {
+	t.Parallel()
+
+	gc := newSlowGetClient(map[string][]byte{"k": []byte("v0")}, time.Millisecond)
+	primary := site.New("primary", types.SiteRolePrimary, gc)
+
+	c := New(primary)
+	c.SetCache(cache.New(cache.Config{MaxBytes: 1 << 20}))
+	ctx := context.Background()
+
+	const writes = 30
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= writes; i++ {
+			if err := c.Put(ctx, "k", []byte(fmt.Sprintf("v%d", i))); err != nil {
+				t.Errorf("Put %d: %v", i, err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < writes*4; i++ {
+			_, _ = c.Get(ctx, "k")
+		}
+	}()
+	wg.Wait()
+
+	final := fmt.Sprintf("v%d", writes)
+	data, err := c.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("final Get: %v", err)
+	}
+	if string(data) != final {
+		t.Errorf("final Get returned %q, want %q: a read-through fill outlived a "+
+			"later write, and with TTL defaulting to 0 nothing ages it out (#89)", data, final)
+	}
+}

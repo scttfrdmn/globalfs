@@ -1236,6 +1236,12 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 	c.mu.RUnlock()
 
 	// Cache read-through: serve from cache when available.
+	//
+	// cacheGen is the invalidation generation observed *before* the site read, and
+	// is what the fill below is conditioned on.  It has to be captured here, not
+	// next to the fill: the whole point is to notice a Put or Delete that landed
+	// while this goroutine was blocked in s.Get (#89, #90).
+	var cacheGen uint64
 	if oc != nil {
 		if cached, ok := oc.Get(key); ok {
 			c.metricsCacheHit()
@@ -1243,6 +1249,7 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 			return cached, nil
 		}
 		c.metricsCacheMiss()
+		cacheGen = oc.Generation()
 	}
 
 	ordered, err := pol.Route(policy.OperationRead, key, snapshot)
@@ -1274,12 +1281,20 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 			allNotFound = false
 		}
 		if siteErr == nil {
-			// Populate cache on successful site fetch.
+			// Populate the cache on a successful site fetch — but only if nothing
+			// was invalidated while the read was in flight.  A Put or Delete that
+			// committed at the sites and then cleared the cache found nothing to
+			// clear, because this entry did not exist yet, so an unconditional fill
+			// reinstated bytes the caller had already overwritten or erased, with no
+			// expiry to bound how long they were served (#89, #90).  Skipping the
+			// fill costs one cache miss on the next read, which is always safe.
 			if oc != nil {
-				evicted := oc.PutAndRecordEvictions(key, data)
-				c.metricsCacheBytes(oc.Stats().Bytes)
-				for i := int64(0); i < evicted; i++ {
-					c.metricsCacheEviction()
+				evicted, stored := oc.PutIfUnchanged(key, data, cacheGen)
+				if stored {
+					c.metricsCacheBytes(oc.Stats().Bytes)
+					for i := int64(0); i < evicted; i++ {
+						c.metricsCacheEviction()
+					}
 				}
 			}
 			return data, nil
