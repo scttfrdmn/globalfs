@@ -127,6 +127,46 @@ const apiKeyHeader = "X-GlobalFS-API-Key"
 // likely cause and the Location is the thing that identifies it.
 var ErrUnexpectedRedirect = errors.New("coordinator returned an unexpected redirect")
 
+// ErrReplicationPending reports that a PutObject write was committed but
+// replication to one or more secondaries could not be queued.
+//
+// The write succeeded.  The bytes are durable on every primary and the object is
+// readable immediately; only the asynchronous copies to the named secondaries
+// were not scheduled, and the coordinator answered 202 rather than 201 to say so
+// (#130).  A caller must not retry the write on this error: the retry would be a
+// second full upload of data that is already stored.
+//
+// It is returned as an error rather than swallowed into a nil precisely because
+// the write is not wholly complete.  A nil would make the client report full
+// durability the coordinator did not claim — the "success while something is
+// wrong" shape that #130 and its neighbours are about, just inverted.  So the
+// contract is: non-nil, but committed.  Test for it and continue:
+//
+//	err := c.PutObject(ctx, key, data)
+//	switch {
+//	case errors.Is(err, client.ErrReplicationPending):
+//	    // stored; log it, do not retry
+//	case err != nil:
+//	    return err
+//	}
+//
+// A sentinel is used rather than a distinct exported type, or a changed
+// PutObject signature, for three reasons.  It matches how the coordinator
+// already communicates this condition internally (ErrReplicationNotQueued), so
+// the same shape survives the whole round trip.  errors.Is answers the only
+// question a caller has to ask, with no string matching and no type assertion,
+// and it stays correct if the error is later wrapped further up.  And it does not
+// break the signature, so every existing caller that treats a non-nil error as
+// "did not fully succeed" remains *safe* by default — conservative, never
+// silently wrong — while a caller who cares can opt into the distinction.
+//
+// The wrapped message carries the coordinator's detail string, which names the
+// destinations that got no job.  As on the server side, those names are not
+// broken out into fields: obtaining them would mean parsing another package's
+// formatted output, which is a silent breakage waiting for that format to
+// change.
+var ErrReplicationPending = errors.New("object stored but replication was not queued")
+
 // ErrInvalidKey reports that an object key was rejected locally, before any
 // request was sent.
 //
@@ -409,7 +449,13 @@ func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 	return data, nil
 }
 
-// PutObject stores data under key. It returns nil on success.
+// PutObject stores data under key. It returns nil when the object is stored and
+// fully replicated (the coordinator's 201).
+//
+// It returns an error wrapping [ErrReplicationPending] when the object is stored
+// but replication could not be queued (the coordinator's 202).  That case is a
+// committed write and must not be retried; see [ErrReplicationPending].  Any
+// other non-2xx is an *[APIError] and the write did not happen.
 //
 // An invalid key is rejected locally; see GetObject and [ErrInvalidKey].
 func (c *Client) PutObject(ctx context.Context, key string, data []byte) error {
@@ -421,7 +467,47 @@ func (c *Client) PutObject(ctx context.Context, key string, data []byte) error {
 		return err
 	}
 	defer resp.Body.Close()
+
+	// Branch here rather than teaching checkStatus a set of acceptable codes.
+	// checkStatus's job is "this code is wrong, here is why", and the two 2xx
+	// codes do not mean the same thing to the caller — a multi-status form of
+	// checkStatus would collapse them back into one and lose the distinction this
+	// method exists to report.  ListObjects treats 207 the same way, for the same
+	// reason (see its comment); this keeps the two consistent.
+	if resp.StatusCode == http.StatusAccepted {
+		return fmt.Errorf("put object %q: %w: %s", key, ErrReplicationPending, putPartialDetail(resp))
+	}
 	return checkStatus(resp, http.StatusCreated)
+}
+
+// objectPutPartialResponse mirrors the coordinator's 202 body for a stored write
+// whose replication was not queued.  It is deliberately not an error envelope on
+// the wire, so it cannot be read out by checkStatus.
+type objectPutPartialResponse struct {
+	Key    string `json:"key"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+}
+
+// putPartialDetail extracts the coordinator's explanation from a 202 body,
+// falling back to a fixed string when the body is absent or unparseable.
+//
+// The fallback matters: the caller's decision is driven by ErrReplicationPending,
+// which is already established by the status code, so a body that cannot be read
+// must not be allowed to turn a committed write into a different outcome.  An
+// older coordinator, or a proxy that strips the body, still yields the correct
+// sentinel with a vaguer message.
+func putPartialDetail(resp *http.Response) string {
+	var partial objectPutPartialResponse
+	if err := json.NewDecoder(resp.Body).Decode(&partial); err == nil {
+		if partial.Detail != "" {
+			return partial.Detail
+		}
+		if partial.Status != "" {
+			return partial.Status
+		}
+	}
+	return "coordinator reported the write as stored but not fully replicated"
 }
 
 // HeadObject returns metadata for the object at key without fetching its

@@ -19,6 +19,7 @@ import (
 
 	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
 	"github.com/scttfrdmn/globalfs/internal/coordinator"
+	"github.com/scttfrdmn/globalfs/pkg/client"
 	"github.com/scttfrdmn/globalfs/pkg/config"
 	"github.com/scttfrdmn/globalfs/pkg/site"
 	"github.com/scttfrdmn/globalfs/pkg/types"
@@ -505,6 +506,56 @@ func TestObjectPut_PrimaryFailureStillReturns502(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "error") {
 		t.Errorf("502 body is not an error envelope: %s", w.Body.String())
+	}
+}
+
+// TestObjectPut_ReplicationNotQueued_RoundTripsToClient closes #130 end to end.
+//
+// The two tests above assert what the coordinator emits, and pkg/client's tests
+// assert what it does with a 202 from a stub.  Neither shows that the real
+// handler and the real client agree, and that gap is exactly where #130 survived
+// its first fix: the coordinator started returning 202 while PutObject still
+// required an exact 201, so the defect reached the CLI unchanged.  This drives
+// the actual handler over a real socket with the actual client, so a future
+// change to either side that breaks the contract fails here.
+func TestObjectPut_ReplicationNotQueued_RoundTripsToClient(t *testing.T) {
+	c, _ := makeSaturatedReplicationCoordinator(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", objectPutHandler(c))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cl := client.New(srv.URL)
+
+	// As in the handler test: loop until one write hits the full queue, since the
+	// worker may not have dequeued the first job yet.
+	var err error
+	for i := 0; i < 10; i++ {
+		err = cl.PutObject(context.Background(), fmt.Sprintf("data/rt-%02d", i), []byte("payload"))
+		if err != nil {
+			break
+		}
+	}
+	if err == nil {
+		t.Fatal("no PUT hit a full replication queue after 10 attempts; " +
+			"the queue is being drained and the test cannot observe #130")
+	}
+
+	if !errors.Is(err, client.ErrReplicationPending) {
+		t.Fatalf("the coordinator's 202 did not reach the client as ErrReplicationPending: %#v (%v)", err, err)
+	}
+	// A committed write must not look like a failed request to a caller switching
+	// on *APIError — that is what made the CLI print "error" for durable bytes.
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) {
+		t.Errorf("the 202 arrived as *APIError (status %d): a committed write reported as a failure",
+			apiErr.StatusCode)
+	}
+	// And the coordinator's detail survives the trip, so an operator can see which
+	// site is behind.
+	if !strings.Contains(err.Error(), "backup") {
+		t.Errorf("the coordinator's detail was lost in transit (should name the un-queued site): %v", err)
 	}
 }
 

@@ -31,6 +31,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -303,6 +304,12 @@ func buildObjectGetCmd() *cobra.Command {
 type objectPutResult struct {
 	Key   string `json:"key"`
 	Bytes int    `json:"bytes"`
+	// ReplicationPending is true when the object is stored and readable but
+	// replication to one or more secondaries was not queued (#130).  Omitted on a
+	// fully replicated write so existing --json consumers see an unchanged shape.
+	ReplicationPending bool `json:"replication_pending,omitempty"`
+	// Detail carries the coordinator's explanation when ReplicationPending is set.
+	Detail string `json:"detail,omitempty"`
 }
 
 func buildObjectPutCmd() *cobra.Command {
@@ -332,14 +339,41 @@ func buildObjectPutCmd() *cobra.Command {
 			}
 
 			c := newClient()
-			if err := c.PutObject(context.Background(), key, data); err != nil {
+			// ErrReplicationPending is a committed write, so it is reported as a
+			// success with a caveat rather than as a failure (#130).  Printing
+			// "error" here for durable bytes is the concrete harm the issue names:
+			// an operator, or a script keying off the exit status, retries an upload
+			// that already landed.
+			//
+			// Exit status stays 0 for the same reason.  A non-zero exit is the only
+			// signal `set -e` and CI runners read, and it would make every one of
+			// them treat a stored object as a failed step.  Replication being
+			// behind is a condition of the deployment, not of this command — the
+			// coordinator retries it — and it is already visible in the text, in
+			// --json, and on the coordinator's own metrics.  If a caller does want
+			// to gate on it, --json now carries replication_pending.
+			result := objectPutResult{Key: key, Bytes: len(data)}
+			switch err := c.PutObject(context.Background(), key, data); {
+			case errors.Is(err, client.ErrReplicationPending):
+				result.ReplicationPending = true
+				result.Detail = err.Error()
+			case err != nil:
 				return err
 			}
 
 			if jsonOutput {
-				return printJSON(cmd.OutOrStdout(), objectPutResult{Key: key, Bytes: len(data)})
+				return printJSON(cmd.OutOrStdout(), result)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "stored %q (%d bytes)\n", key, len(data))
+			if result.ReplicationPending {
+				// Stderr, so the caveat is visible without contaminating stdout for
+				// anyone parsing the success line.
+				// Write error ignored as everywhere else in this file: a failed
+				// write to stderr must not turn a stored object into a failure.
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"warning: replication is not yet queued for %q; the object is stored and readable, do not re-upload it (%s)\n",
+					key, result.Detail)
+			}
 			return nil
 		},
 	}

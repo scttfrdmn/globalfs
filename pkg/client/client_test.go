@@ -1288,3 +1288,120 @@ func TestObjectKey_LegitimateKeysStillWork(t *testing.T) {
 		t.Errorf("server saw %d requests for %d legal keys: %v", len(paths), len(keys), paths)
 	}
 }
+
+// ── PutObject partial success (#130) ──────────────────────────────────────────
+
+// TestPutObject_202IsCommittedButPending pins the client half of #130: the
+// coordinator's 202 must arrive as something errors.Is-testable, and the caller
+// must be able to tell it apart from a real failure without reading the message.
+func TestPutObject_202IsCommittedButPending(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-GlobalFS-Replication", "pending")
+		writeJSON(w, http.StatusAccepted, map[string]string{
+			"key":    r.PathValue("key"),
+			"status": "stored; replication incomplete",
+			"detail": `coordinator: Put "uploads/data.bin": stored on primaries but replication not queued for [backup]`,
+		})
+	})
+	c := newServer(t, mux)
+
+	err := c.PutObject(context.Background(), "uploads/data.bin", []byte("payload"))
+	if err == nil {
+		t.Fatal("PutObject returned nil for a 202: a partially replicated write must not be reported as fully stored")
+	}
+	if !errors.Is(err, client.ErrReplicationPending) {
+		t.Fatalf("PutObject error does not wrap ErrReplicationPending: %#v (%v)", err, err)
+	}
+	// The whole point of the sentinel is that no *APIError leaks out: a caller
+	// switching on *APIError would treat this as a failed request.
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) {
+		t.Errorf("a 202 produced an *APIError (status %d): a committed write must not look like a failed request",
+			apiErr.StatusCode)
+	}
+	// The detail is carried through so an operator can see which site is behind.
+	if !strings.Contains(err.Error(), "backup") {
+		t.Errorf("error text lost the coordinator's detail (should name the un-queued site): %v", err)
+	}
+}
+
+// TestPutObject_PendingAndFailureAreDistinguishable is the assertion the
+// coordinator says matters: a partial success and a genuine failure must be told
+// apart by errors.Is alone, with no substring matching on either.
+func TestPutObject_PendingAndFailureAreDistinguishable(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		switch r.PathValue("key") {
+		case "pending":
+			writeJSON(w, http.StatusAccepted, map[string]string{"detail": "not queued for [backup]"})
+		default:
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "disk full"})
+		}
+	})
+	c := newServer(t, mux)
+
+	pendingErr := c.PutObject(context.Background(), "pending", []byte("v"))
+	failErr := c.PutObject(context.Background(), "broken", []byte("v"))
+
+	if !errors.Is(pendingErr, client.ErrReplicationPending) {
+		t.Errorf("202 did not wrap ErrReplicationPending: %v", pendingErr)
+	}
+	if errors.Is(failErr, client.ErrReplicationPending) {
+		t.Errorf("502 wrapped ErrReplicationPending: a failed write would be treated as committed and never retried: %v", failErr)
+	}
+
+	// And the 502 must still be a plain failure with its status code intact.
+	var apiErr *client.APIError
+	if !errors.As(failErr, &apiErr) {
+		t.Fatalf("502 did not produce an *APIError, got %T: %v", failErr, failErr)
+	}
+	if apiErr.StatusCode != http.StatusBadGateway {
+		t.Errorf("*APIError carries status %d, want 502", apiErr.StatusCode)
+	}
+}
+
+// TestPutObject_202WithUnreadableBodyStillPending checks that the sentinel is
+// driven by the status code, not by the body: a coordinator or proxy that omits
+// or mangles the JSON must not turn a committed write into a different outcome.
+func TestPutObject_202WithUnreadableBodyStillPending(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"empty body", ""},
+		{"not json", "replication queue full"},
+		{"json without detail", `{"key":"k"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("PUT /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = io.WriteString(w, tc.body)
+			})
+			c := newServer(t, mux)
+
+			err := c.PutObject(context.Background(), "k", []byte("v"))
+			if !errors.Is(err, client.ErrReplicationPending) {
+				t.Fatalf("202 with %s did not wrap ErrReplicationPending: %v", tc.name, err)
+			}
+			if err.Error() == "" {
+				t.Error("error message is empty")
+			}
+		})
+	}
+}
+
+// TestPutObject_201IsStillNil guards the other direction: the branch added for
+// 202 must not change the fully-successful case.
+func TestPutObject_201IsStillNil(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	})
+	c := newServer(t, mux)
+
+	if err := c.PutObject(context.Background(), "k", []byte("v")); err != nil {
+		t.Fatalf("a 201 must be a nil error, got %v", err)
+	}
+}
