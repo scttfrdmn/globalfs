@@ -17,8 +17,49 @@
 //
 // # Lifecycle
 //
-// Call Start to begin background replication processing, then Stop (or Close)
-// when done.  Coordinator is safe for concurrent use.
+// A Coordinator is **single-use**.  It moves through three states, in one
+// direction only, and never returns to an earlier one:
+//
+//	created --Start--> running --Stop--> stopped
+//	created ---------------Stop--------> stopped
+//
+// The rules that follow from that, all enforced rather than merely documented:
+//
+//   - **Start is idempotent and reports failure.**  It returns nil on the call
+//     that starts the coordinator (or that enters standby, which is a successful
+//     start with no worker), and nil again for every later call on a running
+//     coordinator.  It returns an error wrapping [ErrStopped] on a stopped one.
+//   - **Stop before Start is legal and terminal.**  It is a no-op on goroutines
+//     that do not exist, but it *does* move the coordinator to stopped, so a
+//     later Start fails loudly instead of running with replication silently off.
+//     Callers that stop defensively during a failed boot get an error they can
+//     act on rather than a healthy-looking coordinator that replicates nothing
+//     (#84).
+//   - **Stop-then-Start is illegal**, and the error says so.  Restarting would
+//     mean rebuilding the worker, its queue, its done channel and every
+//     in-flight job's context; a fresh [New] is the supported way to get a
+//     working coordinator, and it costs nothing but the site list.
+//   - **Start and Stop are ordered with respect to each other.**  Both transition
+//     the same `state` field under `c.mu`, so a Stop racing a Start either loses
+//     (Start wins, Stop then tears down what Start built) or wins (Start is
+//     refused and launches nothing).  It cannot land in between and leave
+//     goroutines nobody can cancel, which is what a nil `storeCancel` plus a
+//     zero `storeWg` used to allow — 59 of 60 races leaked a drain goroutine
+//     (#82).
+//   - **Configuration is frozen at Start.**  Every Set* method that Start reads
+//     once — SetStore, SetMetrics, SetWorkerQueueDepth, SetLeaseManager,
+//     SetLeaseTTL, SetHealthPollInterval — returns an error wrapping
+//     [ErrStarted] if called after Start, instead of mutating state the running
+//     goroutines have already copied (#85, #86).  The genuinely dynamic
+//     knobs — SetPolicy, SetCache, SetCircuitBreaker, SetRetryConfig,
+//     SetEnqueueBackpressure — stay callable at any time and return nothing.
+//
+// Stop and Close wait for the in-flight replication transfer to settle, which is
+// unbounded if the destination site is unresponsive.  Use [Coordinator.StopContext]
+// to bound that wait; a caller that must terminate (a SIGTERM handler) should
+// always use the bounded form (#83).
+//
+// Coordinator is safe for concurrent use.
 package coordinator
 
 import (
@@ -58,12 +99,38 @@ type Coordinator struct {
 	store        metadata.Store   // optional; nil means no persistence
 	m            *metrics.Metrics // optional; nil means no instrumentation
 	storeCancel  context.CancelFunc
-	storeWg      sync.WaitGroup
-	startOnce    sync.Once          // ensures Start() body runs exactly once
 	leaseManager *lease.Manager     // optional; nil means single-node mode
 	leaderLease  *lease.Lease       // non-nil when this instance is the leader
 	leaderCancel context.CancelFunc // cancels the leaderCtx
 	leaseTTL     time.Duration      // 0 → defaultLeaseTTL
+
+	// state is the coordinator's position in its one-directional lifecycle; see
+	// the package Lifecycle doc.  It replaced a sync.Once plus the nil-ness of
+	// storeCancel and the zero-ness of a shared WaitGroup, which between them
+	// could not order Start against Stop at all (#82, #84, #85).  Guarded by
+	// c.mu, the same lock every Set* method takes, so "has Start read this yet?"
+	// is one question with one answer rather than a per-field guess.
+	state coordState
+
+	// lifecycleMu serializes a whole Start against a whole Stop.
+	//
+	// c.mu cannot do this job: Start must release it across the lease
+	// acquisition and across recoverPendingJobs, both of which do I/O, and it is
+	// also the lock every in-flight Get and Put takes — holding it for the
+	// duration of a shutdown is exactly the availability problem #95 is about.
+	// A separate lifecycle lock keeps Start and Stop mutually exclusive without
+	// making either of them exclude ordinary traffic.
+	//
+	// Ordering rule: acquire lifecycleMu before c.mu, never the reverse.
+	lifecycleMu sync.Mutex
+
+	// drainWg tracks the worker-event drain goroutine; healthWg tracks the health
+	// poller.  Separate because Stop has to distinguish them: the final event
+	// flush is safe only once the drain has returned, and a health poller wedged
+	// in a probe that ignores its context must not be able to veto that flush.
+	// One shared WaitGroup made a stuck probe cost buffered replication events.
+	drainWg  sync.WaitGroup
+	healthWg sync.WaitGroup
 
 	// Background health polling.
 	healthPollInterval time.Duration // 0 → use defaultHealthPollInterval
@@ -84,6 +151,61 @@ type Coordinator struct {
 	// 0 → defaultEnqueueBackpressure.  Overridden in tests to keep them fast.
 	enqueueBackpressure time.Duration
 }
+
+// coordState is the coordinator's position in its one-directional lifecycle.
+// See the package Lifecycle doc for the contract it enforces.
+type coordState int
+
+const (
+	// coordCreated is a Coordinator that has never been started.
+	coordCreated coordState = iota
+	// coordRunning is a Coordinator whose Start has been accepted.  Standby
+	// counts: the lease was lost or held elsewhere, so no worker runs, but the
+	// coordinator started successfully and Stop still has work to undo.
+	coordRunning
+	// coordStopped is terminal.  Start on it returns ErrStopped.
+	coordStopped
+)
+
+func (s coordState) String() string {
+	switch s {
+	case coordCreated:
+		return "created"
+	case coordRunning:
+		return "running"
+	case coordStopped:
+		return "stopped"
+	default:
+		return fmt.Sprintf("coordState(%d)", int(s))
+	}
+}
+
+// ErrStarted reports that a configuration call arrived after Start, at which
+// point the value it sets has already been read and copied by the background
+// goroutines.  Such a call is a no-op, logged at Error; the sentinel exists so a
+// caller that wants to check first can, and so the message has one spelling.
+var ErrStarted = errors.New("coordinator already started")
+
+// ErrStopped reports that Start was called on a stopped Coordinator.
+//
+// A Coordinator is single-use: Stop is terminal even when it ran before Start
+// ever did.  A caller that stops defensively during a failed boot and then
+// starts must construct a new Coordinator with [New]; the alternative — a Start
+// that appears to succeed while replication is off for the process lifetime — is
+// the failure #84 describes, and this error is what makes it visible.
+var ErrStopped = errors.New("coordinator stopped; a Coordinator is single-use")
+
+// defaultStopTimeout bounds Stop and Close when the caller supplies no deadline
+// of their own.
+//
+// Unbounded was the previous behaviour and it is how a single unresponsive S3
+// endpoint kept the process alive past its SIGTERM grace period until the
+// orchestrator SIGKILLed it, discarding the in-memory replication queue (#83).
+// 30 s is chosen to sit inside a typical 60 s terminationGracePeriodSeconds with
+// room for the HTTP drain that precedes it, and to be long enough that a
+// genuinely slow-but-progressing transfer finishes rather than being abandoned.
+// Callers that know their own budget should pass it via StopContext/CloseContext.
+const defaultStopTimeout = 30 * time.Second
 
 // defaultHealthPollInterval is the cadence for background site health checks
 // when no explicit interval has been set via SetHealthPollInterval.
@@ -215,32 +337,50 @@ func recordSiteResult(cb *circuitbreaker.Breaker, name string, err error) {
 }
 
 // ── Metrics helpers ───────────────────────────────────────────────────────────
-// These wrappers centralise the nil check so call sites stay clean.
+//
+// Every *metrics.Metrics method is nil-safe on the receiver, so these wrappers
+// exist purely to funnel every read of c.m through metrics(), which does it under
+// the lock.  Reading the field directly was the race in #86: SetMetrics writes it
+// under c.mu, and an unsynchronized read of an interface-shaped field can observe
+// a non-nil type word with a stale data word, so the nil check passes and the call
+// dereferences garbage.  The nil checks the wrappers used to perform are gone
+// because they were never the load-bearing part — Metrics does them itself.
 
-func (c *Coordinator) metricsCacheHit() {
-	if c.m != nil {
-		c.m.RecordCacheHit()
-	}
+// metrics returns the registered Metrics, or nil.  The nil is safe to call
+// methods on; every *metrics.Metrics method returns early on a nil receiver.
+func (c *Coordinator) metrics() *metrics.Metrics {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.m
 }
-func (c *Coordinator) metricsCacheMiss() {
-	if c.m != nil {
-		c.m.RecordCacheMiss()
-	}
-}
-func (c *Coordinator) metricsCacheEviction() {
-	if c.m != nil {
-		c.m.RecordCacheEviction()
-	}
-}
-func (c *Coordinator) metricsCacheBytes(n int64) {
-	if c.m != nil {
-		c.m.SetCacheBytes(n)
-	}
-}
-func (c *Coordinator) metricsSiteCount(n int) {
-	if c.m != nil {
-		c.m.SetSiteCount(n)
-	}
+
+func (c *Coordinator) metricsCacheHit()          { c.metrics().RecordCacheHit() }
+func (c *Coordinator) metricsCacheMiss()         { c.metrics().RecordCacheMiss() }
+func (c *Coordinator) metricsCacheEviction()     { c.metrics().RecordCacheEviction() }
+func (c *Coordinator) metricsCacheBytes(n int64) { c.metrics().SetCacheBytes(n) }
+
+// metricsSiteCountLocked records the site count.  Unlike its siblings this one is
+// called from AddSite/RemoveSite with c.mu already held for writing, so it reads
+// the field directly — taking RLock here would deadlock on Go's non-reentrant
+// RWMutex.
+func (c *Coordinator) metricsSiteCountLocked(n int) { c.m.SetSiteCount(n) }
+
+// workerRef returns the replication worker under the read lock.
+//
+// SetWorkerQueueDepth writes c.worker under c.mu; Put, Replicate,
+// ReplicationQueueDepth and the event drain all used to read it without any lock,
+// which is a pointer race regardless of how benign the timing looks — the second
+// half of #85, and confirmed by -race on the exported
+// ReplicationQueueDepth/SetWorkerQueueDepth pair alone.  Gating the setter on
+// started-state narrows the window but does not close it: two goroutines can still
+// configure and read a *created* coordinator concurrently.
+//
+// The pointer is stable for the whole running lifetime, so callers may hold the
+// returned value across a long operation; the lock is only needed to read it.
+func (c *Coordinator) workerRef() *replication.Worker {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.worker
 }
 
 // New creates a Coordinator from an ordered list of SiteMounts.
@@ -273,15 +413,46 @@ func (c *Coordinator) SetPolicy(e *policy.Engine) {
 	}
 }
 
+// setBeforeStart applies fn under c.mu, but only while the coordinator is still
+// in the created state.
+//
+// It is the single gate behind every configuration setter whose value Start reads
+// once and hands to a goroutine.  Mutating such a field afterwards cannot take
+// effect — the goroutine already has its copy — so the honest outcomes are an
+// error and a no-op, not a silent write to a field nobody will read again.  What
+// it replaces is a set of methods that documented one behaviour ("no effect after
+// Start") and implemented another, of which SetWorkerQueueDepth was the
+// destructive case: it replaced a *running* worker, leaking its goroutine and
+// leaving the new one unstarted, so every subsequent Enqueue filled a queue
+// nobody drained while Put kept returning nil (#85).
+//
+// The error is logged here as well as returned.  Every shipped call site is in
+// cmd/coordinator before Start, where this returns nil; a call that arrives after
+// Start is a caller bug, and the log is what makes it visible even to a caller
+// that discards the error.
+func (c *Coordinator) setBeforeStart(name string, fn func()) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.state {
+	case coordRunning, coordStopped:
+		err := fmt.Errorf("coordinator: %s after Start (state=%s): %w", name, c.state, ErrStarted)
+		slog.Error("coordinator: configuration call ignored", "call", name, "state", c.state.String())
+		return err
+	}
+	fn()
+	return nil
+}
+
 // SetStore registers a metadata store for persistence.
 //
 // When set, replication jobs are persisted before they are enqueued so they
 // survive coordinator restarts.  Completed and failed jobs are deleted from
-// the store.  SetStore must be called before Start to enable job recovery.
-func (c *Coordinator) SetStore(s metadata.Store) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.store = s
+// the store.
+//
+// Must be called before Start; returns an error wrapping [ErrStarted] otherwise,
+// having changed nothing.
+func (c *Coordinator) SetStore(s metadata.Store) error {
+	return c.setBeforeStart("SetStore", func() { c.store = s })
 }
 
 // SetLeaseManager registers a distributed lease manager.
@@ -291,43 +462,54 @@ func (c *Coordinator) SetStore(s metadata.Store) {
 // worker is not started and the coordinator operates in standby mode (writes
 // still reach primary sites synchronously, but async replication is skipped).
 //
-// SetLeaseManager must be called before Start.
-func (c *Coordinator) SetLeaseManager(mgr *lease.Manager) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.leaseManager = mgr
+// Must be called before Start; returns an error wrapping [ErrStarted] otherwise,
+// having changed nothing.
+func (c *Coordinator) SetLeaseManager(mgr *lease.Manager) error {
+	return c.setBeforeStart("SetLeaseManager", func() { c.leaseManager = mgr })
 }
 
 // SetMetrics registers a Metrics instance with the coordinator.
 // When set, site-count and replication event metrics are emitted automatically.
-// SetMetrics must be called before Start to instrument replication events.
-func (c *Coordinator) SetMetrics(m *metrics.Metrics) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.m = m
+//
+// Must be called before Start; returns an error wrapping [ErrStarted] otherwise,
+// having changed nothing.  Freezing it at Start is what closes the #86 race:
+// every read now goes through c.metrics() under the lock, and the field stops
+// changing at the moment concurrent readers appear.
+func (c *Coordinator) SetMetrics(m *metrics.Metrics) error {
+	return c.setBeforeStart("SetMetrics", func() { c.m = m })
 }
 
 // SetHealthPollInterval sets the interval between background site health
 // checks.  The default is 30 seconds.  Pass 0 to use the default.
-// Must be called before Start.
-func (c *Coordinator) SetHealthPollInterval(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.healthPollInterval = d
+//
+// Must be called before Start; returns an error wrapping [ErrStarted] otherwise,
+// having changed nothing.
+func (c *Coordinator) SetHealthPollInterval(d time.Duration) error {
+	return c.setBeforeStart("SetHealthPollInterval", func() { c.healthPollInterval = d })
 }
 
 // SetLeaseTTL sets the TTL used when acquiring the distributed leader lease.
 // When 0 (the default), defaultLeaseTTL (15 s) is used.
-// Must be called before Start.
-func (c *Coordinator) SetLeaseTTL(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.leaseTTL = d
+//
+// Must be called before Start; returns an error wrapping [ErrStarted] otherwise,
+// having changed nothing.
+func (c *Coordinator) SetLeaseTTL(d time.Duration) error {
+	return c.setBeforeStart("SetLeaseTTL", func() { c.leaseTTL = d })
 }
 
 // SetWorkerQueueDepth configures the replication worker queue depth.
-// Must be called before Start; has no effect if Start has already been called.
 // Pass 0 to retain the existing depth (default 512).
+//
+// Must be called before Start; returns an error wrapping [ErrStarted] otherwise,
+// having changed nothing.  This is the setter #85 is about: it used to replace
+// c.worker unconditionally, so calling it on a running coordinator orphaned the
+// goroutine that was draining the queue and installed a fresh worker that nobody
+// would ever Start.  Replication stopped permanently and Put went on returning
+// nil.  Erroring is the right resolution rather than making the depth genuinely
+// reconfigurable: the queue's capacity is the buffer of a channel created by
+// NewWorker, growing it means a new channel, and a new channel means either
+// discarding the jobs in the old one or draining two queues with one worker.
+// The one shipped caller (cmd/coordinator) sets it once at boot.
 //
 // Note that this is a *queue depth*, not a concurrency limit — the worker is a
 // single serial goroutine.  The shipped daemon passes
@@ -336,12 +518,12 @@ func (c *Coordinator) SetLeaseTTL(d time.Duration) {
 // setting is a config change and belongs elsewhere; Put now applies
 // backpressure rather than dropping writes, so the small depth costs latency
 // under a burst instead of data (#79).
-func (c *Coordinator) SetWorkerQueueDepth(depth int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if depth > 0 {
-		c.worker = replication.NewWorker(depth)
-	}
+func (c *Coordinator) SetWorkerQueueDepth(depth int) error {
+	return c.setBeforeStart("SetWorkerQueueDepth", func() {
+		if depth > 0 {
+			c.worker = replication.NewWorker(depth)
+		}
+	})
 }
 
 // SetEnqueueBackpressure bounds how long Put waits for room in the replication
@@ -433,38 +615,89 @@ func (c *Coordinator) runHealthPoll(ctx context.Context) {
 	c.healthCacheMu.Unlock()
 }
 
-// Start launches the background replication worker.
-// It is safe to call Start multiple times; only the first call has effect.
+// Start launches the background replication worker and the health poller.
+//
+// It returns nil on the call that starts the coordinator and nil again for every
+// later call on a running one, so Start is idempotent for callers that do not
+// coordinate among themselves.  It returns an error wrapping [ErrStopped] if the
+// coordinator has been stopped — including stopped before it was ever started.
+// A Coordinator is single-use; see the package Lifecycle doc.
+//
+// Start used to return nothing and to be guarded by a sync.Once, which made
+// "started" and "refused" indistinguishable.  The Once had no relationship to
+// Stop's state at all: Stop-then-Start launched the drain and the health poller
+// while silently leaving the worker dead, so replication was off for the process
+// lifetime with the coordinator reporting healthy and Put returning success
+// (#84).  Returning an error is what lets a caller notice.
 //
 // If a LeaseManager has been registered via SetLeaseManager, Start attempts to
-// acquire the "coordinator/leader" lease.  Only the leader starts the worker;
-// if another instance already holds the lease this coordinator enters standby
-// mode and Start returns without launching any background goroutines.
+// acquire the "coordinator/leader" lease.  Only the leader starts the worker; if
+// another instance already holds the lease this coordinator enters standby mode.
+// Standby is a *successful* start — the coordinator is running, it just has no
+// worker — so Start returns nil and Stop still has the drain and poller to undo.
 //
 // If a Store has been registered via SetStore, Start also recovers any pending
-// jobs from the previous run and begins draining worker events to keep the
-// store in sync.
-func (c *Coordinator) Start(ctx context.Context) {
-	c.startOnce.Do(func() { c.start(ctx) })
-}
+// jobs from the previous run and begins draining worker events to keep the store
+// in sync.
+func (c *Coordinator) Start(ctx context.Context) error {
+	// lifecycleMu serializes Start against Stop for their whole duration, which
+	// is the invariant #82 was missing.  c.mu alone cannot provide it: Start has
+	// to release c.mu across the lease acquisition (a network call) and across
+	// recoverPendingJobs, and a Stop that slipped into that window saw
+	// storeCancel still nil and storeWg still zero, concluded there was nothing
+	// to stop, and returned — after which Start launched a drain goroutine and a
+	// health poller under a context nothing would ever cancel.  59 of 60 races
+	// leaked a pair.
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
 
-// start is the internal implementation of Start; called exactly once via startOnce.
-func (c *Coordinator) start(ctx context.Context) {
 	c.mu.Lock()
-	mgr := c.leaseManager
-	store := c.store
-	leaseTTL := c.leaseTTL
-	pollInterval := c.healthPollInterval
+	switch c.state {
+	case coordRunning:
+		c.mu.Unlock()
+		return nil
+	case coordStopped:
+		c.mu.Unlock()
+		return fmt.Errorf("coordinator: Start: %w", ErrStopped)
+	}
+	// Claim the running state and freeze the configuration in one lock hold, so
+	// no Set* call can land between the check and the read.
+	c.state = coordRunning
+	cfg := startConfig{
+		mgr:          c.leaseManager,
+		store:        c.store,
+		leaseTTL:     c.leaseTTL,
+		pollInterval: c.healthPollInterval,
+		worker:       c.worker,
+	}
 	c.mu.Unlock()
 
+	c.launch(ctx, cfg)
+	return nil
+}
+
+// startConfig is the snapshot of configuration Start takes under c.mu and hands
+// to launch.  Grouping it makes the freeze-at-Start rule visible: these fields
+// are read once, here, and every Set* that writes them refuses afterwards.
+type startConfig struct {
+	mgr          *lease.Manager
+	store        metadata.Store
+	leaseTTL     time.Duration
+	pollInterval time.Duration
+	worker       *replication.Worker
+}
+
+// launch does the work of Start.  Callers must hold c.lifecycleMu.
+func (c *Coordinator) launch(ctx context.Context, cfg startConfig) {
 	// workerCtx is cancelled when the lease is lost (if a lease manager is set).
 	workerCtx := ctx
 
-	if mgr != nil {
+	if cfg.mgr != nil {
+		leaseTTL := cfg.leaseTTL
 		if leaseTTL <= 0 {
 			leaseTTL = defaultLeaseTTL
 		}
-		l, acquired, err := mgr.TryAcquire(ctx, "coordinator/leader", leaseTTL)
+		l, acquired, err := cfg.mgr.TryAcquire(ctx, "coordinator/leader", leaseTTL)
 		if err != nil {
 			slog.Warn("coordinator: acquire leader lease; running in standby mode", "error", err)
 			return
@@ -503,44 +736,69 @@ func (c *Coordinator) start(ctx context.Context) {
 	c.storeCancel = drainCancel
 	c.mu.Unlock()
 
-	if store != nil {
-		c.recoverPendingJobs(workerCtx, store)
+	if cfg.store != nil {
+		c.recoverPendingJobs(workerCtx, cfg.store)
 	}
-	c.storeWg.Add(1)
+
+	// The drain and the health poller get separate WaitGroups because Stop needs
+	// to know which of them finished.  The final flush is only safe once the
+	// drain has returned — two readers would split the event buffer between them
+	// (#78) — and one WaitGroup for both means a health poller stuck in an
+	// unresponsive site's probe makes Stop unable to tell whether flushing is
+	// safe, so it would have to skip a flush it could have done.
+	c.drainWg.Add(1)
 	go func() {
-		defer c.storeWg.Done()
-		c.drainWorkerEvents(drainCtx, store)
+		defer c.drainWg.Done()
+		c.drainWorkerEvents(drainCtx, cfg.store)
 	}()
 
 	// Launch background health polling goroutine.
 	// Uses drainCtx so it stops when Stop() is called (via storeCancel).
-	// pollInterval was read from c.healthPollInterval under c.mu at the top.
+	pollInterval := cfg.pollInterval
 	if pollInterval <= 0 {
 		pollInterval = defaultHealthPollInterval
 	}
-	c.storeWg.Add(1)
+	c.healthWg.Add(1)
 	go func() {
-		defer c.storeWg.Done()
-		c.runHealthPoll(drainCtx) // immediate first check
-		ticker := time.NewTicker(pollInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				c.runHealthPoll(drainCtx)
-			case <-drainCtx.Done():
-				return
-			}
-		}
+		defer c.healthWg.Done()
+		c.runHealthPollLoop(drainCtx, pollInterval)
 	}()
 
-	c.worker.Start(workerCtx)
+	cfg.worker.Start(workerCtx)
+}
+
+// runHealthPollLoop polls site health until ctx is cancelled.
+//
+// It is a named method rather than the closure it used to be so that it appears
+// as a stable frame in a goroutine dump: the leak assertions for #82 identify the
+// coordinator's background goroutines by function name, which is the only way to
+// tell them apart from those of other tests running in the same process.
+func (c *Coordinator) runHealthPollLoop(ctx context.Context, interval time.Duration) {
+	c.runHealthPoll(ctx) // immediate first check
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.runHealthPoll(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // Stop signals the background replication worker to stop and waits for it to
 // finish the current job.  If a leader lease is held it is released so that a
-// standby coordinator can take over immediately.  Calling Stop before Start is
-// safe.
+// standby coordinator can take over immediately.
+//
+// Stop before Start is legal and is terminal: nothing is torn down because
+// nothing was built, but the coordinator moves to stopped and a later Start
+// returns [ErrStopped].  Calling Stop more than once is safe.
+//
+// Stop bounds itself at defaultStopTimeout (30 s).  Use [Coordinator.StopContext]
+// to supply your own budget.  Unbounded was the old behaviour, and it is how one
+// unresponsive S3 endpoint kept a SIGTERMed process alive until the orchestrator
+// SIGKILLed it (#83).
 //
 // # Teardown order
 //
@@ -549,40 +807,90 @@ func (c *Coordinator) start(ctx context.Context) {
 // drain goroutine is torn down first there is nobody left to read it, and the
 // job stays in the store as a phantom while its content hash is lost (#78).
 func (c *Coordinator) Stop() {
+	if err := c.StopContext(context.Background()); err != nil {
+		slog.Error("coordinator: Stop did not complete within the default budget",
+			"timeout", defaultStopTimeout, "error", err)
+	}
+}
+
+// StopContext is Stop with a caller-supplied deadline.  It returns nil when
+// shutdown completed, or an error wrapping ctx.Err() when the budget elapsed
+// first.
+//
+// If ctx carries no deadline, defaultStopTimeout is imposed — the same treatment
+// [Coordinator.Health] gives its own context, and for the same reason: an
+// unbounded wait on a remote endpoint is a liveness bug, not a configuration
+// choice.
+//
+// # What a non-nil error means
+//
+// The coordinator *is* stopped either way: the state transition, the worker's
+// stop signal and both context cancellations all happen before anything is
+// waited on, so no new work starts.  What the error reports is that shutdown gave
+// up *observing* the finish, so one or more of these may still be true:
+//
+//   - a replication transfer is still parked inside a site's PUT, and its
+//     terminal event will be emitted with nobody left to read it (so a persisted
+//     job may be re-enqueued on the next start — which is correct, if wasteful);
+//   - a health probe is still inside the objectfs connection pool's own 30 s
+//     wait, which is not context-aware.
+//
+// Those goroutines are abandoned, not cancelled.  Neither transfer nor probe
+// becomes interruptible because shutdown would like it to be, so the choice is a
+// leaked goroutine in a process that is terminating, or a process that never
+// terminates.  This picks the first, and returns the error so the caller can log
+// it and set a non-zero exit code (#69's reasoning applied to #83).
+func (c *Coordinator) StopContext(ctx context.Context) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultStopTimeout)
+		defer cancel()
+	}
+
+	// Held for the whole of Stop, so a concurrent Start either completes before
+	// this begins (and is torn down) or is refused after it (#82).
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	c.mu.Lock()
+	c.state = coordStopped
 	storeCancel := c.storeCancel
 	leaderCancel := c.leaderCancel
 	l := c.leaderLease
+	c.leaderLease = nil // so a second Stop does not double-release
 	store := c.store
+	worker := c.worker
 	c.mu.Unlock()
+
+	var errs []error
 
 	// 1. Stop the producer.  Returns once the in-flight job has settled, so
 	//    every terminal event it will ever emit is buffered by the time this
 	//    returns.  The events channel is buffered to the queue depth, so emit
 	//    cannot block even with no reader currently scheduled.
-	c.worker.Stop()
+	if err := worker.StopContext(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("replication worker did not settle: %w", err))
+	}
 
 	// 2. Now the consumer.  Cancelling these stops the drain goroutine, the
 	//    health poller, and the lease keepalive.
 	//
-	//    Note for #83: leaderCancel used to run first, and because leaderCtx is
-	//    the worker's ctx that gave the in-flight transfer a cancellation path.
-	//    It no longer does — deliberately, since aborting the transfer is the
-	//    opposite of letting it settle.  Bounding a transfer against an
-	//    unresponsive site is #83's job and wants a real timeout; it was never
-	//    covered in the no-lease-manager case anyway, which is every shipped
-	//    deployment.  cmd/coordinator cancels the root context before calling
-	//    Close, so the transfer ctx is already done by the time Stop is entered.
+	//    leaderCancel deliberately does not run first.  leaderCtx is the worker's
+	//    ctx, so cancelling it before step 1 would abort the in-flight transfer
+	//    instead of letting it settle, which is the opposite of what #78 needs.
+	//    It was also never a bound in the no-lease-manager case, which is every
+	//    shipped deployment; the bound is now the ctx above.
 	if leaderCancel != nil {
 		leaderCancel()
 	}
 	if storeCancel != nil {
 		storeCancel()
 	}
-	c.storeWg.Wait()
 
-	// 3. Final flush on this goroutine.  storeWg.Wait above guarantees the drain
-	//    goroutine has returned, so there is no concurrent reader.
+	// 3. Wait for the drain, then flush on this goroutine.  The wait is what
+	//    makes the flush safe: flushWorkerEvents and a live drain would split the
+	//    event buffer between them.  If the wait times out the flush is skipped
+	//    rather than raced.
 	//
 	//    Step 1 plus the drain's own flush covers the common case, but not the
 	//    one the shipped daemon actually produces: cmd/coordinator cancels the
@@ -591,14 +899,53 @@ func (c *Coordinator) Stop() {
 	//    after a lost leader lease, which cancels leaderCtx with no Stop
 	//    involved.  Flushing here makes the guarantee independent of who
 	//    cancelled what first, which is worth more than the one non-blocking
-	//    channel read it costs when the buffer is empty.
-	c.flushWorkerEvents(store)
+	//    channel read it costs when the buffer is empty (#78).
+	if err := waitBounded(ctx, &c.drainWg); err != nil {
+		errs = append(errs, fmt.Errorf("event drain did not exit, skipping final flush: %w", err))
+	} else {
+		c.flushWorkerEvents(store)
+	}
+
+	// 4. The health poller.  Waited on separately because it is the goroutine
+	//    most likely to be stuck — objectfs's connection pool ignores the probe
+	//    context and waits up to 30 s of its own (#83) — and letting that block
+	//    the flush decision above would cost data for no reason.
+	if err := waitBounded(ctx, &c.healthWg); err != nil {
+		errs = append(errs, fmt.Errorf("health poller did not exit: %w", err))
+	}
 
 	// Release the leader lease last so a standby can take over quickly.
 	if l != nil {
 		if err := l.Release(); err != nil {
 			slog.Warn("coordinator: release leader lease", "error", err)
+			errs = append(errs, fmt.Errorf("release leader lease: %w", err))
 		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("coordinator: Stop: %w", errors.Join(errs...))
+	}
+	return nil
+}
+
+// waitBounded waits for wg, giving up when ctx ends.
+//
+// sync.WaitGroup has no context-aware Wait, so the wait runs on its own
+// goroutine.  That goroutine outlives a timed-out call for exactly as long as the
+// work it is waiting on does; see StopContext for why abandoning it is the right
+// trade.  Every Add on these WaitGroups happens inside Start, which holds
+// c.lifecycleMu, so the Add-before-Wait requirement holds by construction.
+func waitBounded(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -623,7 +970,7 @@ func (c *Coordinator) AddSite(s *site.SiteMount) {
 	defer c.mu.Unlock()
 	c.sites = append(c.sites, s)
 	c.ns.AddSite(s)
-	c.metricsSiteCount(len(c.sites))
+	c.metricsSiteCountLocked(len(c.sites))
 }
 
 // ErrDuplicateSite reports that a site with the requested name is already
@@ -648,7 +995,7 @@ func (c *Coordinator) AddSiteUnique(s *site.SiteMount) error {
 	}
 	c.sites = append(c.sites, s)
 	c.ns.AddSite(s)
-	c.metricsSiteCount(len(c.sites))
+	c.metricsSiteCountLocked(len(c.sites))
 	return nil
 }
 
@@ -685,7 +1032,7 @@ func (c *Coordinator) RemoveSite(name string) bool {
 		return false
 	}
 	c.ns = namespace.New(c.sites...)
-	c.metricsSiteCount(len(c.sites))
+	c.metricsSiteCountLocked(len(c.sites))
 	c.mu.Unlock()
 
 	// Close outside the lock: Close talks to the network and can block, and
@@ -706,11 +1053,39 @@ func (c *Coordinator) Sites() []*site.SiteMount {
 	return cp
 }
 
+// ErrHealthTimeout marks a site whose health probe had not answered when Health's
+// context expired.  It means "unknown", not "unhealthy" — but for routing and for
+// /health the two are treated the same, which is the safe direction.
+var ErrHealthTimeout = errors.New("health check did not answer before the deadline")
+
 // Health returns a per-site health report.
 // A nil error means the site is healthy; checks run concurrently.
 //
-// If ctx carries no deadline, a defaultHealthTimeout deadline is imposed so
-// that per-site goroutines cannot block indefinitely on unreachable sites.
+// If ctx carries no deadline, defaultHealthTimeout is imposed.
+//
+// # The report is bounded, the probes are not
+//
+// Health returns when every probe has answered *or* when ctx expires, whichever
+// comes first, and a site that has not answered by then is reported with
+// [ErrHealthTimeout].  It used to wait unconditionally for every goroutine, which
+// made the deadline a request rather than a guarantee: a probe that ignores its
+// context pinned the wait open, and because the background poller runs under the
+// same call, that pinned Stop open too — one unresponsive endpoint and SIGTERM
+// never completed (#83).
+//
+// The probes do ignore their context, which is why this matters rather than being
+// belt-and-braces.  SiteMount.Health calls objectfs's Client.Health, which reaches
+// Backend.HealthCheck → ClientManager.HealthCheck, and that acquires a pooled S3
+// client via ConnectionPool.Get() *before* it makes the ctx-aware HeadBucket call.
+// Get is hard-coded to GetWithTimeout(30 * time.Second) and takes no context at
+// all, so a saturated pool blocks the probe for up to 30 s no matter what deadline
+// the caller set.  Verified by reading objectfs v0.12.0: internal/storage/s3/
+// client.go:239-256 and pool.go:111-201.
+//
+// A timed-out probe is therefore abandoned, not cancelled.  It writes its result
+// into a channel this function has already stopped reading; the channel is
+// buffered to the site count so the write cannot block, and the goroutine exits on
+// its own once the underlying call returns.
 func (c *Coordinator) Health(ctx context.Context) map[string]error {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -722,22 +1097,36 @@ func (c *Coordinator) Health(ctx context.Context) map[string]error {
 	snapshot := c.snapshotSites()
 	c.mu.RUnlock()
 
-	result := make(map[string]error, len(snapshot))
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
+	type probeResult struct {
+		name string
+		err  error
+	}
+	// Buffered to len(snapshot): an abandoned probe must be able to complete its
+	// send and exit rather than leaking on a blocked channel write forever.
+	results := make(chan probeResult, len(snapshot))
 	for _, s := range snapshot {
-		s := s
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
-			err := s.Health(ctx)
-			mu.Lock()
-			result[s.Name()] = err
-			mu.Unlock()
+			results <- probeResult{name: s.Name(), err: s.Health(ctx)}
 		}()
 	}
-	wg.Wait()
+
+	result := make(map[string]error, len(snapshot))
+	for i := 0; i < len(snapshot); i++ {
+		select {
+		case r := <-results:
+			result[r.name] = r.err
+		case <-ctx.Done():
+			// Fill in every site that has not answered.  Reporting them as
+			// timed-out rather than omitting them keeps the report's key set equal
+			// to the site set, which SiteInfos and preferHealthySites both assume.
+			for _, s := range snapshot {
+				if _, ok := result[s.Name()]; !ok {
+					result[s.Name()] = fmt.Errorf("%w: %w", ErrHealthTimeout, ctx.Err())
+				}
+			}
+			return result
+		}
+	}
 	return result
 }
 
@@ -844,7 +1233,7 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	c.mu.RLock()
 	snapshot, pol, store, cb, oc := c.snapshotSites(), c.policy, c.store, c.cb, c.objCache
-	m, backpressure := c.m, c.enqueueBackpressure
+	m, backpressure, worker := c.m, c.enqueueBackpressure, c.worker
 	c.mu.RUnlock()
 
 	routed, err := pol.Route(policy.OperationWrite, key, snapshot)
@@ -915,7 +1304,7 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 					continue
 				}
 			}
-			if enqErr := c.enqueueWithBackpressure(ctx, backpressure, replication.ReplicationJob{
+			if enqErr := enqueueWithBackpressure(ctx, worker, backpressure, replication.ReplicationJob{
 				SourceSite: src,
 				DestSite:   s,
 				Key:        key,
@@ -927,7 +1316,7 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 				// error to the caller and a counter rather than a log line.
 				m.RecordReplicationDropped()
 				slog.Error("coordinator: replication queue full; write not replicated",
-					"key", key, "dest", s.Name(), "queue_depth", c.worker.QueueDepth(), "error", enqErr)
+					"key", key, "dest", s.Name(), "queue_depth", worker.QueueDepth(), "error", enqErr)
 				notQueued = append(notQueued, s.Name())
 				if notQueuedCause == nil {
 					notQueuedCause = enqErr
@@ -956,14 +1345,19 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	return nil
 }
 
-// enqueueWithBackpressure submits job to the replication worker, waiting up to
-// budget for queue room.  A budget of 0 means defaultEnqueueBackpressure; a
-// negative budget means a single attempt with no wait.
+// enqueueWithBackpressure submits job to worker, waiting up to budget for queue
+// room.  A budget of 0 means defaultEnqueueBackpressure; a negative budget means
+// a single attempt with no wait.
 //
 // Returns nil once the job is queued, or the worker's queue-full error if the
 // budget elapses.  A cancelled ctx aborts the wait and returns ctx.Err().
-func (c *Coordinator) enqueueWithBackpressure(ctx context.Context, budget time.Duration, job replication.ReplicationJob) error {
-	err := c.worker.Enqueue(job)
+//
+// The worker is a parameter rather than read from the receiver so that the caller
+// reads c.worker once, under the lock, and the whole backpressure loop then works
+// against that one worker.  Re-reading the field per retry would have been the
+// pointer race in #85 with extra steps.
+func enqueueWithBackpressure(ctx context.Context, worker *replication.Worker, budget time.Duration, job replication.ReplicationJob) error {
+	err := worker.Enqueue(job)
 	if err == nil || budget < 0 {
 		return err
 	}
@@ -986,7 +1380,7 @@ func (c *Coordinator) enqueueWithBackpressure(ctx context.Context, budget time.D
 		case <-deadline.C:
 			return err // the last queue-full error
 		case <-ticker.C:
-			if err = c.worker.Enqueue(job); err == nil {
+			if err = worker.Enqueue(job); err == nil {
 				return nil
 			}
 		}
@@ -1171,7 +1565,7 @@ func (c *Coordinator) Replicate(ctx context.Context, key, fromSite, toSite strin
 		return fmt.Errorf("coordinator: replicate: destination site %q not found", toSite)
 	}
 
-	if err := c.worker.Enqueue(replication.ReplicationJob{
+	if err := c.workerRef().Enqueue(replication.ReplicationJob{
 		SourceSite: src,
 		DestSite:   dst,
 		Key:        key,
@@ -1186,7 +1580,7 @@ func (c *Coordinator) Replicate(ctx context.Context, key, fromSite, toSite strin
 // ReplicationQueueDepth returns the number of replication jobs currently
 // waiting in the worker queue.
 func (c *Coordinator) ReplicationQueueDepth() int {
-	return c.worker.QueueDepth()
+	return c.workerRef().QueueDepth()
 }
 
 // IsLeader reports whether this coordinator instance is currently the active
@@ -1310,6 +1704,7 @@ func makeJobID(sourceSite, destSite, key string) string {
 // recoverPendingJobs reads all pending replication jobs from the store and
 // re-enqueues them.  Called at Start time when a store is configured.
 func (c *Coordinator) recoverPendingJobs(ctx context.Context, store metadata.Store) {
+	worker := c.workerRef()
 	jobs, err := store.GetPendingJobs(ctx)
 	if err != nil {
 		slog.Error("coordinator: recover pending jobs", "error", err)
@@ -1330,7 +1725,7 @@ func (c *Coordinator) recoverPendingJobs(ctx context.Context, store metadata.Sto
 			slog.Warn("coordinator: skip recovered job (site missing)", "job_id", j.ID)
 			continue
 		}
-		if err := c.worker.Enqueue(replication.ReplicationJob{
+		if err := worker.Enqueue(replication.ReplicationJob{
 			SourceSite: src,
 			DestSite:   dst,
 			Key:        j.Key,
@@ -1350,9 +1745,10 @@ func (c *Coordinator) recoverPendingJobs(ctx context.Context, store metadata.Sto
 // emitted, which is the same loss #78 describes in a narrower window: the
 // buffered EventCompleted of a transfer that finished a moment before shutdown.
 func (c *Coordinator) drainWorkerEvents(ctx context.Context, store metadata.Store) {
+	events := c.workerRef().Events()
 	for {
 		select {
-		case ev, ok := <-c.worker.Events():
+		case ev, ok := <-events:
 			if !ok {
 				return
 			}
@@ -1371,9 +1767,10 @@ func (c *Coordinator) drainWorkerEvents(ctx context.Context, store metadata.Stor
 // Callers must ensure no other goroutine is reading Events() concurrently, or
 // the two will split the buffer between them.
 func (c *Coordinator) flushWorkerEvents(store metadata.Store) {
+	events := c.workerRef().Events()
 	for {
 		select {
-		case ev, ok := <-c.worker.Events():
+		case ev, ok := <-events:
 			if !ok {
 				return
 			}
@@ -1419,11 +1816,10 @@ func (c *Coordinator) handleWorkerEvent(ev replication.ReplicationEvent, store m
 		}
 	}
 
-	c.mu.RLock()
-	m := c.m
-	c.mu.RUnlock()
-	if m != nil {
-		m.RecordReplication(string(ev.Type))
-		m.SetReplicationQueueDepth(c.worker.QueueDepth())
-	}
+	// Both reads go through the locked accessors: c.m is written by SetMetrics
+	// under c.mu (#86) and c.worker by SetWorkerQueueDepth under c.mu (#85), and
+	// this runs on the drain goroutine concurrently with both.
+	m := c.metrics()
+	m.RecordReplication(string(ev.Type))
+	m.SetReplicationQueueDepth(c.workerRef().QueueDepth())
 }
