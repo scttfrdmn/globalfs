@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/scttfrdmn/globalfs/pkg/config"
+	"github.com/scttfrdmn/globalfs/pkg/types"
 )
 
 // TestNewDefault_ResilienceDefaults verifies that NewDefault populates all
@@ -465,6 +466,90 @@ func TestValidate_EtcdEndpointsNotRequired(t *testing.T) {
 	cfg.Coordinator.EtcdEndpoints = []string{}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("empty etcd_endpoints must validate: %v", err)
+	}
+}
+
+// ── Key pattern validation (#100) ────────────────────────────────────────────
+
+func TestValidateKeyPattern(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		pattern string
+		wantErr bool
+	}{
+		{"", false},                  // matches every key
+		{"genomes/", false},          // literal prefix, not a glob
+		{"data/**", false},           // recursive
+		{"**/*.bam", false},          // recursive from the root
+		{"data/**/raw/*", false},     // ** in the middle
+		{"[a-z]*.bam", false},        // a balanced character class is fine
+		{`data/[a-`, true},           // unbalanced [
+		{`data/x\`, true},            // trailing backslash
+		{`**[a`, true},               // unbalanced [ following a **
+		{`ok/[abc]/still/ok`, false}, // balanced mid-pattern
+		{`a]b`, false},               // a lone ] is a literal, not a syntax error
+	}
+	for _, tc := range cases {
+		err := config.ValidateKeyPattern(tc.pattern)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("ValidateKeyPattern(%q) = %v, wantErr %v", tc.pattern, err, tc.wantErr)
+		}
+	}
+}
+
+// TestValidate_RejectsBadKeyPattern covers both pattern-carrying surfaces.
+//
+// policy.rules is the one that reaches the routing engine; policies is the
+// legacy placement block, which Validate has always checked and which nothing
+// reads — but it is where the shipped example's patterns live, so a bad one
+// there still misleads whoever copies it.
+func TestValidate_RejectsBadKeyPattern(t *testing.T) {
+	t.Parallel()
+
+	cfg := baseValidConfig()
+	cfg.Policy.Rules = []config.PolicyRuleConfig{
+		{Name: "good", KeyPattern: "data/**"},
+		{Name: "broken", KeyPattern: `data/[a-`},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted an unparseable policy.rules key_pattern")
+	}
+	if !strings.Contains(err.Error(), "broken") {
+		t.Errorf("error should name the offending rule, got %v", err)
+	}
+
+	cfg = baseValidConfig()
+	cfg.Policies = []types.ReplicationPolicy{
+		{Name: "legacy-broken", PathPattern: `inputs/[a-`, Primary: "primary"},
+	}
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted an unparseable policies path_pattern")
+	}
+	if !strings.Contains(err.Error(), "legacy-broken") {
+		t.Errorf("error should name the offending policy, got %v", err)
+	}
+}
+
+// TestValidate_AcceptsRecursivePatterns guards against a validator that rejects
+// the very syntax #100 made work.  Every pattern here appears in the shipped
+// example configs or the README.
+func TestValidate_AcceptsRecursivePatterns(t *testing.T) {
+	t.Parallel()
+	cfg := baseValidConfig()
+	cfg.Policy.Rules = []config.PolicyRuleConfig{
+		{Name: "inputs", KeyPattern: "inputs/**"},
+		{Name: "bams", KeyPattern: "**/*.bam"},
+		{Name: "hot", KeyPattern: "datasets/hot/*"},
+		{Name: "scratch", KeyPattern: "scratch/"},
+		{Name: "all", KeyPattern: ""},
+	}
+	cfg.Policies = []types.ReplicationPolicy{
+		{Name: "results", PathPattern: "results/**", Primary: "primary"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("recursive patterns must validate: %v", err)
 	}
 }
 
@@ -966,6 +1051,15 @@ func hasSuffixPath(paths map[string]bool, field string) bool {
 // and skips the two "fields removed in …" tables — those exist precisely to name
 // keys the struct no longer has, and are asserted in the opposite direction by
 // TestREADME_RemovedFieldsAreActuallyGone.
+// firstCell returns the first cell of a markdown table row, trimmed.
+func firstCell(line string) string {
+	cells := strings.Split(strings.Trim(line, "|"), "|")
+	if len(cells) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(cells[0])
+}
+
 func readmeFieldCells(t *testing.T) []string {
 	t.Helper()
 	data, err := os.ReadFile("../../README.md")
@@ -974,7 +1068,7 @@ func readmeFieldCells(t *testing.T) []string {
 	}
 
 	var fields []string
-	inSection, skipTable := false, false
+	inSection, inFieldTable := false, false
 	for _, line := range strings.Split(string(data), "\n") {
 		switch {
 		case strings.HasPrefix(line, "## Configuration Reference"):
@@ -987,26 +1081,26 @@ func readmeFieldCells(t *testing.T) []string {
 			continue
 		}
 
-		// The removed-field tables are identified by their header row, which says
-		// "Removed field" where the live tables say "Field".
-		if strings.HasPrefix(line, "|") && strings.Contains(line, "Removed field") {
-			skipTable = true
-			continue
-		}
+		// Table selection is positive: a table is scanned only when its header row's
+		// first cell is exactly "Field".  Every live reference table is shaped that
+		// way, and the alternative — excluding the tables that are not field lists —
+		// has already failed once: the removed-field tables were excluded by name
+		// while the `key_pattern` syntax table (header "Pattern", first column full
+		// of globs) was not, and its rows arrived here as field names (#100).
 		if !strings.HasPrefix(line, "|") {
-			skipTable = false
+			inFieldTable = false
 			continue
 		}
-		if skipTable {
+		if first := firstCell(line); first == "Field" {
+			inFieldTable = true
+			continue
+		}
+		if !inFieldTable {
 			continue
 		}
 
-		cells := strings.Split(strings.Trim(line, "|"), "|")
-		if len(cells) == 0 {
-			continue
-		}
-		cell := strings.TrimSpace(cells[0])
-		// Skip header and separator rows.
+		cell := firstCell(line)
+		// Skip separator rows and any prose cell.
 		if !strings.HasPrefix(cell, "`") || !strings.HasSuffix(cell, "`") {
 			continue
 		}

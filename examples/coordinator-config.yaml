@@ -81,10 +81,15 @@ sites:
 # The first matching rule wins.
 #
 # key_pattern supports:
-#   exact match     "data/genome.bam"
-#   glob            "*.bam"  or  "results/*"
+#   exact match      "data/genome.bam"
+#   glob             "*.bam"  or  "results/*"   (one * never crosses a /)
+#   recursive glob   "data/**"  or  "**/*.bam"  (** does cross /)
 #   recursive prefix "genomes/"   (trailing / = everything under that path)
-#   empty           ""            (matches all keys)
+#   empty            ""           (matches all keys)
+#
+# Note that "*.bam" matches only root-level keys.  Write "**/*.bam" for the
+# recursive form.  A pattern that matches nothing is not an error, so the rule
+# simply never fires — check yours against a real key before relying on it.
 #
 # operations: read, write, delete  (empty = all)
 # target_roles: primary, backup, burst  (empty = all sites, default order)

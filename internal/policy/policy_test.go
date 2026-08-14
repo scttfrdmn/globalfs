@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	objectfstypes "github.com/scttfrdmn/objectfs/pkg/types"
@@ -124,6 +125,159 @@ func TestRule_MatchesKey_EmptyPattern(t *testing.T) {
 		if !r.matchesKey(key) {
 			t.Errorf("empty pattern should match %q", key)
 		}
+	}
+}
+
+// ─── Recursive ** patterns (#100) ─────────────────────────────────────────────
+//
+// Every case below returned false under path.Match, which treats ** as two
+// adjacent stars and therefore still refuses to cross a /.  The table covers **
+// at the start, the middle, and the end of a pattern, because those are three
+// different code paths in the matcher and only the trailing form appeared in the
+// documentation that was wrong.
+
+func TestRule_MatchesKey_DoubleStarSuffix(t *testing.T) {
+	t.Parallel()
+	r := Rule{KeyPattern: "data/**"}
+	cases := []struct {
+		key  string
+		want bool
+	}{
+		{"data/genome.bam", true},
+		{"data/a/b.dat", true},       // the whole point: ** crosses /
+		{"data/a/b/c/d/e.dat", true}, // arbitrarily deep
+		{"data", true},               // ** matches the empty remainder
+		{"database/x", false},        // ** does not extend the literal segment
+		{"other/a/b.dat", false},
+	}
+	for _, tc := range cases {
+		if got := r.matchesKey(tc.key); got != tc.want {
+			t.Errorf("matchesKey(%q): got %v, want %v", tc.key, got, tc.want)
+		}
+	}
+}
+
+func TestRule_MatchesKey_DoubleStarPrefix(t *testing.T) {
+	t.Parallel()
+	r := Rule{KeyPattern: "**/*.bam"}
+	cases := []struct {
+		key  string
+		want bool
+	}{
+		{"genome.bam", true},   // leading ** matches nothing at all
+		{"a/x.bam", true},      // ...one segment...
+		{"a/b/c/x.bam", true},  // ...or several
+		{"a/x.fastq", false},   // the suffix still has to match
+		{"x.bam/notit", false}, // and it has to match the last segment
+	}
+	for _, tc := range cases {
+		if got := r.matchesKey(tc.key); got != tc.want {
+			t.Errorf("matchesKey(%q): got %v, want %v", tc.key, got, tc.want)
+		}
+	}
+}
+
+func TestRule_MatchesKey_DoubleStarInfix(t *testing.T) {
+	t.Parallel()
+	r := Rule{KeyPattern: "data/**/raw/*"}
+	cases := []struct {
+		key  string
+		want bool
+	}{
+		{"data/raw/x.dat", true},       // ** absorbs zero segments
+		{"data/a/raw/x.dat", true},     // one
+		{"data/a/b/c/raw/x.dat", true}, // many
+		{"data/a/raw/b/x.dat", false},  // the trailing single * still stops at /
+		{"other/raw/x.dat", false},
+	}
+	for _, tc := range cases {
+		if got := r.matchesKey(tc.key); got != tc.want {
+			t.Errorf("matchesKey(%q): got %v, want %v", tc.key, got, tc.want)
+		}
+	}
+}
+
+// TestRule_MatchesKey_BareStarDoesNotCrossSlash pins the rule that makes the
+// three tables above necessary.  It is not a bug and it is not new — one * has
+// never crossed a / — but it is the reason "*.bam" quietly matched only
+// root-level keys while looking like a recursive pattern.
+func TestRule_MatchesKey_BareStarDoesNotCrossSlash(t *testing.T) {
+	t.Parallel()
+	nested := "genomes/sample/x.bam"
+	for _, pattern := range []string{"*", "*.bam", "*/*.bam"} {
+		if (&Rule{KeyPattern: pattern}).matchesKey(nested) {
+			t.Errorf("pattern %q should not match nested key %q; a single * stops at /", pattern, nested)
+		}
+	}
+	// The recursive spellings of the same three intentions do match.
+	for _, pattern := range []string{"**", "**/*.bam", "genomes/**"} {
+		if !(&Rule{KeyPattern: pattern}).matchesKey(nested) {
+			t.Errorf("pattern %q should match nested key %q", pattern, nested)
+		}
+	}
+}
+
+// ─── Pattern validation (#100) ────────────────────────────────────────────────
+
+func TestValidateKeyPattern_AcceptsUsablePatterns(t *testing.T) {
+	t.Parallel()
+	for _, pattern := range []string{
+		"", "*", "*.bam", "data/*", "data/**", "**/*.bam", "data/**/raw/*",
+		"data/genome.bam", "genomes/", "[a-z]*.bam",
+	} {
+		if err := ValidateKeyPattern(pattern); err != nil {
+			t.Errorf("ValidateKeyPattern(%q) = %v, want nil", pattern, err)
+		}
+	}
+}
+
+func TestValidateKeyPattern_RejectsUnparseablePatterns(t *testing.T) {
+	t.Parallel()
+	// Both of these make Match return an error, which matchesKey reports as "no
+	// match" — indistinguishable from a valid pattern that happens not to match,
+	// which is why they have to be rejected at load rather than at match time.
+	for _, pattern := range []string{`data/[a-`, `data/x\`} {
+		if err := ValidateKeyPattern(pattern); err == nil {
+			t.Errorf("ValidateKeyPattern(%q) = nil, want an error", pattern)
+		}
+	}
+}
+
+func TestNewFromConfig_RejectsUnparseablePattern(t *testing.T) {
+	t.Parallel()
+	_, err := NewFromConfig([]config.PolicyRuleConfig{
+		{Name: "ok", KeyPattern: "data/**"},
+		{Name: "broken", KeyPattern: `data/[a-`},
+	})
+	if err == nil {
+		t.Fatal("NewFromConfig accepted an unparseable key pattern")
+	}
+	if !strings.Contains(err.Error(), "broken") {
+		t.Errorf("error should name the offending rule, got %v", err)
+	}
+}
+
+// TestEngine_Route_DoubleStarRuleFires is the end-to-end form of the defect: the
+// rule exists, the key is under its pattern, and before #100 it was routed by
+// the fallback ordering as though the rule were not there.
+func TestEngine_Route_DoubleStarRuleFires(t *testing.T) {
+	t.Parallel()
+	sites := []*site.SiteMount{
+		siteMount("primary", types.SiteRolePrimary),
+		siteMount("burst", types.SiteRoleBurst),
+	}
+	e, err := NewFromConfig([]config.PolicyRuleConfig{
+		{Name: "inputs", KeyPattern: "inputs/**", TargetRoles: []string{"burst"}, Priority: 10},
+	})
+	if err != nil {
+		t.Fatalf("NewFromConfig: %v", err)
+	}
+	got, err := e.Route(OperationRead, "inputs/run1/sample.fastq", sites)
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if names := siteNames(got); len(names) != 1 || names[0] != "burst" {
+		t.Errorf("Route = %v, want [burst]: the inputs/** rule did not fire", names)
 	}
 }
 

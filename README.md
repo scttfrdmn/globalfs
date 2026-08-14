@@ -305,7 +305,7 @@ When no rule matches, sites are ordered: primary → backup → burst.
 policy:
   rules:
     - name: hot-reads
-      key_pattern: "datasets/hot/*"  # glob, prefix (ends with /), or exact
+      key_pattern: "datasets/hot/**" # glob, prefix (ends with /), or exact
       operations: [read]             # read, write, delete (empty = all)
       target_roles: [primary]        # primary, backup, burst (empty = all)
       priority: 10
@@ -314,10 +314,36 @@ policy:
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Rule identifier |
-| `key_pattern` | string | Glob (`*`, `**`), prefix ending in `/`, or exact key |
+| `key_pattern` | string | Glob (`*`, `**`), prefix ending in `/`, or exact key — see below |
 | `operations` | []string | `read`, `write`, `delete` |
 | `target_roles` | []string | `primary`, `backup`, `burst` |
 | `priority` | int | Evaluation order (lower = first) |
+
+#### `key_pattern` syntax
+
+| Pattern | Matches |
+|---------|---------|
+| `data/genome.bam` | exactly that key |
+| `data/*` | keys directly under `data/`, one level only |
+| `data/**` | every key under `data/` at any depth, and `data` itself |
+| `**/*.bam` | every `.bam` at any depth, including at the root |
+| `data/**/raw/*` | a `raw/` directory at any depth under `data/`, files directly in it |
+| `genomes/` | a trailing `/` is a literal recursive prefix, not a glob |
+| `""` | every key |
+
+**A single `*` stops at a `/`; `**` crosses it.** So `*.bam` matches `genome.bam`
+but not `runs/genome.bam` — write `**/*.bam` for the recursive form. This is the
+standard glob rule, but it is the one that catches people out, and the
+consequence is quiet: a pattern that matches nothing is not an error, so the rule
+never fires and objects are placed by whatever rule wins instead.
+
+Before v0.3.0 (#100) matching used Go's `path.Match`, to which `**` is just two
+adjacent stars — and therefore still barred from crossing `/`. Every recursive
+pattern this document and the shipped examples advertised matched nothing below
+the first level. Patterns are now matched with
+[doublestar](https://github.com/bmatcuk/doublestar), and a pattern that cannot be
+parsed is rejected at config load with the offending rule named, rather than
+silently matching nothing.
 
 ### `resilience`
 

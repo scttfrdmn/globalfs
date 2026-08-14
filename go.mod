@@ -14,6 +14,7 @@ go 1.26.0
 toolchain go1.26.5
 
 require (
+	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/scttfrdmn/objectfs v0.12.0
 	github.com/spf13/cobra v1.10.2

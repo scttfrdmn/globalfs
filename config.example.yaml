@@ -36,11 +36,23 @@ sites:
       s3_bucket: hpc-data-cloud
       s3_region: us-west-2
 
-# Replication policies
+# Replication policies (LEGACY — validated but never read)
+#
+# This block is checked by `globalfs config validate` and by nothing else: no
+# code path reads cfg.Policies, so none of the placement below happens.  The
+# routing rules that do take effect are the `policy: rules:` block — see
+# examples/coordinator-config.yaml.  The block is kept because strict decoding
+# (#97) would otherwise reject every existing config that carries it.
+#
+# The patterns are corrected here anyway, since this file is what people copy.
+# Two things were wrong with them: they were rooted at "/", and object keys have
+# no leading slash, so none of them matched anything at all; and "**" did not
+# cross a "/" before v0.3.0 (#100), so the recursive ones matched nothing even
+# unrooted.
 policies:
   # Hot datasets - pre-stage before burst
   - name: hot_datasets
-    path_pattern: "/datasets/hot/*"
+    path_pattern: "datasets/hot/**"
     primary: onprem
     replicate_to:
       - cloud
@@ -48,7 +60,7 @@ policies:
 
   # Input data - lazy fetch on first access
   - name: input_data
-    path_pattern: "/inputs/**"
+    path_pattern: "inputs/**"
     primary: onprem
     replicate_to:
       - cloud
@@ -56,21 +68,21 @@ policies:
 
   # Output data - write to cloud, async sync back
   - name: output_data
-    path_pattern: "/results/**"
+    path_pattern: "results/**"
     primary: onprem
     replicate_to: []
     priority: 3
 
   # Scratch space - never replicate (local only)
   - name: scratch
-    path_pattern: "/scratch/**"
+    path_pattern: "scratch/**"
     primary: ""  # No primary (site-local)
     replicate_to: []
     priority: 0
 
   # Shared software - replicate to all sites
   - name: software
-    path_pattern: "/software/**"
+    path_pattern: "software/**"
     primary: onprem
     replicate_to:
       - cloud

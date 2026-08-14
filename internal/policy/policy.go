@@ -12,11 +12,26 @@
 //
 // # Key pattern syntax
 //
-//   - Exact:    "data/genome.bam"    — matches only that key
-//   - Glob:     "*.bam"             — standard path.Match glob (* does not cross /)
-//   - Glob:     "data/*"            — matches any key directly under data/
-//   - Prefix:   "data/genomes/"     — trailing / = recursive prefix (matches everything under)
-//   - Wildcard: ""                  — empty pattern matches every key
+// Patterns are matched with [doublestar.Match], so a single * stops at a / and
+// ** crosses them:
+//
+//   - Exact:     "data/genome.bam"  — matches only that key
+//   - Glob:      "data/*"           — any key directly under data/, one level only
+//   - Recursive: "data/**"          — any key under data/ at any depth, and "data" itself
+//   - Recursive: "**/*.bam"         — any .bam at any depth, including the root
+//   - Prefix:    "data/genomes/"    — trailing / = recursive prefix (matches everything under)
+//   - Wildcard:  ""                 — empty pattern matches every key
+//
+// Note that "*.bam" matches only root-level keys, because one * does not cross a
+// /. Write "**/*.bam" for the recursive form. This is the standard glob rule and
+// not a GlobalFS quirk, but it is the one that surprises people.
+//
+// Matching used [path.Match] before v0.3.0, to which ** is just two stars and
+// therefore still barred from crossing / (#100). Every recursive pattern the
+// documentation and the shipped examples advertised — "/inputs/**" among them —
+// matched nothing below the first level. The failure was silent in the worst way:
+// a pattern that matches nothing is not an error, so the rule simply never fired
+// and its objects were placed by whatever rule won instead.
 //
 // # Rule priority
 //
@@ -26,9 +41,10 @@ package policy
 
 import (
 	"fmt"
-	"path"
 	"sort"
 	"strings"
+
+	"github.com/bmatcuk/doublestar/v4"
 
 	"github.com/scttfrdmn/globalfs/pkg/config"
 	"github.com/scttfrdmn/globalfs/pkg/site"
@@ -82,15 +98,31 @@ func (r *Rule) matchesKey(key string) bool {
 	}
 	// Recursive prefix match: pattern ending with "/" matches every key that
 	// starts with that prefix (e.g. "genomes/" matches "genomes/sample.bam").
+	// Kept as a plain string prefix rather than folded into the glob, because it
+	// is exactly a prefix test and a pattern containing glob metacharacters
+	// before its trailing / would otherwise change meaning.
 	if strings.HasSuffix(r.KeyPattern, "/") {
 		return strings.HasPrefix(key, r.KeyPattern)
 	}
-	matched, err := path.Match(r.KeyPattern, key)
+	matched, err := doublestar.Match(r.KeyPattern, key)
 	if err != nil {
 		// Invalid pattern syntax — treat as no match rather than panic.
+		// ValidatePattern rejects these at construction, so reaching this is a
+		// rule built by hand rather than through New/NewFromConfig.
 		return false
 	}
 	return matched
+}
+
+// ValidateKeyPattern reports whether pattern is syntactically usable.
+//
+// It is [config.ValidateKeyPattern], re-exported here so that a caller working
+// with policy.Rule does not have to reach into the config package to check one.
+// The implementation lives there because pkg/config validates the same patterns
+// during Load and cannot import this package — policy imports config, not the
+// other way round.
+func ValidateKeyPattern(pattern string) error {
+	return config.ValidateKeyPattern(pattern)
 }
 
 // matchesOperation reports whether op is covered by this rule.
@@ -129,10 +161,16 @@ func New(rules ...Rule) *Engine {
 
 // NewFromConfig constructs an Engine from YAML-decoded policy rule configs.
 //
-// Returns an error if any rule references an unknown operation or role name.
+// Returns an error if any rule references an unknown operation or role name, or
+// carries a key pattern that cannot be parsed (#100).  [New] cannot make the
+// pattern check — it takes already-typed rules and returns no error — so a rule
+// assembled in Go is trusted; every rule that arrives from a config file is not.
 func NewFromConfig(cfgRules []config.PolicyRuleConfig) (*Engine, error) {
 	rules := make([]Rule, 0, len(cfgRules))
 	for _, cr := range cfgRules {
+		if err := ValidateKeyPattern(cr.KeyPattern); err != nil {
+			return nil, fmt.Errorf("policy: rule %q: %w", cr.Name, err)
+		}
 		rule := Rule{
 			Name:       cr.Name,
 			KeyPattern: cr.KeyPattern,

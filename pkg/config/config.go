@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/scttfrdmn/globalfs/pkg/types"
+	"github.com/bmatcuk/doublestar/v4"
 	"gopkg.in/yaml.v3"
+
+	"github.com/scttfrdmn/globalfs/pkg/types"
 )
 
 // PolicyRuleConfig defines a single routing rule in YAML configuration.
@@ -39,6 +42,30 @@ type PolicyRuleConfig struct {
 type PolicyConfig struct {
 	// Rules is the ordered list of routing rules loaded from YAML.
 	Rules []PolicyRuleConfig `yaml:"rules"`
+}
+
+// ValidateKeyPattern reports whether a policy key pattern is syntactically
+// usable.  An empty pattern is valid and matches every key; so is one ending in
+// "/", which is a literal prefix rather than a glob.
+//
+// The check exists because an unparseable pattern fails the same way #100's `**`
+// did: matching returns false for it, which is indistinguishable from a valid
+// pattern that happens not to match — so the rule silently never fires and its
+// objects are placed by whatever rule wins instead.  Rejecting at load turns a
+// wrong-placement defect into a startup error naming the rule.
+//
+// It lives in this package, rather than next to the matching code in
+// internal/policy, so that Validate can call it: internal/policy imports this
+// package for PolicyRuleConfig, so the reverse import is not available.
+// policy.ValidateKeyPattern re-exports it.
+func ValidateKeyPattern(pattern string) error {
+	if pattern == "" || strings.HasSuffix(pattern, "/") {
+		return nil
+	}
+	if !doublestar.ValidatePattern(pattern) {
+		return fmt.Errorf("invalid key pattern %q: unbalanced [ ] or a trailing backslash", pattern)
+	}
+	return nil
 }
 
 // CircuitBreakerConfig configures the per-site circuit breaker.
@@ -410,6 +437,18 @@ func (c *Configuration) Validate() error {
 		return fmt.Errorf("at least one site with role 'primary' is required")
 	}
 
+	// Validate the routing rules that actually reach the policy engine.
+	//
+	// These are checked here as well as in policy.NewFromConfig so that
+	// `globalfs config validate` catches a bad pattern without constructing an
+	// engine, and so the daemon fails at load rather than after it has already
+	// opened every site connection.
+	for i, rule := range c.Policy.Rules {
+		if err := ValidateKeyPattern(rule.KeyPattern); err != nil {
+			return fmt.Errorf("policy.rules[%d] (%s): %w", i, rule.Name, err)
+		}
+	}
+
 	// Validate policies
 	for i, policy := range c.Policies {
 		if policy.Name == "" {
@@ -417,6 +456,9 @@ func (c *Configuration) Validate() error {
 		}
 		if policy.PathPattern == "" {
 			return fmt.Errorf("policies[%d].path_pattern is required", i)
+		}
+		if err := ValidateKeyPattern(policy.PathPattern); err != nil {
+			return fmt.Errorf("policies[%d] (%s): %w", i, policy.Name, err)
 		}
 		if policy.Primary != "" && !siteNames[policy.Primary] {
 			return fmt.Errorf("policies[%d].primary references unknown site: %s", i, policy.Primary)
