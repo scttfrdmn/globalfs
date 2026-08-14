@@ -1699,6 +1699,14 @@ func objectStillPresentAfterDelete(err error) bool {
 // the same way they do for Get and Head.
 // Pass limit ≤ 0 to retrieve all matching objects.
 //
+// Results come back in key order and a limit truncates that order, so with
+// limit > 0 the result is the merged namespace's first limit keys rather than an
+// arbitrary subset — see [namespace.Namespace.List] for why the per-site bound
+// costs nothing once the merge is ordered (#109).  Note that health promotion
+// and breaker filtering reorder the *site* slice, which no longer influences
+// which keys are returned; it only decides which site's copy of a shared key
+// supplies the metadata.
+//
 // # Circuit breaker
 //
 // List reads breaker state but never acquires a probe permit, and records no

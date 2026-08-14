@@ -1405,3 +1405,344 @@ func TestPutObject_201IsStillNil(t *testing.T) {
 		t.Fatalf("a 201 must be a nil error, got %v", err)
 	}
 }
+
+// ─── Bounded response bodies and order-independent options (#111) ─────────────
+
+// silentListener accepts connections and then says nothing, which is the
+// condition a client timeout exists for.
+//
+// A bare net.Listener rather than an httptest.Server: httptest's Close blocks
+// until every in-flight handler returns, so a handler that parks until the test
+// releases it deadlocks against a t.Cleanup ordering — and the deadlock would
+// appear precisely in the failing case this test is meant to report, turning a
+// clear assertion failure into a hung run.  Accepted connections are held (not
+// closed) so the client sees a live but silent peer; the goroutine ends when the
+// listener does.
+func silentListener(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, cn := range conns {
+			cn.Close()
+		}
+	})
+	go func() {
+		for {
+			cn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, cn)
+			mu.Unlock()
+		}
+	}()
+	return "http://" + ln.Addr().String()
+}
+
+// endlessBody serves an unbounded stream of bytes, which is the condition every
+// unbounded io.ReadAll in this package would have allocated against.  It writes
+// in chunks and flushes so the client sees data immediately, and stops when the
+// client goes away — a test server that ignored that would keep a goroutine
+// spinning for the rest of the run.
+func endlessBody(t *testing.T, header func(http.ResponseWriter)) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if header != nil {
+			header(w)
+		}
+		chunk := bytes.Repeat([]byte("A"), 64<<10)
+		flusher, _ := w.(http.Flusher)
+		for {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestGetObject_OverSizedBody_IsAnErrorNotATruncation is the core of #111: a
+// server that never stops sending must not be able to drive this client's
+// allocation, and the refusal must be reported rather than handed back as a
+// short object.
+//
+// The distinction matters because #74 is in this same method: returning
+// maxResponseSize bytes with a nil error would be exactly the "truncated data as
+// success" bug that #74 fixed, reintroduced by the fix for this one.
+func TestGetObject_OverSizedBody_IsAnErrorNotATruncation(t *testing.T) {
+	srv := endlessBody(t, nil)
+
+	c := client.New(srv.URL, client.WithMaxResponseSize(256<<10))
+	data, err := c.GetObject(context.Background(), "big")
+	if err == nil {
+		t.Fatalf("GetObject returned nil error for an endless body, with %d bytes", len(data))
+	}
+	if !errors.Is(err, client.ErrResponseTooLarge) {
+		t.Errorf("error does not wrap ErrResponseTooLarge: %v", err)
+	}
+	if data != nil {
+		t.Errorf("GetObject returned %d bytes alongside the error; partial content must "+
+			"be discarded so a caller cannot use whichever value it checks first", len(data))
+	}
+}
+
+// TestGetObject_AtExactlyTheLimit_Succeeds pins the boundary.  A body of exactly
+// maxResponseSize bytes is a valid response, so the limit must be inclusive —
+// which is why the implementation reads limit+1 rather than trusting
+// io.LimitReader's EOF, since that EOF is indistinguishable from a body that
+// simply ended.
+func TestGetObject_AtExactlyTheLimit_Succeeds(t *testing.T) {
+	const size = 4096
+	payload := bytes.Repeat([]byte("z"), size)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		w.Write(payload)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL, client.WithMaxResponseSize(size))
+	data, err := c.GetObject(context.Background(), "exact")
+	if err != nil {
+		t.Fatalf("GetObject at exactly the limit: %v", err)
+	}
+	if len(data) != size {
+		t.Errorf("got %d bytes, want %d", len(data), size)
+	}
+
+	// One byte over is refused, so the boundary is where it claims to be rather
+	// than somewhere nearby.
+	c = client.New(srv.URL, client.WithMaxResponseSize(size-1))
+	if _, err := c.GetObject(context.Background(), "exact"); !errors.Is(err, client.ErrResponseTooLarge) {
+		t.Errorf("limit=%d against a %d-byte body: got %v, want ErrResponseTooLarge",
+			size-1, size, err)
+	}
+}
+
+// TestGetObject_UnboundedByOption keeps the escape hatch honest: a caller who
+// asks for no cap gets no cap, because a trusted coordinator moving very large
+// objects is a real case and the default is a safety default, not a hard limit.
+func TestGetObject_UnboundedByOption(t *testing.T) {
+	const size = 512 << 10
+	payload := bytes.Repeat([]byte("q"), size)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/objects/{key...}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		w.Write(payload)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL, client.WithMaxResponseSize(0))
+	data, err := c.GetObject(context.Background(), "big")
+	if err != nil {
+		t.Fatalf("GetObject with the cap lifted: %v", err)
+	}
+	if len(data) != size {
+		t.Errorf("got %d bytes, want %d", len(data), size)
+	}
+}
+
+// TestCheckStatus_ErrorBodyIsTruncatedNotFailed covers the one read where
+// truncating is right.  An endless *error* body must neither be buffered whole
+// nor cost the caller the status code — a misconfigured endpoint returning a
+// large HTML page is the motivating case, and the useful answer there is "404
+// from something that is not a coordinator", not an allocation.
+func TestCheckStatus_ErrorBodyIsTruncatedNotFailed(t *testing.T) {
+	srv := endlessBody(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	c := client.New(srv.URL)
+	err := c.DeleteObject(context.Background(), "k")
+	if err == nil {
+		t.Fatal("DeleteObject returned nil against a 404")
+	}
+	if errors.Is(err, client.ErrResponseTooLarge) {
+		t.Errorf("an over-long error body must be truncated, not turned into "+
+			"ErrResponseTooLarge: %v", err)
+	}
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error is not an *APIError, so the status code was lost: %v", err)
+	}
+	if apiErr.StatusCode != http.StatusNotFound {
+		t.Errorf("StatusCode = %d, want 404", apiErr.StatusCode)
+	}
+	// 4 KiB of message plus the fixed prefix — the assertion is that it is bounded
+	// at all, since the whole failure mode is a body of unbounded length.
+	if len(apiErr.Message) > 8<<10 {
+		t.Errorf("error message is %d bytes; the body read is not bounded", len(apiErr.Message))
+	}
+}
+
+// TestListObjects_OverSizedBody_IsRefused: the list envelope's size is set by how
+// much is stored rather than by the API's shape, so it carries the configurable
+// cap rather than the fixed control-plane one.
+func TestListObjects_OverSizedBody_IsRefused(t *testing.T) {
+	srv := endlessBody(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+	})
+
+	c := client.New(srv.URL, client.WithMaxResponseSize(128<<10))
+	if _, err := c.ListObjects(context.Background(), "", 0); !errors.Is(err, client.ErrResponseTooLarge) {
+		t.Errorf("ListObjects against an endless body: got %v, want ErrResponseTooLarge", err)
+	}
+}
+
+// TestListSites_OverSizedBody_IsRefused covers the control-plane cap, which is
+// fixed rather than configurable: the site list's size is set by the number of
+// registered sites, and a megabyte is thousands of them.
+//
+// It also pins the error message, because the failure this replaces is
+// misleading rather than absent: decoding a truncated stream yields "unexpected
+// end of JSON input", which points at the coordinator's output when the actual
+// cause is that the response did not stop.
+func TestListSites_OverSizedBody_IsRefused(t *testing.T) {
+	srv := endlessBody(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+	})
+
+	c := client.New(srv.URL)
+	_, err := c.ListSites(context.Background())
+	if !errors.Is(err, client.ErrResponseTooLarge) {
+		t.Fatalf("ListSites against an endless body: got %v, want ErrResponseTooLarge", err)
+	}
+	if strings.Contains(err.Error(), "unexpected end of JSON") {
+		t.Errorf("error blames the JSON rather than the size: %v", err)
+	}
+}
+
+// TestStatus_OverSizedBody_StillReportsHealth is the same reasoning as the error
+// body: /healthz's answer is its status code, and the body is detail.  A server
+// that streams forever must not turn a determinate health answer into an error.
+func TestStatus_OverSizedBody_StillReportsHealth(t *testing.T) {
+	srv := endlessBody(t, func(w http.ResponseWriter) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+
+	c := client.New(srv.URL)
+	sr, err := c.Status(context.Background())
+	if err == nil {
+		t.Error("Status returned nil error for a 503")
+	}
+	if sr.Healthy {
+		t.Error("Status reported healthy for a 503")
+	}
+	if len(sr.Details) > 2<<20 {
+		t.Errorf("Details is %d bytes; the /healthz body read is not bounded", len(sr.Details))
+	}
+}
+
+// TestWithTimeout_AppliesInEitherOptionOrder is the second half of #111.
+// WithTimeout used to assign into c.httpClient.Timeout as it ran, so a
+// WithHTTPClient appearing after it replaced the whole client and discarded the
+// timeout.  The two orderings produced different behaviour from the same options,
+// and the one that lost the timeout is the one that hangs.
+//
+// The assertion is behavioural rather than a field read: the server holds the
+// request open past the timeout, so a client whose timeout was dropped waits on
+// the test's own deadline instead of failing.
+func TestWithTimeout_AppliesInEitherOptionOrder(t *testing.T) {
+	url := silentListener(t)
+
+	const timeout = 150 * time.Millisecond
+	supplied := func() *http.Client { return &http.Client{} }
+
+	orders := map[string][]client.Option{
+		"timeout then httpClient": {client.WithTimeout(timeout), client.WithHTTPClient(supplied())},
+		"httpClient then timeout": {client.WithHTTPClient(supplied()), client.WithTimeout(timeout)},
+		"timeout alone":           {client.WithTimeout(timeout)},
+	}
+
+	for name, opts := range orders {
+		t.Run(name, func(t *testing.T) {
+			c := client.New(url, opts...)
+			done := make(chan error, 1)
+			go func() { _, err := c.ListSites(context.Background()); done <- err }()
+
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("ListSites returned nil against a server that never responds")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("ListSites did not time out: WithTimeout(%v) was discarded in "+
+					"this option order", timeout)
+			}
+		})
+	}
+}
+
+// TestWithHTTPClient_TimeoutSurvivesWhenNoOptionOverridesIt is the converse
+// guard: resolving the timeout after the options must not mean overwriting a
+// timeout that came in on the caller's own client.  Only an explicit WithTimeout
+// changes it.
+func TestWithHTTPClient_TimeoutSurvivesWhenNoOptionOverridesIt(t *testing.T) {
+	url := silentListener(t)
+
+	supplied := &http.Client{Timeout: 150 * time.Millisecond}
+	c := client.New(url, client.WithHTTPClient(supplied))
+
+	done := make(chan error, 1)
+	go func() { _, err := c.ListSites(context.Background()); done <- err }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("ListSites returned nil against a server that never responds")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the timeout on the caller's own *http.Client was discarded")
+	}
+
+	if supplied.Timeout != 150*time.Millisecond {
+		t.Errorf("New mutated the caller's client: Timeout = %v", supplied.Timeout)
+	}
+}
+
+// TestWithTimeout_ZeroMeansNoTimeout distinguishes "option not passed" from
+// "option passed with the zero value", which is why the field is a *Duration.
+// http.Client reads a zero Timeout as unlimited, and a caller who says so must
+// get that rather than the 30s default.
+func TestWithTimeout_ZeroMeansNoTimeout(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		writeJSON(w, http.StatusOK, []client.SiteInfo{{Name: "a", Role: "primary", Healthy: true}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL, client.WithTimeout(0))
+	sites, err := c.ListSites(context.Background())
+	if err != nil {
+		t.Fatalf("ListSites with WithTimeout(0): %v", err)
+	}
+	if len(sites) != 1 {
+		t.Errorf("got %d sites, want 1", len(sites))
+	}
+}

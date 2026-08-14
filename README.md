@@ -811,16 +811,16 @@ exactly the ones on the sites that failed. Do not use it to conclude that a key 
 not exist, and do not use it as the input to a deletion or synchronisation pass. The
 error detail naming the failed sites goes to the coordinator log, not the response.
 
-Two caveats apply even to a `200`:
+Objects are returned in lexicographic key order across all sites, and a `limit`
+truncates that order — so `limit=n` gives you the namespace's first *n* keys, not
+whichever site was polled first. The last key of a truncated response is therefore a
+valid resumption point, though there is no `start_after` parameter to hand it back to
+yet: paging past the truncation means raising the limit.
 
-- **`checksum` is always empty from this endpoint.** S3's `ListObjectsV2` returns no
-  user metadata, and the checksum lives there, so only `HEAD` can supply it.
-  Similarly `size` is the stored (possibly compressed) size here and the
-  uncompressed size from `HEAD`.
-- **A `200` is not a guarantee that the listing is complete.** `limit` is passed to
-  each site individually and the merged result is then truncated, so a
-  lexicographically-early key held only on a lower-priority site can be missing at
-  any limit. Tracked as [#109](https://github.com/scttfrdmn/globalfs/issues/109).
+One caveat applies even to a `200`: **`checksum` is always empty from this endpoint.**
+S3's `ListObjectsV2` returns no user metadata, and the checksum lives there, so only
+`HEAD` can supply it. Similarly `size` is the stored (possibly compressed) size here
+and the uncompressed size from `HEAD`.
 
 ---
 

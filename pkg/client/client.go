@@ -178,6 +178,91 @@ var ErrReplicationPending = errors.New("object stored but replication was not qu
 // check that stops the request being made at all.
 var ErrInvalidKey = errors.New("invalid object key")
 
+// ErrResponseTooLarge reports that the coordinator's response body exceeded the
+// client's size limit and was therefore not returned (#111).
+//
+// It is an error rather than a truncation, deliberately and for the same reason
+// as #74: a short body handed back with a nil error is indistinguishable from a
+// complete one, and this client's contract is that a nil error means whole data.
+// A caller who legitimately needs a bigger object raises the cap with
+// [WithMaxResponseSize]; a caller who has been pointed at the wrong endpoint
+// finds out instead of allocating whatever it sends.
+//
+// Error bodies are the exception: those are truncated silently, because the
+// status code is the outcome and the body is only a message.
+var ErrResponseTooLarge = errors.New("coordinator response exceeds the client's size limit")
+
+// Response body limits.
+//
+// The endpoint this client talks to is a user-supplied flag, so every body it
+// reads is attacker-controlled in the threat model that matters — a
+// misconfiguration pointing at something that is not a coordinator, a proxy
+// returning a large error page, or a hostile host. The server side has bounded
+// request bodies since v0.1.4 (http.MaxBytesReader, 413); this is the missing
+// half.
+//
+// Two fixed caps and one configurable one, split by what determines the size:
+//
+//   - maxErrorBodyBytes — an error message. Nothing legitimate is longer, and
+//     exceeding it truncates silently rather than erroring, because losing the
+//     status code to a body-read failure is strictly worse than a clipped
+//     message.
+//   - maxControlBodyBytes — responses whose size is set by the API's shape
+//     rather than by stored data: the site list, an added site, a replicate
+//     acknowledgement, the 202 detail, /healthz. A megabyte is thousands of
+//     sites.
+//   - WithMaxResponseSize — the two responses whose size is set by how much
+//     data is stored: an object body and a list envelope. Only these need to be
+//     the caller's decision.
+const (
+	maxErrorBodyBytes   = 4 << 10
+	maxControlBodyBytes = 1 << 20
+
+	// defaultMaxResponseSize is generous rather than tight: the point is to have
+	// a finite ceiling at all, not to second-guess object sizes. It is four
+	// times the coordinator's own 256 MiB PUT cap, so no object this client
+	// could have stored through the API is refused on the way back.
+	defaultMaxResponseSize = 1 << 30
+)
+
+// readAtMost reads up to limit bytes, reporting separately whether the reader
+// had more to give.
+//
+// It reads limit+1 bytes to distinguish "exactly limit bytes, complete" from
+// "limit bytes and counting", which io.LimitReader alone cannot: a LimitReader
+// that hits its bound returns io.EOF, identical to a body that simply ended.
+// That difference is the whole point — one is a valid response and the other
+// must not be returned as one.
+func readAtMost(r io.Reader, limit int64) (data []byte, exceeded bool, err error) {
+	data, err = io.ReadAll(io.LimitReader(r, limit+1))
+	if int64(len(data)) > limit {
+		return data[:limit], true, err
+	}
+	return data, false, err
+}
+
+// decodeControlJSON decodes a control-plane response body into v under
+// maxControlBodyBytes.
+//
+// Reading into a buffer first, rather than handing the body to a
+// json.Decoder wrapped in an io.LimitReader, is what lets an over-long body be
+// named as such: a truncated stream reaches the decoder as a syntax error, and
+// "unexpected end of JSON input" is a misleading thing to report when the real
+// cause is that the response did not stop (#111).
+func decodeControlJSON(r io.Reader, what string, v any) error {
+	data, exceeded, err := readAtMost(r, maxControlBodyBytes)
+	if exceeded {
+		return fmt.Errorf("%s: %w (limit %d bytes)", what, ErrResponseTooLarge, int64(maxControlBodyBytes))
+	}
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	if err := json.Unmarshal(data, v); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
+}
+
 // validateKey rejects object keys that could escape their intended path.
 //
 // Same rule, and same reasoning, as cmd/coordinator's validateObjectKey: a ".."
@@ -226,6 +311,15 @@ type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	apiKey     string // set via WithAPIKey; empty means no auth header is sent
+
+	// maxResponseSize caps object and list bodies; see WithMaxResponseSize.
+	maxResponseSize int64
+
+	// timeout holds WithTimeout's value until New resolves it, so that the
+	// timeout does not depend on option order (#111).  nil means "not set by an
+	// option" — distinct from a zero Duration, which http.Client reads as no
+	// timeout at all and which a caller may legitimately want.
+	timeout *time.Duration
 }
 
 // Option is a functional option for New.
@@ -244,8 +338,58 @@ func WithHTTPClient(hc *http.Client) Option {
 }
 
 // WithTimeout sets the HTTP client timeout (default 30s).
+//
+// It applies whatever order the options are given in, including alongside
+// [WithHTTPClient]: the value is recorded here and installed by New once every
+// option has run (#111).  It previously assigned straight into c.httpClient.Timeout,
+// so a WithHTTPClient appearing after it replaced the whole client and discarded
+// the timeout — silently, and in the direction that hangs.
+//
+// A zero duration means no timeout, matching http.Client, and is distinguishable
+// from not passing the option at all.
 func WithTimeout(d time.Duration) Option {
-	return func(c *Client) { c.httpClient.Timeout = d }
+	return func(c *Client) { c.timeout = &d }
+}
+
+// WithMaxResponseSize caps the bytes this client will read from an object body or
+// a list response (default 1 GiB).  A response that exceeds the cap is reported
+// as an error wrapping [ErrResponseTooLarge] rather than truncated (#111).
+//
+// Pass a value ≤ 0 to lift the cap, which restores the pre-v0.3.0 behaviour of
+// allocating whatever the server sends.  That is a real choice for a trusted
+// coordinator moving very large objects, and a bad one for a CLI pointed at an
+// endpoint from a flag, which is why it is not the default.
+//
+// The limit does not apply to error bodies or to the small control-plane
+// responses; those carry their own fixed caps, and an over-long error message is
+// truncated rather than turned into a failure.
+func WithMaxResponseSize(n int64) Option {
+	return func(c *Client) { c.maxResponseSize = n }
+}
+
+// objectBodyLimit returns the effective cap for object and list bodies, and
+// whether one applies at all.
+func (c *Client) objectBodyLimit() (int64, bool) {
+	if c.maxResponseSize <= 0 {
+		return 0, false
+	}
+	return c.maxResponseSize, true
+}
+
+// readBounded reads a response body under the object/list cap, mapping an
+// over-long body to ErrResponseTooLarge.  what names the thing being read so the
+// error says which call was refused.
+func (c *Client) readBounded(r io.Reader, what string) ([]byte, error) {
+	limit, bounded := c.objectBodyLimit()
+	if !bounded {
+		return io.ReadAll(r)
+	}
+	data, exceeded, err := readAtMost(r, limit)
+	if exceeded {
+		return nil, fmt.Errorf("%s: %w (limit %d bytes; raise it with WithMaxResponseSize)",
+			what, ErrResponseTooLarge, limit)
+	}
+	return data, err
 }
 
 // WithAPIKey sets the API key sent as X-GlobalFS-API-Key on every request.
@@ -270,23 +414,35 @@ func (c *Client) setAPIKey(req *http.Request) {
 // chose.  See ErrUnexpectedRedirect for why that matters (#132).
 func New(coordinatorAddr string, opts ...Option) *Client {
 	c := &Client{
-		baseURL:    strings.TrimRight(coordinatorAddr, "/"),
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		baseURL:         strings.TrimRight(coordinatorAddr, "/"),
+		httpClient:      &http.Client{Timeout: 30 * time.Second},
+		maxResponseSize: defaultMaxResponseSize,
 	}
 	for _, o := range opts {
 		o(c)
 	}
-	// Applied after the options, so a client supplied by WithHTTPClient is covered
-	// too — that is the path a caller most plausibly uses to install a custom
-	// Transport, and it would otherwise silently opt out of the policy.  Copying
-	// rather than mutating keeps the caller's own *http.Client untouched: it may be
-	// shared with unrelated code that does want redirects.
+	// Everything below runs after the options, so that no option's effect depends
+	// on where in the list it appeared (#111).
 	if c.httpClient == nil {
 		c.httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
-	if c.httpClient.CheckRedirect == nil {
+	// A copy is taken whenever this constructor needs to change anything about the
+	// client, so the caller's own *http.Client is never mutated: it may be shared
+	// with unrelated code that wants different redirect or timeout behaviour.
+	// Copying shares the Transport, so pooling and any custom RoundTripper survive.
+	if c.timeout != nil || c.httpClient.CheckRedirect == nil {
 		hc := *c.httpClient
-		hc.CheckRedirect = refuseRedirects
+		if c.timeout != nil {
+			hc.Timeout = *c.timeout
+		}
+		// The no-redirect policy covers a WithHTTPClient-supplied client too —
+		// that is the path a caller most plausibly uses to install a custom
+		// Transport, and it would otherwise silently opt out.  A caller who set
+		// CheckRedirect themselves keeps it, including one that deliberately
+		// follows redirects.
+		if hc.CheckRedirect == nil {
+			hc.CheckRedirect = refuseRedirects
+		}
 		c.httpClient = &hc
 	}
 	return c
@@ -308,8 +464,8 @@ func (c *Client) ListSites(ctx context.Context) ([]SiteInfo, error) {
 	}
 
 	var sites []SiteInfo
-	if err := json.NewDecoder(resp.Body).Decode(&sites); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+	if err := decodeControlJSON(resp.Body, "read site list", &sites); err != nil {
+		return nil, err
 	}
 	if sites == nil {
 		sites = []SiteInfo{}
@@ -331,8 +487,8 @@ func (c *Client) AddSite(ctx context.Context, req AddSiteRequest) (SiteInfo, err
 	}
 
 	var info SiteInfo
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return SiteInfo{}, fmt.Errorf("decode response: %w", err)
+	if err := decodeControlJSON(resp.Body, "read added site", &info); err != nil {
+		return SiteInfo{}, err
 	}
 	return info, nil
 }
@@ -362,8 +518,8 @@ func (c *Client) Replicate(ctx context.Context, req ReplicateRequest) (Replicate
 	}
 
 	var result ReplicateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return ReplicateResponse{}, fmt.Errorf("decode response: %w", err)
+	if err := decodeControlJSON(resp.Body, "read replicate acknowledgement", &result); err != nil {
+		return ReplicateResponse{}, err
 	}
 	return result, nil
 }
@@ -380,9 +536,9 @@ func (c *Client) Status(ctx context.Context) (StatusResponse, error) {
 
 	// A read error here is deliberately ignored: the status code is what
 	// determines health, and the body only supplies human-readable detail, so a
-	// truncated read degrades the message rather than the answer.  (Bounding
-	// this read is #111.)
-	body, _ := io.ReadAll(resp.Body)
+	// truncated read degrades the message rather than the answer.  Bounded at
+	// maxControlBodyBytes — /healthz emits one line per unhealthy site (#111).
+	body, _, _ := readAtMost(resp.Body, maxControlBodyBytes)
 	text := strings.TrimSpace(string(body))
 
 	if resp.StatusCode == http.StatusOK {
@@ -406,9 +562,11 @@ func (c *Client) Status(ctx context.Context) (StatusResponse, error) {
 // GetObject retrieves the full content of the object at key.
 //
 // GetObject never returns partial content with a nil error: a read that fails
-// mid-body, or a body shorter than the advertised Content-Length, is reported as
-// an error and the partial bytes are discarded (#74).  Callers can therefore
-// treat a nil error as meaning the returned slice is the whole object.
+// mid-body, a body shorter than the advertised Content-Length, or a body longer
+// than the client's size cap is reported as an error and the partial bytes are
+// discarded (#74, #111).  Callers can therefore treat a nil error as meaning the
+// returned slice is the whole object.  The cap defaults to 1 GiB and is set by
+// [WithMaxResponseSize]; exceeding it wraps [ErrResponseTooLarge].
 //
 // A key containing a ".." component or a null byte is rejected locally, without
 // any request being sent; the returned error wraps [ErrInvalidKey] (#132).
@@ -426,8 +584,15 @@ func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 		return nil, err
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	// Bounded by WithMaxResponseSize, and an over-long body is an error rather
+	// than a truncation — the same rule as the short-body check below, from the
+	// same principle: this method's contract is that a nil error means the whole
+	// object (#74, #111).
+	data, err := c.readBounded(resp.Body, fmt.Sprintf("read object %q body", key))
 	if err != nil {
+		if errors.Is(err, ErrResponseTooLarge) {
+			return nil, err
+		}
 		// Discard the partial bytes: returning them alongside an error invites
 		// callers to use whichever value they check first.
 		return nil, fmt.Errorf("read object %q body after %d bytes: %w", key, len(data), err)
@@ -499,7 +664,10 @@ type objectPutPartialResponse struct {
 // sentinel with a vaguer message.
 func putPartialDetail(resp *http.Response) string {
 	var partial objectPutPartialResponse
-	if err := json.NewDecoder(resp.Body).Decode(&partial); err == nil {
+	// Bounded like any other control-plane body, and the error is discarded for
+	// the reason in the doc comment: the outcome is already fixed by the status
+	// code, so an unreadable or over-long body may only cost detail (#111).
+	if err := decodeControlJSON(resp.Body, "read partial-put detail", &partial); err == nil {
 		if partial.Detail != "" {
 			return partial.Detail
 		}
@@ -563,6 +731,13 @@ func (c *Client) DeleteObject(ctx context.Context, key string) error {
 // ListObjects returns up to limit objects whose keys begin with prefix.
 // Pass prefix="" to list all objects. Pass limit ≤ 0 to retrieve all matches.
 // An empty (never nil) slice is returned when no objects match.
+//
+// Results are in lexicographic key order across every site, and limit truncates
+// that order — so limit=n returns the namespace's first n keys, and the last key
+// of a truncated result is a valid place to resume from (#109).  Checksum is
+// always empty from this call; only [Client.HeadObject] can supply it.
+//
+// The response body is capped; see [WithMaxResponseSize].
 func (c *Client) ListObjects(ctx context.Context, prefix string, limit int) ([]ObjectInfo, error) {
 	params := url.Values{}
 	if prefix != "" {
@@ -591,8 +766,16 @@ func (c *Client) ListObjects(ctx context.Context, prefix string, limit int) ([]O
 		}
 	}
 
+	// The list envelope is bounded by WithMaxResponseSize rather than the fixed
+	// control-plane cap: its size is set by how many objects are stored, which is
+	// the caller's own limit parameter times the size of an entry, and is
+	// therefore the caller's business to size (#111).
+	body, err := c.readBounded(resp.Body, fmt.Sprintf("read object list for prefix %q", prefix))
+	if err != nil {
+		return nil, err
+	}
 	var envelope listObjectsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+	if err := json.Unmarshal(body, &envelope); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	if envelope.Objects == nil {
@@ -679,10 +862,16 @@ func checkStatus(resp *http.Response, wantCode int) error {
 	if resp.StatusCode == wantCode {
 		return nil
 	}
-	// As in Status, a read error is ignored on purpose: an *APIError carrying the
-	// status code and a partial message is strictly better than losing the status
-	// code to a body-read failure.  (Bounding this read is #111.)
-	body, _ := io.ReadAll(resp.Body)
+	// A read error is ignored on purpose: an *APIError carrying the status code and
+	// a partial message is strictly better than losing the status code to a
+	// body-read failure.
+	//
+	// Bounded at maxErrorBodyBytes and truncated silently (#111).  This was the
+	// sharpest of the unbounded reads — it buffered an arbitrarily large *error*
+	// body purely to build a message — and it is also the one place where
+	// truncating beats erroring, since the status code is the outcome and an
+	// error path must not acquire a new way to fail.
+	body, _, _ := readAtMost(resp.Body, maxErrorBodyBytes)
 	// Try to extract {"error":"..."} message.
 	var e struct{ Error string }
 	if json.Unmarshal(body, &e) == nil && e.Error != "" {
