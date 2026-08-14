@@ -1,9 +1,11 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/scttfrdmn/globalfs/pkg/types"
@@ -177,14 +179,22 @@ type GlobalConfig struct {
 	// LogLevel defines the logging level (DEBUG, INFO, WARN, ERROR).
 	LogLevel string `yaml:"log_level"`
 
-	// LogFile is the path to the log file (empty for stdout).
+	// LogFile is the path to the log file.  Empty means stderr, which is also the
+	// fallback if the path cannot be opened — a daemon that refuses to start
+	// because of a log destination is a worse outcome than one that logs to
+	// stderr and says so.
 	LogFile string `yaml:"log_file"`
 
-	// MetricsEnabled enables Prometheus metrics export.
+	// MetricsEnabled controls whether /metrics is served.  When false the route
+	// is not registered and returns 404.
+	//
+	// Note that /metrics is a route on the main API mux and is therefore behind
+	// the API key, like every other route.  There is no second listener and no
+	// metrics_port: that field was accepted and never read until #98 removed it,
+	// which meant a config setting 9090 described a listener that did not exist.
+	// Serving metrics on a separate unauthenticated port is a design change, not
+	// a config read.
 	MetricsEnabled bool `yaml:"metrics_enabled"`
-
-	// MetricsPort is the port for metrics endpoint.
-	MetricsPort int `yaml:"metrics_port"`
 }
 
 // SiteConfig defines a GlobalFS site.
@@ -197,9 +207,6 @@ type SiteConfig struct {
 
 	// ObjectFS configuration
 	ObjectFS ObjectFSConfig `yaml:"objectfs"`
-
-	// CargoShip configuration
-	CargoShip CargoShipConfig `yaml:"cargoship"`
 }
 
 // ObjectFSConfig contains ObjectFS-specific settings for a site.
@@ -215,15 +222,6 @@ type ObjectFSConfig struct {
 
 	// S3Endpoint is an optional custom S3 endpoint (for MinIO, etc.).
 	S3Endpoint string `yaml:"s3_endpoint,omitempty"`
-}
-
-// CargoShipConfig contains CargoShip-specific settings.
-type CargoShipConfig struct {
-	// Endpoint is the CargoShip service endpoint.
-	Endpoint string `yaml:"endpoint"`
-
-	// Enabled indicates if CargoShip is enabled for this site.
-	Enabled bool `yaml:"enabled"`
 }
 
 // The coordinator's port is defined once, here, and every other default is
@@ -257,7 +255,6 @@ func NewDefault() *Configuration {
 			ClusterName:    "globalfs-cluster",
 			LogLevel:       "INFO",
 			MetricsEnabled: true,
-			MetricsPort:    9090,
 		},
 		Coordinator: types.CoordinatorConfig{
 			ListenAddr:    DefaultListenAddr,
@@ -267,7 +264,7 @@ func NewDefault() *Configuration {
 		Sites:    []SiteConfig{},
 		Policies: []types.ReplicationPolicy{},
 		Performance: types.PerformanceConfig{
-			MaxConcurrentTransfers: 8,
+			ReplicationQueueDepth: 8,
 		},
 		Resilience: ResilienceConfig{
 			HealthPollInterval: 30 * time.Second,
@@ -299,13 +296,35 @@ func NewDefault() *Configuration {
 }
 
 // LoadFromFile loads configuration from a YAML file.
+//
+// Decoding is strict: a key with no corresponding struct field is an error, not
+// a value to discard.  This is a deliberate breaking change (#97).  Previously
+// `yaml.Unmarshal` dropped unknown keys silently, so `listen_adrr: ":9000"` was
+// accepted and the daemon bound the default port, and three fields that
+// `config init` itself emitted had been deleted from the struct in v0.1.5 and
+// were being thrown away — while `config validate` passed and `config show`
+// printed a config that simply did not contain them.  An operator got positive
+// confirmation for a setting that did not exist.
+//
+// The cost is that a config carrying a stale key now fails to start rather than
+// being quietly misinterpreted.  That audience is exactly the one that needs to
+// know, and the error names the offending key and its line.
 func (c *Configuration) LoadFromFile(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	if err := yaml.Unmarshal(data, c); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(c); err != nil {
+		// An empty file decodes to io.EOF with the target untouched.  That is a
+		// valid config to load — Validate is what decides whether it is usable,
+		// and it reports the specific missing field, which is a better message
+		// than a bare EOF.
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
 		return fmt.Errorf("failed to parse config file: %w", err)
 	}
 
@@ -343,9 +362,16 @@ func (c *Configuration) Validate() error {
 	if c.Coordinator.ListenAddr == "" {
 		return fmt.Errorf("coordinator.listen_addr is required")
 	}
-	if len(c.Coordinator.EtcdEndpoints) == 0 {
-		return fmt.Errorf("coordinator.etcd_endpoints is required")
-	}
+	// coordinator.etcd_endpoints is deliberately not required.  Nothing reads it:
+	// SetLeaseManager and SetStore have no non-test callers, so the etcd metadata
+	// store and the lease manager are never constructed and no connection to these
+	// endpoints is ever made.  Requiring the field was a startup failure in
+	// exchange for nothing, and examples/coordinator-config.yaml told operators to
+	// leave it empty — advice that produced a config which would not load (#106).
+	//
+	// The field is kept, rather than removed, because it is the configuration
+	// surface for the store when it is wired.  Removing it would also break every
+	// existing config the moment KnownFields(true) below rejects unknown keys.
 
 	// Validate sites
 	if len(c.Sites) == 0 {
@@ -377,11 +403,6 @@ func (c *Configuration) Validate() error {
 		}
 		if site.ObjectFS.S3Region == "" {
 			return fmt.Errorf("sites[%d].objectfs.s3_region is required", i)
-		}
-
-		// Validate CargoShip config
-		if site.CargoShip.Enabled && strings.TrimSpace(site.CargoShip.Endpoint) == "" {
-			return fmt.Errorf("sites[%d] (%q): cargoship.endpoint must not be empty when cargoship.enabled is true", i, site.Name)
 		}
 	}
 

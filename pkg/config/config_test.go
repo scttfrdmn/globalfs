@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -437,33 +438,32 @@ func TestValidate_Valid_ResilienceAndCache(t *testing.T) {
 	}
 }
 
-func TestValidate_CargoShip_EnabledWithoutEndpoint(t *testing.T) {
-	t.Parallel()
-	cfg := baseValidConfig()
-	cfg.Sites[0].CargoShip.Enabled = true
-	cfg.Sites[0].CargoShip.Endpoint = ""
-	if err := cfg.Validate(); err == nil {
-		t.Error("expected error for cargoship.enabled=true with blank endpoint, got nil")
-	}
-}
+// The three TestValidate_CargoShip_* tests that stood here were removed with the
+// CargoShip config block itself (#108).  They asserted that
+// `cargoship.enabled: true` without an endpoint failed validation — real
+// behaviour, for a feature this repository never implemented and that objectfs
+// deleted upstream.  A `cargoship:` key is now rejected at decode time, which
+// TestLoad_RejectsRemovedCargoShipBlock below covers.
 
-func TestValidate_CargoShip_EnabledWithEndpoint(t *testing.T) {
+// TestValidate_EtcdEndpointsNotRequired pins the #106 decision: the field is
+// accepted, unused, and optional.
+//
+// It was required, so `etcd_endpoints: []` — which the shipped example told
+// operators to use for a single-node deployment — produced a config that would
+// not load.  Nothing reads the value: SetStore and SetLeaseManager have no
+// non-test callers, so no connection to these endpoints is ever attempted.
+// Requiring it bought a startup failure and nothing else.
+func TestValidate_EtcdEndpointsNotRequired(t *testing.T) {
 	t.Parallel()
 	cfg := baseValidConfig()
-	cfg.Sites[0].CargoShip.Enabled = true
-	cfg.Sites[0].CargoShip.Endpoint = "http://cargoship.example.com:8080"
+	cfg.Coordinator.EtcdEndpoints = nil
 	if err := cfg.Validate(); err != nil {
-		t.Errorf("valid CargoShip config should pass validation: %v", err)
+		t.Errorf("etcd_endpoints is unused and must not be required: %v", err)
 	}
-}
 
-func TestValidate_CargoShip_DisabledWithoutEndpoint(t *testing.T) {
-	t.Parallel()
-	cfg := baseValidConfig()
-	cfg.Sites[0].CargoShip.Enabled = false
-	cfg.Sites[0].CargoShip.Endpoint = ""
+	cfg.Coordinator.EtcdEndpoints = []string{}
 	if err := cfg.Validate(); err != nil {
-		t.Errorf("disabled CargoShip without endpoint should pass validation: %v", err)
+		t.Errorf("empty etcd_endpoints must validate: %v", err)
 	}
 }
 
@@ -490,7 +490,7 @@ coordinator:
     - etcd-a:2379
     - etcd-b:2379
 performance:
-  max_concurrent_transfers: 32
+  replication_queue_depth: 32
 policies:
   - name: hot
     path_pattern: "/datasets/hot/*"
@@ -529,8 +529,8 @@ sites:
 	}
 
 	// types.PerformanceConfig
-	if got := cfg.Performance.MaxConcurrentTransfers; got != 32 {
-		t.Errorf("Performance.MaxConcurrentTransfers = %d, want 32", got)
+	if got := cfg.Performance.ReplicationQueueDepth; got != 32 {
+		t.Errorf("Performance.ReplicationQueueDepth = %d, want 32", got)
 	}
 
 	// types.ReplicationPolicy — the field whose absence made config.example.yaml
@@ -657,6 +657,167 @@ func TestShippedConfigs_ListenAddrMatchesDefault(t *testing.T) {
 				t.Errorf("coordinator.listen_addr = %q, want %q — a user who copies this "+
 					"file gets a coordinator the CLI default cannot reach (#81)",
 					got, config.DefaultListenAddr)
+			}
+		})
+	}
+}
+
+// ─── Strict decoding (#97) ────────────────────────────────────────────────────
+//
+// LoadFromFile rejects unknown keys.  These tests are the reason the change is
+// worth its breakage: before it, every case below loaded successfully and the
+// setting was discarded in silence, while `config validate` passed and the daemon
+// started.
+
+// TestLoad_RejectsUnknownField covers the plain typo, which is the case that
+// motivated #97: `listen_adrr: ":9000"` was accepted and the daemon bound the
+// default port instead, with nothing logged.  The operator had a config file
+// containing the port they wanted and a daemon on a different one.
+func TestLoad_RejectsUnknownField(t *testing.T) {
+	t.Parallel()
+
+	path := writeTempFile(t, `
+coordinator:
+  listen_adrr: ":9000"
+`)
+	cfg := config.NewDefault()
+	err := cfg.LoadFromFile(path)
+	if err == nil {
+		t.Fatal("expected an error for the misspelled key listen_adrr, got nil")
+	}
+	// The message must name the offending key, or an operator cannot act on it.
+	if !strings.Contains(err.Error(), "listen_adrr") {
+		t.Errorf("error does not name the unknown key: %v", err)
+	}
+}
+
+// TestLoad_RejectsFieldsDeletedInV015 covers the three fields that `config init`
+// itself emitted after v0.1.5 removed them from the struct.  The generated
+// template validated clean while `config show` reported none of the three, so an
+// operator could edit transfer_chunk_size, restart, see the config accepted, and
+// have nothing change.
+func TestLoad_RejectsFieldsDeletedInV015(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, yaml string }{
+		{"health_check_interval", "coordinator:\n  health_check_interval: 30s\n"},
+		{"transfer_chunk_size", "performance:\n  transfer_chunk_size: 16777216\n"},
+		{"cache_size", "performance:\n  cache_size: 1073741824\n"},
+		{"network.bandwidth", "network:\n  bandwidth: 10Gbps\n"},
+		{"network.latency", "network:\n  latency: 20ms\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := config.NewDefault()
+			if err := cfg.LoadFromFile(writeTempFile(t, tc.yaml)); err == nil {
+				t.Errorf("%s was removed in v0.1.5 and must be rejected, got nil", tc.name)
+			}
+		})
+	}
+}
+
+// TestLoad_RejectsRemovedCargoShipBlock covers #108's removal.  A leftover
+// cargoship: block is now a load failure rather than a validated no-op — which
+// is the upgrade note: the block has to come out of existing configs.
+func TestLoad_RejectsRemovedCargoShipBlock(t *testing.T) {
+	t.Parallel()
+
+	path := writeTempFile(t, `
+sites:
+  - name: onprem
+    role: primary
+    cargoship:
+      enabled: true
+      endpoint: http://cargoship:8081
+`)
+	cfg := config.NewDefault()
+	err := cfg.LoadFromFile(path)
+	if err == nil {
+		t.Fatal("expected an error for the removed cargoship block, got nil")
+	}
+	if !strings.Contains(err.Error(), "cargoship") {
+		t.Errorf("error does not name the removed key: %v", err)
+	}
+}
+
+// TestLoad_RejectsRenamedPerformanceField covers #101's rename.  The old name is
+// the one every existing config carries, so it must fail loudly rather than
+// leave the queue at its default depth.
+func TestLoad_RejectsRenamedPerformanceField(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.NewDefault()
+	err := cfg.LoadFromFile(writeTempFile(t, "performance:\n  max_concurrent_transfers: 32\n"))
+	if err == nil {
+		t.Fatal("expected an error for the renamed max_concurrent_transfers, got nil")
+	}
+
+	// And the new name must bind, or the rename traded one silent discard for
+	// another.
+	cfg = config.NewDefault()
+	if err := cfg.LoadFromFile(writeTempFile(t, "performance:\n  replication_queue_depth: 32\n")); err != nil {
+		t.Fatalf("replication_queue_depth must load: %v", err)
+	}
+	if got := cfg.Performance.ReplicationQueueDepth; got != 32 {
+		t.Errorf("ReplicationQueueDepth = %d, want 32", got)
+	}
+}
+
+// TestLoad_RejectsRemovedMetricsPort covers #98.  metrics_port implied a second
+// listener that never existed — /metrics is a route on the main authenticated
+// mux — so the field is gone rather than wired.
+func TestLoad_RejectsRemovedMetricsPort(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.NewDefault()
+	if err := cfg.LoadFromFile(writeTempFile(t, "global:\n  metrics_port: 9090\n")); err == nil {
+		t.Error("expected an error for the removed metrics_port, got nil")
+	}
+}
+
+// TestLoad_EmptyFileIsNotAnError pins the one case where strict decoding must not
+// fire.  An empty file yields io.EOF from the decoder with the target untouched;
+// that is a config to be judged by Validate, whose message names the specific
+// missing field, rather than a parse failure reported as a bare EOF.
+func TestLoad_EmptyFileIsNotAnError(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, content string }{
+		{"empty", ""},
+		{"only-comments", "# nothing but a comment\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := config.NewDefault()
+			if err := cfg.LoadFromFile(writeTempFile(t, tc.content)); err != nil {
+				t.Fatalf("LoadFromFile on an empty config: %v", err)
+			}
+			// Defaults must survive: the decode touched nothing.
+			if got := cfg.Coordinator.ListenAddr; got != config.DefaultListenAddr {
+				t.Errorf("ListenAddr = %q, want the default %q", got, config.DefaultListenAddr)
+			}
+		})
+	}
+}
+
+// TestLoad_ShippedTemplateHasNoUnknownFields is the gate that would have caught
+// the `config init` drift.  TestShippedConfigsAreValid covers the two YAML files
+// on disk; the template is a Go string constant in cmd/globalfs, so it is
+// verified there (TestConfigInit_TemplateLoadsStrictly).  This asserts the
+// property that matters for both: every key a shipped config contains is a key
+// the struct has.
+func TestLoad_ShippedConfigsHaveNoUnknownFields(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		"../../config.example.yaml",
+		"../../examples/coordinator-config.yaml",
+	} {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			t.Parallel()
+			cfg := config.NewDefault()
+			if err := cfg.LoadFromFile(path); err != nil {
+				t.Fatalf("shipped config has a key the struct lacks: %v", err)
 			}
 		})
 	}

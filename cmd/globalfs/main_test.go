@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/scttfrdmn/globalfs/pkg/client"
+	"github.com/scttfrdmn/globalfs/pkg/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -914,6 +916,41 @@ func TestConfigInit_Stdout(t *testing.T) {
 	var m map[string]any
 	if err := yaml.Unmarshal([]byte(out), &m); err != nil {
 		t.Fatalf("config init output is not valid YAML: %v\n%s", err, out)
+	}
+}
+
+// TestConfigInit_TemplateLoadsStrictly is the gate the template never had.
+//
+// Decoding into map[string]any — as TestConfigInit_Stdout above does — accepts
+// any key whatsoever, which is precisely why the template could emit three
+// fields that v0.1.5 had deleted from the struct and stay green for eleven
+// releases.  `config validate` did not catch it either: a file full of discarded
+// keys validates perfectly, because validation runs after the discard.
+//
+// Loading through config.LoadFromFile is what makes the check real, now that it
+// rejects unknown fields (#97).  If someone adds a key to the template that the
+// struct lacks — or deletes a struct field the template still emits — this fails
+// with the offending key named.
+func TestConfigInit_TemplateLoadsStrictly(t *testing.T) {
+	out, err := runCmd(t, "http://localhost:0", "config", "init")
+	if err != nil {
+		t.Fatalf("config init: %v (output: %s)", err, out)
+	}
+
+	path := filepath.Join(t.TempDir(), "template.yaml")
+	if err := os.WriteFile(path, []byte(out), 0o600); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+
+	cfg := config.NewDefault()
+	if err := cfg.LoadFromFile(path); err != nil {
+		t.Fatalf("the config init template has a key the struct lacks: %v", err)
+	}
+
+	// And the template must be usable, not merely decodable: it is what a new
+	// user's first `globalfs config validate` runs against (#96).
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("the config init template does not validate: %v", err)
 	}
 }
 

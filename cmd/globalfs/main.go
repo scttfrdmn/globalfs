@@ -546,15 +546,18 @@ const configTemplate = `# GlobalFS coordinator configuration
 global:
   cluster_name: my-globalfs-cluster
   log_level: INFO             # DEBUG | INFO | WARN | ERROR
-  metrics_enabled: true
-  metrics_port: 9090
+  metrics_enabled: true       # false stops /metrics being served at all
+  # log_file: /var/log/globalfs/coordinator.log   # omit for stderr
 
 coordinator:
   listen_addr: ":8090"
-  etcd_endpoints:
-    - localhost:2379
+
+  # etcd_endpoints and lease_timeout configure the etcd metadata store, which
+  # is not currently enabled — the values are accepted and unused, and neither
+  # field is required.  The coordinator is single-instance; there is no leader
+  # election.  Do not run two against the same buckets.
+  etcd_endpoints: []
   lease_timeout: 60s
-  health_check_interval: 30s
 
 sites:
   - name: primary
@@ -563,9 +566,6 @@ sites:
       mount_point: /mnt/globalfs/primary
       s3_bucket: my-primary-bucket
       s3_region: us-west-2
-    cargoship:
-      enabled: false
-      endpoint: ""
 
   # - name: backup
   #   role: backup
@@ -584,9 +584,9 @@ policy:
   #     priority: 10
 
 performance:
-  max_concurrent_transfers: 8
-  transfer_chunk_size: 16777216  # 16 MiB
-  cache_size: "1GB"
+  # How many replication jobs may queue before Put reports backpressure.
+  # Transfers are serial — this is not a parallelism setting.
+  replication_queue_depth: 8
 
 # Resilience — fault tolerance for site routing
 resilience:

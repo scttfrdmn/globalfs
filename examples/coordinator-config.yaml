@@ -31,10 +31,14 @@ coordinator:
   # Can be overridden at runtime with --bind-addr.
   listen_addr: ":8090"
 
-  # etcd endpoints for distributed metadata (used by the lease manager).
-  # Leave empty for single-node / in-memory-only mode.
-  etcd_endpoints:
-    - "localhost:2379"
+  # etcd endpoints for the etcd metadata store.
+  #
+  # The store is NOT currently enabled: nothing in the shipped daemon constructs
+  # it, so no connection to these endpoints is ever made and the value is accepted
+  # and unused.  It is not required, and leaving it empty is fine.  The same
+  # applies to lease_timeout below — there is no leader election running, and the
+  # coordinator is single-instance.  See the README's Deployment topology note.
+  etcd_endpoints: []
 
   lease_timeout: 60s
 
@@ -54,9 +58,6 @@ sites:
       s3_bucket: hpc-data-onprem
       s3_region: us-west-2
       s3_endpoint: http://minio.local:9000   # omit for AWS S3
-    cargoship:
-      endpoint: http://cargoship-onprem:8081
-      enabled: true
 
   # AWS S3 cloud burst site
   - name: cloud
@@ -65,9 +66,6 @@ sites:
       mount_point: /mnt/objectfs-cloud
       s3_bucket: hpc-data-cloud-us-west-2
       s3_region: us-west-2
-    cargoship:
-      endpoint: http://cargoship-cloud:8081
-      enabled: true
 
   # Off-site backup replica (e.g. a second AWS region)
   - name: backup
@@ -76,9 +74,6 @@ sites:
       mount_point: /mnt/objectfs-backup
       s3_bucket: hpc-data-backup-us-east-1
       s3_region: us-east-1
-    cargoship:
-      endpoint: ""
-      enabled: false
 
 # ── Policy routing rules ───────────────────────────────────────────────────────
 #
@@ -124,4 +119,8 @@ policy:
 # ── Performance tuning ─────────────────────────────────────────────────────────
 
 performance:
-  max_concurrent_transfers: 8
+  # replication_queue_depth is how many replication jobs may wait in the queue
+  # before Put starts reporting backpressure.  It is NOT a parallelism setting:
+  # the worker drains the queue serially, one transfer at a time.  This field was
+  # called max_concurrent_transfers, which is why it reads like a worker count.
+  replication_queue_depth: 8

@@ -132,7 +132,18 @@ type CoordinatorConfig struct {
 
 // PerformanceConfig contains performance tuning settings.
 type PerformanceConfig struct {
-	// MaxConcurrentTransfers sets the replication worker queue depth.
-	// The coordinator daemon reads this and passes it to SetWorkerQueueDepth at startup.
-	MaxConcurrentTransfers int `json:"max_concurrent_transfers" yaml:"max_concurrent_transfers"`
+	// ReplicationQueueDepth sets the replication worker's queue capacity — the
+	// number of jobs that may be waiting before Enqueue starts reporting
+	// backpressure.  The coordinator daemon passes it to SetWorkerQueueDepth at
+	// startup.
+	//
+	// This field was called max_concurrent_transfers and documented as "maximum
+	// parallel replication jobs", which it never was: the worker's run loop is a
+	// single goroutine consuming the queue serially, so raising the value bought
+	// buffer, not throughput.  Renamed in #101 rather than made true, because a
+	// pool of N consumers can reorder two Puts of the same key — seriality is
+	// currently what guarantees per-key ordering, and replacing that guarantee
+	// needs a design (per-key affinity, or accepted last-writer-wins) rather than
+	// a wider channel.  A real pool may reclaim the old name later.
+	ReplicationQueueDepth int `json:"replication_queue_depth" yaml:"replication_queue_depth"`
 }

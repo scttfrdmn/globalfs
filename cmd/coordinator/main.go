@@ -20,6 +20,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -163,8 +164,21 @@ func main() {
 			logLevelExplicit = true
 		}
 	})
+	// Reconfigure the logger from config for level, destination, or both.  The
+	// level from --log-level wins when it was given explicitly; global.log_file
+	// has no flag equivalent, so it always applies (#98).
+	logLevel := *logLevelStr
 	if !logLevelExplicit && cfg.Global.LogLevel != "" {
-		setupLogger(cfg.Global.LogLevel)
+		logLevel = cfg.Global.LogLevel
+	}
+	// The returned file is deliberately not closed.  It must stay open for the
+	// whole process lifetime, and main exits via os.Exit on every path — including
+	// the successful one — so a defer here would not run anyway.  Nothing is lost
+	// by that: slog's TextHandler issues one unbuffered Write per record, so there
+	// is no buffered output to flush, and the kernel closes the descriptor at
+	// exit.  A defer would only imply a guarantee that does not exist.
+	if setupLoggerTo(logLevel, cfg.Global.LogFile) != nil {
+		slog.Info("logging to file", "path", cfg.Global.LogFile)
 	}
 
 	// ── Build site mounts ─────────────────────────────────────────────────────
@@ -201,11 +215,11 @@ func main() {
 		slog.Info("leader lease TTL configured", "ttl", cfg.Coordinator.LeaseTimeout)
 	}
 
-	// ── Replication worker queue depth (from performance.max_concurrent_transfers) ─
-	if cfg.Performance.MaxConcurrentTransfers > 0 {
+	// ── Replication worker queue depth (from performance.replication_queue_depth) ─
+	if cfg.Performance.ReplicationQueueDepth > 0 {
 		mustConfigure("replication worker queue depth",
-			c.SetWorkerQueueDepth(cfg.Performance.MaxConcurrentTransfers))
-		slog.Info("replication worker depth configured", "depth", cfg.Performance.MaxConcurrentTransfers)
+			c.SetWorkerQueueDepth(cfg.Performance.ReplicationQueueDepth))
+		slog.Info("replication worker depth configured", "depth", cfg.Performance.ReplicationQueueDepth)
 	}
 
 	// ── Resilience: health polling ────────────────────────────────────────────
@@ -320,7 +334,20 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler(c))
 	mux.HandleFunc("/readyz", readyzHandler())
-	mux.Handle("/metrics", promhttp.Handler())
+
+	// global.metrics_enabled now gates the route (#98).  It previously bound
+	// nothing at all, so an operator who set it false to keep cardinality — or
+	// site and bucket names — off a shared network got metrics served anyway,
+	// with `config show` confirming the setting they had asked for.
+	//
+	// Registration is skipped entirely rather than the handler returning 404, so
+	// there is no route to probe.  Note the coordinator still collects metrics
+	// internally when this is off; the flag controls exposure, not measurement.
+	if cfg.Global.MetricsEnabled {
+		mux.Handle("/metrics", promhttp.Handler())
+	} else {
+		slog.Info("metrics endpoint disabled by global.metrics_enabled")
+	}
 	mux.HandleFunc("GET /api/v1/info", infoHandler(c, version, startTime))
 	registerAPIRoutes(mux, ctx, c, m, cfg.Security)
 
@@ -457,8 +484,26 @@ func readyzHandler() http.HandlerFunc {
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
-// setupLogger configures the global slog logger with the given level.
+// setupLogger configures the global slog logger with the given level, writing to
+// stderr.
 func setupLogger(level string) {
+	setupLoggerTo(level, "")
+}
+
+// setupLoggerTo configures the global slog logger with the given level, writing
+// to path — or to stderr when path is empty.
+//
+// It returns the opened file so the caller can close it, and nil when logging to
+// stderr.  A path that cannot be opened is reported and falls back to stderr
+// rather than being fatal: a daemon that refuses to start because of a log
+// destination has turned an observability preference into an outage, and the
+// operator loses the very channel that would have explained why (#98).
+//
+// The file is opened append-only.  Truncating would discard the previous run's
+// logs at exactly the moment they are most likely to be wanted — after a crash
+// and restart.  No rotation is performed; that is logrotate's job, and this
+// handler will keep writing to a renamed inode until the process restarts.
+func setupLoggerTo(level, path string) *os.File {
 	var lvl slog.Level
 	switch strings.ToUpper(strings.TrimSpace(level)) {
 	case "DEBUG":
@@ -470,6 +515,25 @@ func setupLogger(level string) {
 	default:
 		lvl = slog.LevelInfo
 	}
-	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
+
+	var w io.Writer = os.Stderr
+	var f *os.File
+	var openErr error
+	if strings.TrimSpace(path) != "" {
+		f, openErr = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if openErr == nil {
+			w = f
+		}
+	}
+
+	h := slog.NewTextHandler(w, &slog.HandlerOptions{Level: lvl})
 	slog.SetDefault(slog.New(h))
+
+	// Logged after SetDefault so the warning lands on stderr, where a reader who
+	// is looking for the missing log file will actually see it.
+	if openErr != nil {
+		slog.Warn("cannot open global.log_file; logging to stderr",
+			"path", path, "error", openErr)
+	}
+	return f
 }
