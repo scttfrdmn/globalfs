@@ -71,6 +71,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cmd/globalfs`: `object put --json` gains `replication_pending` and `detail`,
   both `omitempty`, so a fully replicated write serialises byte-identically to
   before and a caller who wants to gate on incomplete replication can (#130)
+- `internal/coordinator`: `ErrDeleteIncomplete`, returned by `Delete` when the
+  object may still be readable at a named site. A `Delete` that reported success
+  while leaving copies behind was the defect; the sentinel is how a caller
+  distinguishes "gone everywhere" from "gone from some places", and the error
+  text names the survivors so the operator knows where to look (#87)
+- `internal/cache`: `Generation()` and `PutIfUnchanged()` — the invalidation
+  fence that makes a read-through fill safe against a write that lands while the
+  fill is in flight. Every invalidation bumps a counter; a filler reads it before
+  its remote read and inserts only if it has not moved (#89, #90)
+- `internal/metrics`: `globalfs_delete_incomplete_total` and
+  `RecordDeleteIncomplete()`. Monotonic, for the same reason
+  `globalfs_replication_dropped_total` is: an incomplete delete is an object
+  still readable through the API that just reported it gone, and that has to stay
+  visible after a later retry succeeds and after the log line scrolls. Any
+  non-zero value is a correctness event, and under a retention or erasure
+  obligation a compliance one (#87)
 
 ### Security
 - `cmd/coordinator/api.go`, `main.go`: path traversal crossed the authorization
@@ -332,6 +348,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by construction and says so; `AddSiteUnique` under the lock remains
   authoritative, verified by 16 concurrent registrations that all see the name
   free (#131)
+- `internal/cache`, `internal/coordinator`: the read-through cache served bytes a
+  write had already replaced, and there was no bound on how long. A read-through
+  fill is two steps with a network round-trip between them, so a reader parked
+  after its site read and before its cache write repopulated the entry *after* a
+  concurrent `Put` or `Delete` had invalidated it — and the invalidation found
+  nothing to remove, because the entry did not exist yet. With `Cache.TTL`
+  defaulting to `0` the resurrected entry never expires, so it was served until
+  LRU pressure happened to evict it or the process restarted. Fixed with a
+  generation fence: every invalidation bumps a counter, `Get` reads it *before*
+  the site read, and the fill goes through `PutIfUnchanged`, which compares and
+  inserts under one lock acquisition. The load-bearing detail is that
+  `Cache.Delete` bumps the counter **whether or not the key was present** — the
+  case that matters is exactly the one where it is absent because a fill for it is
+  still in flight. That also meant `Put` and `Delete` needed no change, which is
+  what let this land alongside the delete work below without the two colliding.
+  The `TTL=0` half is deliberately *not* fixed: see Changed (#89, #90)
+- `internal/coordinator/coordinator.go`: `Delete` returned `nil` while the object
+  was still readable. Failures at non-primary sites were logged and discarded, and
+  — not in the filed report — the primary loop returned on the *first* error, so
+  every replica was left untouched: the failure mode maximised the number of
+  surviving copies of an object the caller had asked to be erased. `Delete` now
+  attempts every routed site and returns an error wrapping `ErrDeleteIncomplete`
+  naming the survivors, with `globalfs_delete_incomplete_total` alongside it.
+  A site-level not-found counts as *gone*, which is what keeps the fix idempotent:
+  without it, every retry of an already-completed delete would report incomplete
+  forever and "retry the same Delete" would not be usable advice. Any other error
+  means "may still be there", because a refused delete and a delete that succeeded
+  but failed to acknowledge are indistinguishable from here, and assuming survival
+  is the direction that reports a problem instead of hiding one (#87)
+- `internal/coordinator/coordinator.go`: `Put`'s error paths skipped cache
+  invalidation. Primaries are written sequentially and the first failure returns
+  immediately, so a `Put` that reported an error could still have mutated an
+  earlier primary while the cache went on serving the pre-`Put` value — with
+  `TTL=0`, for the life of the process. The invalidation is now a `defer` taken
+  before the first site is touched, which covers the early returns by construction
+  rather than by remembering to duplicate it above each new `return` — and `Put`
+  gained another error path this same release (#79's partial success). `Delete`
+  got the same treatment for the same reason. Invalidating more than necessary is
+  the safe direction: a spurious invalidation costs one cache miss, a missed one
+  serves stale data indefinitely (#91)
+- `internal/replication/worker.go`: a transfer already in flight re-created an
+  object that had been deleted everywhere. `transfer` read the source and wrote
+  the destination with nothing in between that could notice, so a delete landing
+  in that span was undone at a site the operator was not watching — and
+  `Coordinator.Get` then served the resurrected replica, because any replica
+  satisfies a read. The source is now re-checked immediately before the
+  destination PUT, which narrows the window from the whole GET→PUT span (minutes
+  for a large object, or the queue wait plus two retry backoffs) to the Head→Put
+  gap. The guard is deliberately asymmetric: only an unambiguous code-matched
+  not-found abandons the transfer, because treating an unreachable source as a
+  delete would silently halt replication for the duration of any source-side
+  incident. An abandoned transfer settles `EventCompleted` with **no** content
+  hash — recording one would make the dedup index claim the destination holds
+  content it does not, which is the same class of quiet defect one layer over.
+  The residual Head→Put window stays open by necessity; see Changed (#92)
+- `internal/coordinator/coordinator.go`: the circuit breaker leaked HalfOpen probe
+  permits, ejecting recovered sites from read routing for the life of the process.
+  `filterByCircuitBreaker` called `Allow` for every candidate, but `Get` and `Head`
+  use only the first site that answers — and `Allow` is not a predicate: on a
+  HalfOpen circuit it *takes* the single probe permit, which only a recorded
+  outcome releases. `List` was worse and was not in the filed report: it acquired
+  for every candidate and recorded nothing for any of them. Filtering now tests
+  `State`, which consumes nothing, and `Get`/`Head` range over an
+  `attemptableSites` iterator that takes each permit as it yields the site, paired
+  1:1 with the `recordSiteResult` that releases it. `List` reads breaker state and
+  acquires nothing at all: `namespace.List` folds per-site failures into one
+  joined error, so it cannot attribute an outcome to a site without
+  reimplementing the merge — and excluding a HalfOpen site would silently truncate
+  the namespace, the one failure mode a listing must not have. Two traps recorded
+  because neither is visible from the fix: splitting acquisition from filtering
+  makes them two decisions at different moments, so without a second pass when
+  every candidate refuses, a read can attempt *no* site and return not-found — a
+  404 for data that exists, worse than the leak. And `State` cannot detect the
+  leak it diagnoses, since it persists the Open→HalfOpen transition itself and
+  reads `HalfOpen` for a healthy probe-eligible site and a stranded one alike;
+  that is why nothing in `/api/v1/sites` ever looked wrong (#94)
 - `internal/metadata/etcd_store.go`: removed `replicatedPrefix`, which was
   never called and duplicated a string literal already inlined at its one
   would-be call site
@@ -349,6 +441,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the build now resolves entirely from the module proxy with no local paths.
 
 ### Changed
+- **`Coordinator.Delete` now returns an error where it used to return `nil`.** A
+  delete that leaves the object readable at any routed site reports
+  `ErrDeleteIncomplete` and names the survivors. Callers that treated a nil from
+  `Delete` as "gone" were getting an answer the coordinator could not support;
+  callers that treat *any* error as "nothing happened" now need to distinguish,
+  because a partial delete removed real copies and retrying is both safe and the
+  intended response. `DELETE /api/v1/objects/{key...}` maps this to 502 for now,
+  which is not wrong but says less than it could — a partial delete with named
+  sites is not the same as a delete that achieved nothing (#87)
+- **Two known gaps are left open rather than papered over.** `Cache.TTL` still
+  defaults to `0`, so a cache entry has no expiry. The generation fence closes the
+  race that put stale bytes there, so this is no longer a correctness bug — but a
+  non-zero default would bound the damage from any *future* staleness defect, and
+  unboundedness is what made #89/#90 severity-high rather than a transient
+  inconsistency. Recommended: 5–15 minutes. Changing a shipped default is an
+  operator-visible decision, so it is not made here. Separately, #92's Head→Put
+  window still exists: closing it needs `Delete` to invalidate queued replication
+  jobs, which needs a durable record of the delete that no shipped deployment has
+  (`SetStore` still has no non-test callers). Both are documented at the code so
+  the next reader does not assume they are handled (#89, #90, #92)
+- **`Coordinator.Delete`'s burst-only fix came from elsewhere than filed.** #88
+  asked for `Put`'s promote-the-first-non-primary rule to be shared with `Delete`,
+  and it now is, as `partitionForWrite`. But that promotion is *behaviourally
+  inert* in the rewritten `Delete`, which concatenates primaries and others into
+  one target list and reports every site's outcome identically — reverting it
+  breaks no test. The burst-only symptom is genuinely fixed; it is fixed by #87's
+  change. The shared helper is kept on its original rationale rather than a
+  correctness one: `Put` grew the promotion with a comment explaining why it was
+  necessary, `Delete` never did, and neither call site showed the omission on its
+  own. `Put` still depends on it for real (#87, #88)
 - **Coordinator and Worker are now single-use.** The lifecycle is
   `created → running → stopped`: `Start` is idempotent, `Stop` before `Start` is
   legal but terminal, and `Stop`-then-`Start` is refused with `ErrStopped`.

@@ -1332,8 +1332,17 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 //
 // An HTTP layer in front of this should map ErrReplicationNotQueued to 202
 // Accepted (the object exists; replication is incomplete), not to 5xx: the
-// object is retrievable immediately afterwards.  cmd/coordinator currently maps
-// every Put error to 502, which is wrong for this case and is tracked separately.
+// object is retrievable immediately afterwards.  cmd/coordinator does this, and
+// also sets X-GlobalFS-Replication: pending so a caller can tell the two kinds
+// of success apart without parsing a body (#130).
+//
+// # Cache invalidation
+//
+// The cached entry for key is invalidated on every path out of Put, not only the
+// successful one.  Primaries are written sequentially and the first failure
+// returns immediately, so a Put that reports an error may still have mutated an
+// earlier primary — and the cache would otherwise go on serving the pre-Put
+// value, with the default TTL of 0, for as long as the process ran (#91).
 func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	c.mu.RLock()
 	snapshot, pol, store, cb, oc := c.snapshotSites(), c.policy, c.store, c.cb, c.objCache
