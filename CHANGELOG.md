@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-08-13
+
+**This release contains the v0.2.2 milestone as well as v0.2.3.** Both tranches
+were developed against `main` and neither was tagged as it landed, so 0.2.2 is
+skipped as a version number rather than tagged retroactively at a commit that was
+never released. Entries are grouped by kind rather than by milestone, so read the
+issue numbers: **#72–#81 is v0.2.2** — the worker panic, the two authorization
+escapes, the truncated-read and write-timeout corruption pair,
+not-found-as-site-failure, the two shutdown ordering defects, and the disagreeing
+default ports. **#82–#95 and #130–#132 is v0.2.3** — the single-use lifecycle,
+delete correctness, and cache coherence.
+
+Twenty-seven issues, and the shape of them is worth stating: most were **success
+reported for something that had not succeeded** — `Put` returning `nil` with the
+write unreplicated, `Delete` returning `nil` with copies still readable,
+`GetObject` returning a truncated body with a nil error, a cache serving pre-write
+bytes indefinitely. None would have appeared in a log as an error. Two entries in
+`### Changed` are therefore about callers: `Delete` now returns an error where it
+returned `nil`, and `PUT /api/v1/objects` can answer 202.
+
 ### Added
 - `.github/workflows/ci.yml`: continuous integration, which this repository has
   never had. Six jobs: `test` (build, vet, `go test -race`), `tidy` (go.mod/go.sum
@@ -511,6 +531,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged — done here so the new gofmt gate can be whole-repo and blocking
   rather than scoped to changed files
 
+## [0.2.1] - 2026-02-24
+
+Tagged and released without a section here; recorded retroactively at 0.2.3 so the
+file agrees with the tag list.
+
+### Changed
+- objectfs dependency updated v0.9.0 → v0.10.0 — parallel range GETs, a
+  chunk-aware cache, and the content SHA-256 metadata that 0.2.0's replication
+  fast path reads. Worth recording precisely, because 0.2.0's own notes said it
+  "depends on objectfs v0.10.0" while its `go.mod` pinned v0.9.0: the checksum
+  fast path was documented as available one release before the dependency
+  providing it was required. It degraded to the full GET → PUT rather than
+  failing, which is why nothing caught it
+- **Neither 0.2.0 nor 0.2.1 was installable.** Both tags carry
+  `replace github.com/objectfs/objectfs => ../objectfs`, so `go install` of either
+  fails outside a working tree with a sibling objectfs checkout. The module path
+  was also a repository belonging to someone else. Both are fixed in 0.2.3, which
+  is the first release resolvable entirely from the module proxy — see the CI and
+  import-path entries above
+
 ## [0.2.0] - 2026-02-23
 
 ### Added
@@ -810,4 +850,18 @@ First production-ready release of the GlobalFS coordinator.
 
 ---
 
+[Unreleased]: https://github.com/scttfrdmn/globalfs/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/scttfrdmn/globalfs/compare/v0.2.1...v0.2.3
+[0.2.1]: https://github.com/scttfrdmn/globalfs/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/scttfrdmn/globalfs/compare/v0.1.12...v0.2.0
+[0.1.12]: https://github.com/scttfrdmn/globalfs/compare/v0.1.11...v0.1.12
+[0.1.11]: https://github.com/scttfrdmn/globalfs/compare/v0.1.10...v0.1.11
+[0.1.10]: https://github.com/scttfrdmn/globalfs/compare/v0.1.9...v0.1.10
+[0.1.9]: https://github.com/scttfrdmn/globalfs/compare/v0.1.8...v0.1.9
+[0.1.8]: https://github.com/scttfrdmn/globalfs/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/scttfrdmn/globalfs/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/scttfrdmn/globalfs/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/scttfrdmn/globalfs/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/scttfrdmn/globalfs/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/scttfrdmn/globalfs/compare/v0.1.0...v0.1.3
 [0.1.0]: https://github.com/scttfrdmn/globalfs/releases/tag/v0.1.0
