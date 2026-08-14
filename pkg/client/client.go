@@ -649,9 +649,14 @@ func (c *Client) PutObject(ctx context.Context, key string, data []byte) error {
 // whose replication was not queued.  It is deliberately not an error envelope on
 // the wire, so it cannot be read out by checkStatus.
 type objectPutPartialResponse struct {
-	Key    string `json:"key"`
-	Status string `json:"status"`
-	Detail string `json:"detail"`
+	Key          string   `json:"key"`
+	Status       string   `json:"status"`
+	PendingSites []string `json:"pending_sites,omitempty"`
+	RequestID    string   `json:"request_id,omitempty"`
+	// Detail is what coordinators before v0.3.0 sent in place of PendingSites: the
+	// server-side error verbatim.  Still read, so this client keeps working against
+	// one; new coordinators do not send it (#110).
+	Detail string `json:"detail,omitempty"`
 }
 
 // putPartialDetail extracts the coordinator's explanation from a 202 body,
@@ -662,16 +667,23 @@ type objectPutPartialResponse struct {
 // must not be allowed to turn a committed write into a different outcome.  An
 // older coordinator, or a proxy that strips the body, still yields the correct
 // sentinel with a vaguer message.
+//
+// PendingSites is preferred over Detail because it is the structured form of the
+// same information: the sites are read from a field rather than recovered from a
+// formatted error string (#110).  Detail remains the fallback for a pre-v0.3.0
+// coordinator, so an older server still produces a message naming the sites.
 func putPartialDetail(resp *http.Response) string {
 	var partial objectPutPartialResponse
 	// Bounded like any other control-plane body, and the error is discarded for
 	// the reason in the doc comment: the outcome is already fixed by the status
 	// code, so an unreadable or over-long body may only cost detail (#111).
 	if err := decodeControlJSON(resp.Body, "read partial-put detail", &partial); err == nil {
-		if partial.Detail != "" {
+		switch {
+		case len(partial.PendingSites) > 0:
+			return fmt.Sprintf("replication not queued for %v", partial.PendingSites)
+		case partial.Detail != "":
 			return partial.Detail
-		}
-		if partial.Status != "" {
+		case partial.Status != "":
 			return partial.Status
 		}
 	}

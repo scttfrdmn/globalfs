@@ -263,6 +263,42 @@ var ErrNotFound = fmt.Errorf("object not found at any site: %w", objectfssdk.Err
 // (#79).
 var ErrReplicationNotQueued = errors.New("replication not queued")
 
+// ReplicationNotQueuedError is the concrete error [Coordinator.Put] returns for
+// the partial success described on [ErrReplicationNotQueued], carrying the
+// destinations that got no job as a field.
+//
+// It exists because two layers wanted those names and the only way to get them
+// was to parse this package's %v output.  Both said so in a comment and did it
+// anyway: cmd/coordinator put the whole formatted message in a 202 response body,
+// and pkg/client re-derived it from the wrapped text.  A parser of another
+// package's format is a silent breakage waiting for the next edit to that format,
+// and on the response path it was also an open channel for whatever that text
+// might later contain (#110).
+//
+// Errors.Is still finds ErrReplicationNotQueued and the underlying cause, so no
+// existing caller has to change; errors.As is the addition.
+type ReplicationNotQueuedError struct {
+	// Key is the object that was stored.
+	Key string
+	// Destinations names the sites for which replication could not be queued.
+	// These are GlobalFS site names, which the API already exposes on
+	// GET /api/v1/sites; no bucket, region, or endpoint appears here.
+	Destinations []string
+	// Cause is the underlying reason — the worker's queue-full error, or the
+	// context error if the caller's context ended while waiting for room.
+	Cause error
+}
+
+func (e *ReplicationNotQueuedError) Error() string {
+	return fmt.Sprintf("coordinator: Put %q: stored on primaries but %s for %v: %v",
+		e.Key, ErrReplicationNotQueued, e.Destinations, e.Cause)
+}
+
+// Unwrap returns both the sentinel and the cause, so errors.Is finds either.
+func (e *ReplicationNotQueuedError) Unwrap() []error {
+	return []error{ErrReplicationNotQueued, e.Cause}
+}
+
 // defaultEnqueueBackpressure is how long Put will wait for room in the
 // replication queue before giving up and reporting ErrReplicationNotQueued.
 //
@@ -1508,8 +1544,11 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 	}
 
 	if len(notQueued) > 0 {
-		return fmt.Errorf("coordinator: Put %q: stored on primaries but %w for %v: %w",
-			key, ErrReplicationNotQueued, notQueued, notQueuedCause)
+		return &ReplicationNotQueuedError{
+			Key:          key,
+			Destinations: notQueued,
+			Cause:        notQueuedCause,
+		}
 	}
 	return nil
 }

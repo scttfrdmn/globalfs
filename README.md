@@ -422,6 +422,11 @@ Known gap: the interval between resolving the host and the S3 SDK connecting is
 a DNS-rebinding window. Closing it requires pinning the connection to the
 resolved address, which the ObjectFS SDK does not currently expose.
 
+There is no config field for error sanitization: storage-layer failures are always
+reported to the caller as `"upstream storage error"` with a `request_id`, and the
+real message always goes to the coordinator log. See [Error
+responses](#api-reference) for the shape and the reasoning.
+
 ---
 
 ## CLI Reference
@@ -582,8 +587,18 @@ X-GlobalFS-API-Key: <key>
 Responses are `application/json`. Error responses have the shape:
 
 ```json
-{"error": "message"}
+{"error": "message", "request_id": "8f3ac21d920e6fd2"}
 ```
+
+Every response also carries `X-Request-ID`, echoing the header you sent or a
+generated one. Failures that came from the storage layer report a fixed
+`"upstream storage error"` and put `request_id` in the body as well as the header:
+the real error — which site, which bucket, which endpoint — goes to the
+coordinator log at `ERROR` under that same ID. When reporting a problem, quote the
+`request_id`; it is what lets an operator find the message you did not get.
+
+Errors the caller can act on are still specific: a rejected key, a malformed
+`limit`, an oversized body, and a missing object all say so.
 
 ### Object key restrictions
 
@@ -700,13 +715,20 @@ Returns all registered sites with health and circuit state.
     "name": "cloud",
     "role": "burst",
     "healthy": false,
-    "error": "connection timeout",
+    "error": "health check failed",
     "circuit_state": "open"
   }
 ]
 ```
 
 `circuit_state` is omitted when no circuit breaker is configured.
+
+`error` is always the fixed string `health check failed`. The underlying failure
+was a verbatim `HeadBucket` error naming the bucket, region, and endpoint behind
+the site; it now goes to the coordinator log at `WARN` with the site name and the
+request ID. `healthy: false` is the part to act on. `globalfs site list` run
+against an embedded coordinator still prints the full detail, since it is not
+crossing the API boundary.
 
 #### `POST /api/v1/sites`
 
@@ -742,16 +764,34 @@ Enqueue manual replication of a key. Returns `202 Accepted`.
 {"key": "datasets/hot/sim.dat", "from": "onprem", "to": "cloud"}
 ```
 
+| Status | Meaning |
+|--------|---------|
+| `202 Accepted` | The job is queued; the transfer runs in the background |
+| `400 Bad Request` | Malformed body, a missing field, or a site name that is not registered |
+| `503 Service Unavailable` | The replication queue is full — retry later |
+
+A `503` is transient and retryable; a `400` will not become valid on retry. The
+`400` does not say which of the two site names was unknown — read
+`GET /api/v1/sites` for the registered set.
+
 ### Objects
 
 All object endpoints accept an arbitrary key path after `/api/v1/objects/`.
 
 #### `GET /api/v1/objects/{key...}`
 
-Returns object data as `application/octet-stream`. A key that exists at no routed
-site returns `502` today, not `404` — the coordinator distinguishes absence from
-outage internally but the handler does not yet map it, tracked as
-[#110](https://github.com/scttfrdmn/globalfs/issues/110).
+Returns object data as `application/octet-stream`.
+
+| Status | Meaning |
+|--------|---------|
+| `200 OK` | The object was read from a routed site |
+| `404 Not Found` | Every routed site answered, and none of them holds the key |
+| `502 Bad Gateway` | No routed site could answer |
+
+The distinction between the last two is the point: `404` means the object is not
+there, `502` means nobody knows. Before v0.3.0 both were `502`, so an absent key
+and a site outage were indistinguishable and the only way to tell was to probe
+(#110).
 
 #### `PUT /api/v1/objects/{key...}`
 
@@ -761,6 +801,8 @@ Stores the request body. Bodies are capped at 256 MiB; a larger one returns `413
 |--------|---------|
 | `201 Created` | Stored on every primary and replication to all secondaries was queued |
 | `202 Accepted` | **Stored and readable, but replication was not queued for at least one secondary** |
+| `413 Content Too Large` | Body over 256 MiB |
+| `502 Bad Gateway` | No primary accepted the write |
 
 A `202` also carries `X-GlobalFS-Replication: pending` and a body naming the
 destinations that got no job:
@@ -769,9 +811,15 @@ destinations that got no job:
 {
   "key": "datasets/hot/sim.dat",
   "status": "stored; replication incomplete",
-  "detail": "coordinator: replication not queued for [cloud]: replication: queue full"
+  "pending_sites": ["cloud"],
+  "request_id": "8f3ac21d920e6fd2"
 }
 ```
+
+`pending_sites` is the list of destinations that got no replication job. Through
+v0.2.x this was a `detail` string holding the server-side error verbatim; it is
+now a list, because the site names are the part an operator acts on and the
+formatted error around them was not something a client could parse.
 
 The bytes are durable on every primary in the routed set and readable immediately —
 a `202` is not a failed write, and treating it as one leads to retrying a write that
@@ -788,10 +836,17 @@ one of them confirmed the delete; if any site still holds a copy the response is
 `502` and `globalfs_delete_incomplete_total` increments. An object reported deleted
 is not readable from any site.
 
+Deleting a key that exists nowhere is a `204`, not a `404`: the delete is
+idempotent, and the requested end state holds. The site names still holding a copy
+after a `502` go to the coordinator log, not the response body.
+
 #### `HEAD /api/v1/objects/{key...}`
 
 Returns object metadata as response headers, and never a body — including on error,
-where the status alone carries the result.
+where the status alone carries the result: `200` with the headers below, `404` when
+every routed site answered and none holds the key, `502` when no site could answer.
+Since there is no body, that status is the whole of the answer, which is why the
+`404`/`502` split matters more here than anywhere else.
 
 ```
 Content-Type: application/octet-stream
@@ -835,7 +890,8 @@ if you are behind a proxy or a client library that treats any 2xx as complete: a
 `207` listing is a subset of the true namespace, and the keys that are absent are
 exactly the ones on the sites that failed. Do not use it to conclude that a key does
 not exist, and do not use it as the input to a deletion or synchronisation pass. The
-error detail naming the failed sites goes to the coordinator log, not the response.
+error detail naming the failed sites goes to the coordinator log at `WARN`, with the
+prefix, the number of keys returned, and the request ID — not to the response.
 
 Objects are returned in lexicographic key order across all sites, and a `limit`
 truncates that order — so `limit=n` gives you the namespace's first *n* keys, not

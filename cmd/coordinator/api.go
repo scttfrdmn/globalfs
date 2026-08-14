@@ -34,6 +34,7 @@ import (
 
 	"github.com/scttfrdmn/globalfs/internal/coordinator"
 	"github.com/scttfrdmn/globalfs/internal/metrics"
+	"github.com/scttfrdmn/globalfs/internal/replication"
 	"github.com/scttfrdmn/globalfs/pkg/config"
 	"github.com/scttfrdmn/globalfs/pkg/site"
 	"github.com/scttfrdmn/globalfs/pkg/types"
@@ -277,8 +278,16 @@ type replicateResponse struct {
 	To     string `json:"to"`
 }
 
+// errorResponse is the body of every error the API returns.
+//
+// RequestID is present on responses whose detail was withheld (#110).  It is the
+// same value as the X-Request-ID response header, repeated in the body because
+// the body is what gets pasted into a bug report; it is what makes a sanitized
+// error still diagnosable, by giving the operator a key into the log line that
+// holds the real message.
 type errorResponse struct {
-	Error string `json:"error"`
+	Error     string `json:"error"`
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // objectPutPartialResponse is the body of a 202 from PUT /api/v1/objects/{key...}:
@@ -290,17 +299,23 @@ type errorResponse struct {
 // this success as a failure — which is the mistake the whole issue is about,
 // moved from the status code into the body.
 //
-// Detail carries the coordinator's own message, which names the destinations that
-// got no job.  They are not broken out into a field because the only way to
-// obtain them here is to parse a formatted error string, and a parser of another
-// package's %v output is a silent breakage waiting for the next edit to that
-// format.  Exposing them structurally needs a typed error from
-// internal/coordinator; until then Detail is verbatim and the header below is the
-// part a machine should read.
+// It carried a Detail field holding the coordinator's error verbatim.  Replaced
+// in v0.3.0 by PendingSites (#110): the destinations are what an operator acts on,
+// and they are now read from [coordinator.ReplicationNotQueuedError] as a field
+// rather than recovered by parsing another package's %v output.  That parse is
+// what the old comment here called a silent breakage waiting to happen, and on a
+// response path it was also an open channel for whatever the formatted text might
+// later contain.
+//
+// Site names are not withheld: GET /api/v1/sites returns them by design.  What
+// was withheld is the SDK error underneath, which carries the bucket and the
+// endpoint; it goes to the log under RequestID.
 type objectPutPartialResponse struct {
 	Key    string `json:"key"`
 	Status string `json:"status"`
-	Detail string `json:"detail"`
+	// PendingSites names the sites for which replication was not queued.
+	PendingSites []string `json:"pending_sites,omitempty"`
+	RequestID    string   `json:"request_id,omitempty"`
 }
 
 // replicationHeader marks a response whose write is stored but not fully
@@ -328,6 +343,75 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, errorResponse{Error: msg})
+}
+
+// ── Upstream error sanitization (#110) ────────────────────────────────────────
+
+// upstreamErrorMessage is the client-facing body for any failure that came from
+// the storage layer.  It says what happened at the level the caller can act on
+// and nothing about where.
+const upstreamErrorMessage = "upstream storage error"
+
+// writeUpstreamError answers a site-layer failure with a generic message and the
+// request ID, logging the real error at Error level under that same ID.
+//
+// The errors it replaces are objectfs/AWS SDK strings, and they carry the
+// bucket, the region, the endpoint, and the GlobalFS site name:
+//
+//	site "burst-us-east": operation error S3: HeadObject, https response error
+//	StatusCode: 404, ... bucket "acme-prod-genomes-burst"
+//
+// Any request that errored therefore taught an authenticated caller the internal
+// topology — how many sites, their names, and the bucket behind each.  Site names
+// alone are not secret (GET /api/v1/sites returns them by design), but bucket
+// names, regions, and endpoints are not exposed on any route, and an error body
+// is the wrong place for them to arrive.
+//
+// The operator loses nothing: the detail goes to the log with the request ID, and
+// the response carries the same ID in the body and the X-Request-ID header. This
+// is the pattern errEndpointRejected already established for the SSRF guard
+// (#76) — the difference is that this one applies to the whole object API.
+//
+// op names the operation for the log line only.  It is never sent to the client:
+// a caller already knows which request they made, and encoding it in the body
+// would reintroduce a distinction between failure modes.
+func writeUpstreamError(w http.ResponseWriter, r *http.Request, code int, op, key string, err error) {
+	id := requestIDFromCtx(r.Context())
+	slog.Error("api: upstream storage error",
+		"op", op,
+		"key", key,
+		"status", code,
+		"request_id", id,
+		"error", err)
+	writeJSON(w, code, errorResponse{Error: upstreamErrorMessage, RequestID: id})
+}
+
+// upstreamStatus maps a coordinator error to the status code it deserves.
+//
+// A not-found is a 404 and is *not* sanitized away: #77 made "absent at every
+// site" distinguishable from "every site failed", and a 404 on a missing key is
+// the contract of a key-value API rather than a leak.  Collapsing it into 502
+// with the rest is what made HEAD an existence oracle worth probing, because the
+// oracle was the only way to get the answer the status code should have given
+// (#110).
+func upstreamStatus(err error) int {
+	if errors.Is(err, coordinator.ErrNotFound) {
+		return http.StatusNotFound
+	}
+	return http.StatusBadGateway
+}
+
+// writeObjectError is writeUpstreamError with the status derived from err.
+func writeObjectError(w http.ResponseWriter, r *http.Request, op, key string, err error) {
+	code := upstreamStatus(err)
+	if code == http.StatusNotFound {
+		// A 404 carries no upstream detail to withhold, so it gets the ordinary
+		// message rather than the generic one — "upstream storage error" on a key
+		// that simply does not exist would be actively misleading.
+		writeError(w, http.StatusNotFound, "object not found")
+		return
+	}
+	writeUpstreamError(w, r, code, op, key, err)
 }
 
 func decodeJSON(r *http.Request, dst any) error {
@@ -486,8 +570,37 @@ func sitesListHandler(c *coordinator.Coordinator) http.HandlerFunc {
 		defer cancel()
 
 		infos := c.SiteInfos(ctx)
-		writeJSON(w, http.StatusOK, infos)
+		writeJSON(w, http.StatusOK, sanitizeSiteInfos(r, infos))
 	}
+}
+
+// sanitizeSiteInfos replaces each SiteInfo.Error with a generic string, logging
+// the real one against the request ID (#110).
+//
+// The field is a verbatim HeadBucket failure, so on this route — which returns
+// site names by design and is the one place that is correct — it also handed over
+// the bucket, region, and endpoint behind each name.  `healthy: false` is the part
+// a caller needs; which bucket refused the request is not.
+//
+// Sanitizing here rather than in [coordinator.SiteInfos] keeps the detail for
+// in-process callers, which is what `globalfs site list` prints when it runs
+// against a coordinator it is embedded in.  The boundary being crossed is HTTP,
+// so the boundary is where the trimming belongs.
+func sanitizeSiteInfos(r *http.Request, infos []coordinator.SiteInfo) []coordinator.SiteInfo {
+	out := make([]coordinator.SiteInfo, len(infos))
+	copy(out, infos)
+	for i := range out {
+		if out[i].Error == "" {
+			continue
+		}
+		slog.Warn("api: site health check failed",
+			"site", out[i].Name,
+			"role", out[i].Role,
+			"request_id", requestIDFromCtx(r.Context()),
+			"error", out[i].Error)
+		out[i].Error = "health check failed"
+	}
+	return out
 }
 
 // siteNameTaken reports whether a site with this name is already registered.
@@ -707,11 +820,32 @@ func replicateHandler(c *coordinator.Coordinator) http.HandlerFunc {
 		}
 
 		if err := c.Replicate(r.Context(), req.Key, req.From, req.To); err != nil {
-			status := http.StatusBadRequest
-			if strings.Contains(err.Error(), "queue full") {
-				status = http.StatusServiceUnavailable
+			// A full queue is transient and the caller should retry; an unknown site
+			// name is the caller's mistake.  Classified by sentinel rather than by
+			// searching the message for "queue full", which reclassified a 503 as a
+			// 400 the moment that text changed (#110).
+			if errors.Is(err, replication.ErrQueueFull) {
+				slog.Warn("api: replicate: queue full",
+					"key", req.Key,
+					"from", req.From,
+					"to", req.To,
+					"request_id", requestIDFromCtx(r.Context()))
+				writeError(w, http.StatusServiceUnavailable,
+					"replication queue is full; retry later")
+				return
 			}
-			writeError(w, status, err.Error())
+			// The remaining case is an unregistered site name, which the caller
+			// supplied and so already knows.  Echoing it back names no site the
+			// request did not; the message is rewritten rather than passed through
+			// so that a future error from Replicate cannot leak by default.
+			slog.Warn("api: replicate rejected",
+				"key", req.Key,
+				"from", req.From,
+				"to", req.To,
+				"request_id", requestIDFromCtx(r.Context()),
+				"error", err)
+			writeError(w, http.StatusBadRequest,
+				"replication rejected: check that both site names are registered")
 			return
 		}
 
@@ -769,8 +903,9 @@ func objectListHandler(c *coordinator.Coordinator) http.HandlerFunc {
 
 		objects, err := c.List(r.Context(), prefix, limit)
 		if err != nil && len(objects) == 0 {
-			// All sites failed — no data to return.
-			writeError(w, http.StatusBadGateway, err.Error())
+			// All sites failed — no data to return.  The error names every site it
+			// tried and carries their bucket-qualified SDK messages (#110).
+			writeUpstreamError(w, r, http.StatusBadGateway, "list", prefix, err)
 			return
 		}
 		if objects == nil {
@@ -782,6 +917,14 @@ func objectListHandler(c *coordinator.Coordinator) http.HandlerFunc {
 			// contributed data.  Use 207 Multi-Status to signal degraded state.
 			status = http.StatusMultiStatus
 			w.Header().Set("X-GlobalFS-Partial", "true")
+			// The detail was already absent from this response — the header says
+			// only that the listing is partial — so it was reaching nobody at all.
+			// Logging it here is what makes withholding it defensible (#110).
+			slog.Warn("api: partial listing; some sites did not answer",
+				"prefix", prefix,
+				"returned", len(objects),
+				"request_id", requestIDFromCtx(r.Context()),
+				"error", err)
 		}
 		writeJSON(w, status, listObjectsResponse{
 			Prefix:  prefix,
@@ -897,7 +1040,7 @@ func objectGetHandler(c *coordinator.Coordinator) http.HandlerFunc {
 
 		data, err := c.Get(r.Context(), key)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeObjectError(w, r, "get", key, err)
 			return
 		}
 
@@ -990,15 +1133,25 @@ func objectPutHandler(c *coordinator.Coordinator) http.HandlerFunc {
 					"bytes", len(data),
 					"request_id", requestIDFromCtx(r.Context()),
 					"error", err)
+				// The destinations come from the typed error's field.  A nil
+				// PendingSites means the error wrapped the sentinel without being
+				// the concrete type, which is not a case worth failing over: the
+				// status, the header, and the log line all still say what happened.
+				var nq *coordinator.ReplicationNotQueuedError
+				var pending []string
+				if errors.As(err, &nq) {
+					pending = nq.Destinations
+				}
 				w.Header().Set(replicationHeader, replicationPending)
 				writeJSON(w, http.StatusAccepted, objectPutPartialResponse{
-					Key:    key,
-					Status: "stored; replication incomplete",
-					Detail: err.Error(),
+					Key:          key,
+					Status:       "stored; replication incomplete",
+					PendingSites: pending,
+					RequestID:    requestIDFromCtx(r.Context()),
 				})
 				return
 			}
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeUpstreamError(w, r, http.StatusBadGateway, "put", key, err)
 			return
 		}
 
@@ -1021,7 +1174,10 @@ func objectDeleteHandler(c *coordinator.Coordinator) http.HandlerFunc {
 		}
 
 		if err := c.Delete(r.Context(), key); err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			// Not routed through writeObjectError: Delete treats "absent" as the
+			// state it wanted and returns nil for it, so a 404 here is not
+			// reachable and mapping one would be dead code claiming otherwise.
+			writeUpstreamError(w, r, http.StatusBadGateway, "delete", key, err)
 			return
 		}
 
@@ -1047,8 +1203,20 @@ func objectHeadHandler(c *coordinator.Coordinator) http.HandlerFunc {
 
 		info, err := c.Head(r.Context(), key)
 		if err != nil {
-			// HEAD must not return a body.
-			w.WriteHeader(http.StatusBadGateway)
+			// HEAD must not return a body, so the status is the entire answer and
+			// getting it right is the whole of #110's oracle half: 404 for a key
+			// that is absent everywhere, 502 for sites that could not answer.  It
+			// was 502 for both, which is why probing it was worth anything.
+			code := upstreamStatus(err)
+			if code != http.StatusNotFound {
+				slog.Error("api: upstream storage error",
+					"op", "head",
+					"key", key,
+					"status", code,
+					"request_id", requestIDFromCtx(r.Context()),
+					"error", err)
+			}
+			w.WriteHeader(code)
 			return
 		}
 

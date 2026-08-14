@@ -284,16 +284,27 @@ func (w *Worker) QueueDepth() int {
 	return len(w.queue)
 }
 
+// ErrQueueFull reports that Enqueue found no room in the work queue.
+//
+// It exists so that callers can classify the condition with errors.Is rather than
+// by searching the message for "queue full", which is what cmd/coordinator did:
+// a substring match on another package's error text, silently reclassifying a 503
+// as a 400 the moment that text changed.  It became load-bearing when #110
+// stopped echoing the message back to the client, since the status code is then
+// the only part of the answer the caller sees.
+var ErrQueueFull = errors.New("replication queue full")
+
 // Enqueue adds a job to the work queue.
-// Returns an error when the queue is full so callers can log or propagate it.
-// Enqueue is safe to call before Start.
+//
+// Returns an error wrapping [ErrQueueFull] when the queue has no room, so callers
+// can log or propagate it.  Enqueue is safe to call before Start.
 func (w *Worker) Enqueue(job ReplicationJob) error {
 	select {
 	case w.queue <- job:
 		return nil
 	default:
-		return fmt.Errorf("replication: queue full; key=%q → %q",
-			job.Key, job.DestSite.Name())
+		return fmt.Errorf("replication: %w; key=%q → %q",
+			ErrQueueFull, job.Key, job.DestSite.Name())
 	}
 }
 

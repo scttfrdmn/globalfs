@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	objectfserrors "github.com/scttfrdmn/objectfs/pkg/errors"
 	objectfstypes "github.com/scttfrdmn/objectfs/pkg/types"
 
 	"github.com/scttfrdmn/globalfs/internal/circuitbreaker"
@@ -62,6 +63,19 @@ func newTestMemClient(objs map[string][]byte) *testMemClient {
 	return &testMemClient{objects: objs}
 }
 
+// testNotFound returns the error a real objectfs client returns for an absent
+// key: code-matched by errors.Is against objectfssdk.ErrNotFound, which is what
+// the coordinator's classification into coordinator.ErrNotFound relies on.
+//
+// A plain errors.New("not found: "+key) stood here until #110, and it made the
+// 404 path unreachable from any handler test — every absent key looked like a
+// site failure and came back 502, which is precisely the bug #110 fixes.
+func testNotFound(key string) error {
+	return objectfserrors.NewError(objectfserrors.ErrCodeObjectNotFound, "object does not exist").
+		WithComponent("testmemclient").
+		WithContext("key", key)
+}
+
 func (m *testMemClient) Get(_ context.Context, key string, _, _ int64) ([]byte, error) {
 	if m.getDelay > 0 {
 		time.Sleep(m.getDelay)
@@ -73,7 +87,7 @@ func (m *testMemClient) Get(_ context.Context, key string, _, _ int64) ([]byte, 
 	defer m.mu.Unlock()
 	data, ok := m.objects[key]
 	if !ok {
-		return nil, errors.New("not found: " + key)
+		return nil, testNotFound(key)
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
@@ -150,7 +164,7 @@ func (m *testMemClient) Head(_ context.Context, key string) (*objectfstypes.Obje
 	defer m.mu.Unlock()
 	data, ok := m.objects[key]
 	if !ok {
-		return nil, errors.New("not found: " + key)
+		return nil, testNotFound(key)
 	}
 	return &objectfstypes.ObjectInfo{
 		Key:          key,
@@ -490,15 +504,22 @@ func TestObjectPut_ReplicationNotQueued_Returns202(t *testing.T) {
 	if _, ok := body["error"]; ok {
 		t.Errorf("202 body carries an \"error\" field: %s", w.Body.String())
 	}
-	for _, field := range []string{"key", "status", "detail"} {
+	for _, field := range []string{"key", "status", "pending_sites"} {
 		if _, ok := body[field]; !ok {
 			t.Errorf("202 body is missing %q: %s", field, w.Body.String())
 		}
 	}
-	// The detail must name what is incomplete, since that is what an operator acts
-	// on and the coordinator's message already carries the destinations.
-	if detail, _ := body["detail"].(string); !strings.Contains(detail, "backup") {
-		t.Errorf("202 detail does not name the un-queued destination: %q", detail)
+	// The body must name what is incomplete, since that is what an operator acts
+	// on.  As of #110 the destinations arrive as a field read from
+	// coordinator.ReplicationNotQueuedError, rather than inside a formatted error
+	// string — so this asserts the list, not a substring of prose.
+	pending, _ := body["pending_sites"].([]any)
+	if len(pending) != 1 || pending[0] != "backup" {
+		t.Errorf("pending_sites = %v, want [backup]: %s", pending, w.Body.String())
+	}
+	// And the verbatim server-side error must be gone from the response.
+	if _, ok := body["detail"]; ok {
+		t.Errorf("202 body still carries the verbatim \"detail\" field (#110): %s", w.Body.String())
 	}
 
 	// The whole justification for 202 is that the bytes are on the primary.  If
@@ -2495,5 +2516,458 @@ func TestWithObjectMetrics_NilMetrics(t *testing.T) {
 	}
 	if w.Code != http.StatusOK {
 		t.Errorf("status: got %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+// ── Upstream error sanitization and the 404 contract (#110) ───────────────────
+
+// The leaking strings these tests guard against are S3 SDK errors, which name the
+// bucket:
+//
+//	site "burst-us-east": operation error S3: HeadObject, https response error
+//	StatusCode: 403, ... bucket "acme-prod-genomes-burst"
+//
+// A response body carrying that text tells an authenticated caller the internal
+// topology — how many sites there are, their names, and the bucket, region, and
+// endpoint behind each.  None of that appears on any route by design, and an
+// error body is the wrong place for it to arrive.
+
+// leakyBucket is the bucket name planted in every mock failure below.  It is
+// distinctive on purpose: the assertion is a substring search over the whole
+// response body, so a value that could occur by accident would make the test
+// either flaky or vacuous.
+const leakyBucket = "acme-prod-genomes-burst-8f3a"
+
+// leakySiteError is shaped like the AWS SDK error the coordinator wraps, so what
+// is being asserted is the real leak rather than a stand-in short string.
+func leakySiteError(op string) error {
+	return fmt.Errorf("operation error S3: %s, https response error StatusCode: 403, "+
+		"api error AccessDenied: bucket %q in region us-east-1 at "+
+		"https://s3.internal.acme.example: access denied", op, leakyBucket)
+}
+
+// assertNoLeak fails if body mentions the bucket, the endpoint host, or the
+// region.  Site names are deliberately absent from this list: GET /api/v1/sites
+// returns them by design, so echoing one is not a disclosure — the bucket behind
+// it is.
+func assertNoLeak(t *testing.T, where, body string) {
+	t.Helper()
+	for _, secret := range []string{
+		leakyBucket,
+		"s3.internal.acme.example",
+		"us-east-1",
+		"AccessDenied",
+	} {
+		if strings.Contains(body, secret) {
+			t.Errorf("%s: response body discloses %q (#110): %s", where, secret, body)
+		}
+	}
+}
+
+// decodeErrorBody decodes a sanitized error body and fails if it is not one.
+func decodeErrorBody(t *testing.T, w *httptest.ResponseRecorder) errorResponse {
+	t.Helper()
+	var got errorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("error body is not JSON: %v (%s)", err, w.Body.String())
+	}
+	return got
+}
+
+// withRequestID returns req carrying id in its context, the way
+// requestIDMiddleware would.  The handler-level tests in this file assemble
+// handlers by hand and so bypass the middleware chain; without this the ID under
+// test would always be "" and the omitempty tag would hide the field.
+func withRequestID(req *http.Request, id string) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), requestIDCtxKey{}, id))
+}
+
+// TestObjectGet_UpstreamErrorIsSanitized is the core #110 assertion on the read
+// path: a site failure answers 502 with a fixed message plus the correlation ID,
+// and the SDK text goes to the log instead of the wire.
+func TestObjectGet_UpstreamErrorIsSanitized(t *testing.T) {
+	c, mc := makeTestCoordinator(t, nil)
+	mc.getErr = leakySiteError("GetObject")
+
+	req := httptest.NewRequest("GET", "/api/v1/objects/data/genome.bam", nil)
+	req.SetPathValue("key", "data/genome.bam")
+	req = withRequestID(req, "req-get-1")
+	w := httptest.NewRecorder()
+	objectGetHandler(c)(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want 502: %s", w.Code, w.Body.String())
+	}
+	assertNoLeak(t, "GET", w.Body.String())
+
+	got := decodeErrorBody(t, w)
+	if got.Error != upstreamErrorMessage {
+		t.Errorf("error = %q, want %q", got.Error, upstreamErrorMessage)
+	}
+	// The ID is what makes a sanitized error diagnosable: it is the operator's key
+	// into the log line that holds the message the caller no longer gets.  Without
+	// it, withholding the detail would just be losing it.
+	if got.RequestID != "req-get-1" {
+		t.Errorf("request_id = %q, want %q — a sanitized error with no correlation "+
+			"ID is undiagnosable (#110)", got.RequestID, "req-get-1")
+	}
+}
+
+// TestObjectGet_AbsentKeyReturns404 is the other half of #110: "absent
+// everywhere" and "every site failed" were both 502, and collapsing them is what
+// made probing the API for existence worthwhile in the first place.  #77 created
+// coordinator.ErrNotFound; nothing mapped it to a status until now.
+func TestObjectGet_AbsentKeyReturns404(t *testing.T) {
+	c, _ := makeTestCoordinator(t, map[string][]byte{"data/present.bam": []byte("ACGT")})
+
+	req := httptest.NewRequest("GET", "/api/v1/objects/data/absent.bam", nil)
+	req.SetPathValue("key", "data/absent.bam")
+	w := httptest.NewRecorder()
+	objectGetHandler(c)(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("absent key: got %d, want 404 — a missing object is the contract of "+
+			"a key-value API, not an upstream failure (#110): %s", w.Code, w.Body.String())
+	}
+	// A 404 is not sanitized away, but it also must not name the key's storage.
+	assertNoLeak(t, "GET absent", w.Body.String())
+	if got := decodeErrorBody(t, w); got.Error != "object not found" {
+		t.Errorf("error = %q, want %q", got.Error, "object not found")
+	}
+}
+
+// TestObjectHead_StatusDistinguishesAbsentFromFailed drives the oracle directly.
+// HEAD sends no body, so the status code is the entire answer and is the only
+// thing that can carry the distinction.
+func TestObjectHead_StatusDistinguishesAbsentFromFailed(t *testing.T) {
+	t.Run("absent is 404", func(t *testing.T) {
+		c, _ := makeTestCoordinator(t, map[string][]byte{"k": []byte("v")})
+		req := httptest.NewRequest("HEAD", "/api/v1/objects/gone", nil)
+		req.SetPathValue("key", "gone")
+		w := httptest.NewRecorder()
+		objectHeadHandler(c)(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("absent key: got %d, want 404 (#110)", w.Code)
+		}
+		if w.Body.Len() != 0 {
+			t.Errorf("HEAD wrote a body: %q", w.Body.String())
+		}
+	})
+
+	t.Run("site failure is 502", func(t *testing.T) {
+		c, mc := makeTestCoordinator(t, map[string][]byte{"k": []byte("v")})
+		mc.headErr = leakySiteError("HeadObject")
+		req := httptest.NewRequest("HEAD", "/api/v1/objects/k", nil)
+		req.SetPathValue("key", "k")
+		w := httptest.NewRecorder()
+		objectHeadHandler(c)(w, req)
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("site failure: got %d, want 502", w.Code)
+		}
+		if w.Body.Len() != 0 {
+			t.Errorf("HEAD wrote a body: %q", w.Body.String())
+		}
+	})
+}
+
+// TestObjectDelete_UpstreamErrorIsSanitized covers the delete path.  Delete
+// returns nil for an object that is absent everywhere, so 404 is unreachable
+// here and every error is a genuine site failure.
+func TestObjectDelete_UpstreamErrorIsSanitized(t *testing.T) {
+	c, mc := makeTestCoordinator(t, map[string][]byte{"k": []byte("v")})
+	mc.delErr = leakySiteError("DeleteObject")
+
+	req := httptest.NewRequest("DELETE", "/api/v1/objects/k", nil)
+	req.SetPathValue("key", "k")
+	req = withRequestID(req, "req-del-1")
+	w := httptest.NewRecorder()
+	objectDeleteHandler(c)(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want 502: %s", w.Code, w.Body.String())
+	}
+	assertNoLeak(t, "DELETE", w.Body.String())
+	got := decodeErrorBody(t, w)
+	if got.Error != upstreamErrorMessage {
+		t.Errorf("error = %q, want %q", got.Error, upstreamErrorMessage)
+	}
+	if got.RequestID != "req-del-1" {
+		t.Errorf("request_id = %q, want %q", got.RequestID, "req-del-1")
+	}
+}
+
+// TestObjectList_UpstreamErrorIsSanitized covers the all-sites-failed list path.
+func TestObjectList_UpstreamErrorIsSanitized(t *testing.T) {
+	c, mc := makeTestCoordinator(t, nil)
+	mc.listErr = leakySiteError("ListObjectsV2")
+
+	req := httptest.NewRequest("GET", "/api/v1/objects?prefix=data/", nil)
+	req = withRequestID(req, "req-list-1")
+	w := httptest.NewRecorder()
+	objectListHandler(c)(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want 502: %s", w.Code, w.Body.String())
+	}
+	assertNoLeak(t, "LIST", w.Body.String())
+	if got := decodeErrorBody(t, w); got.RequestID != "req-list-1" {
+		t.Errorf("request_id = %q, want %q", got.RequestID, "req-list-1")
+	}
+}
+
+// TestObjectPut_UpstreamErrorIsSanitized covers the write path.  A PUT that no
+// primary accepted is a 502 with nothing about which bucket refused it.
+func TestObjectPut_UpstreamErrorIsSanitized(t *testing.T) {
+	c, mc := makeTestCoordinator(t, nil)
+	mc.putErr = leakySiteError("PutObject")
+
+	req := httptest.NewRequest("PUT", "/api/v1/objects/data/new.bam",
+		bytes.NewReader([]byte("ACGT")))
+	req.SetPathValue("key", "data/new.bam")
+	req = withRequestID(req, "req-put-1")
+	w := httptest.NewRecorder()
+	objectPutHandler(c)(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want 502: %s", w.Code, w.Body.String())
+	}
+	assertNoLeak(t, "PUT", w.Body.String())
+	got := decodeErrorBody(t, w)
+	if got.Error != upstreamErrorMessage {
+		t.Errorf("error = %q, want %q", got.Error, upstreamErrorMessage)
+	}
+	if got.RequestID != "req-put-1" {
+		t.Errorf("request_id = %q, want %q", got.RequestID, "req-put-1")
+	}
+}
+
+// TestSitesList_HealthErrorIsSanitized covers GET /api/v1/sites, where the
+// SiteInfo.Error field was a verbatim HeadBucket failure.  This route returns
+// site names by design and is the one place that is correct, but the bucket,
+// region, and endpoint behind each name are not part of that contract.
+func TestSitesList_HealthErrorIsSanitized(t *testing.T) {
+	t.Parallel()
+	cli := newTestMemClient(nil)
+	cli.healthErr = leakySiteError("HeadBucket")
+	c := coordinator.New(site.New("burst-us-east", types.SiteRoleBurst, cli))
+
+	req := httptest.NewRequest("GET", "/api/v1/sites", nil)
+	req = withRequestID(req, "req-sites-1")
+	w := httptest.NewRecorder()
+	sitesListHandler(c)(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertNoLeak(t, "GET /sites", w.Body.String())
+
+	var sites []struct {
+		Name    string `json:"name"`
+		Healthy bool   `json:"healthy"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &sites); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if len(sites) != 1 {
+		t.Fatalf("expected 1 site, got %d: %s", len(sites), w.Body.String())
+	}
+	// healthy:false is the part a caller acts on and must survive sanitization —
+	// replacing the detail must not also erase the signal.
+	if sites[0].Healthy {
+		t.Error("healthy = true for a site whose health check failed")
+	}
+	if sites[0].Error != "health check failed" {
+		t.Errorf("error = %q, want %q", sites[0].Error, "health check failed")
+	}
+	// The site name stays: it is already public on this route, and an operator
+	// needs to know which site is down.
+	if sites[0].Name != "burst-us-east" {
+		t.Errorf("name = %q, want %q", sites[0].Name, "burst-us-east")
+	}
+}
+
+// TestSiteInfos_KeepsDetailForInProcessCallers pins the reason sanitization lives
+// in the HTTP layer rather than in the coordinator: `globalfs site list` prints
+// SiteInfo.Error when it runs against an embedded coordinator, and the operator
+// there is on the trusted side of the boundary.
+func TestSiteInfos_KeepsDetailForInProcessCallers(t *testing.T) {
+	t.Parallel()
+	cli := newTestMemClient(nil)
+	cli.healthErr = leakySiteError("HeadBucket")
+	c := coordinator.New(site.New("burst-us-east", types.SiteRoleBurst, cli))
+
+	infos := c.SiteInfos(context.Background())
+	if len(infos) != 1 {
+		t.Fatalf("expected 1 site, got %d", len(infos))
+	}
+	if !strings.Contains(infos[0].Error, leakyBucket) {
+		t.Errorf("coordinator.SiteInfos dropped the detail an in-process caller "+
+			"needs: %q", infos[0].Error)
+	}
+}
+
+// TestUpstreamErrorsAcrossAPI_NoBucketInAnyBody is the sweep the issue asks for:
+// every object route and the sites route, driven through the real middleware
+// chain, with every site call failing.  A per-handler test can be forgotten when a
+// route is added; this one covers the surface.
+func TestUpstreamErrorsAcrossAPI_NoBucketInAnyBody(t *testing.T) {
+	cli := newTestMemClient(map[string][]byte{"data/genome.bam": []byte("ACGT")})
+	cli.getErr = leakySiteError("GetObject")
+	cli.putErr = leakySiteError("PutObject")
+	cli.delErr = leakySiteError("DeleteObject")
+	cli.headErr = leakySiteError("HeadObject")
+	cli.listErr = leakySiteError("ListObjectsV2")
+	cli.healthErr = leakySiteError("HeadBucket")
+
+	c := coordinator.New(site.New("burst-us-east", types.SiteRoleBurst, cli))
+	mustStart(t, c)
+	t.Cleanup(c.Stop)
+
+	mux := http.NewServeMux()
+	registerAPIRoutes(mux, context.Background(), c, nil, config.SecurityConfig{})
+	// infoHandler is registered by main rather than registerAPIRoutes, so without
+	// this line the /api/v1/info case below asserts against a 404 from the mux and
+	// proves nothing.  It reports per-role site counts and a healthy/unhealthy
+	// tally, so it is in scope: it must summarize the failures without quoting
+	// them.
+	mux.HandleFunc("GET /api/v1/info", infoHandler(c, "test", time.Now()))
+	srv := httptest.NewServer(buildHandler(mux, ""))
+	t.Cleanup(srv.Close)
+
+	cases := []struct {
+		name, method, path string
+		body               io.Reader
+		wantStatus         int
+	}{
+		{"list", http.MethodGet, "/api/v1/objects?prefix=data/", nil, http.StatusBadGateway},
+		{"get", http.MethodGet, "/api/v1/objects/data/genome.bam", nil, http.StatusBadGateway},
+		{"put", http.MethodPut, "/api/v1/objects/data/genome.bam", strings.NewReader("ACGT"), http.StatusBadGateway},
+		{"delete", http.MethodDelete, "/api/v1/objects/data/genome.bam", nil, http.StatusBadGateway},
+		{"head", http.MethodHead, "/api/v1/objects/data/genome.bam", nil, http.StatusBadGateway},
+		{"sites", http.MethodGet, "/api/v1/sites", nil, http.StatusOK},
+		{"info", http.MethodGet, "/api/v1/info", nil, http.StatusOK},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(tc.method, srv.URL+tc.path, tc.body)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("%s %s: %v", tc.method, tc.path, err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			// Asserting the status is what keeps the leak check honest: a route
+			// that 404s from the mux has an empty body and would pass the sweep
+			// without ever reaching the code under test.
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("%s %s: status %d, want %d — the leak assertion below is "+
+					"only meaningful if the failure path ran: %s",
+					tc.method, tc.path, resp.StatusCode, tc.wantStatus, strings.TrimSpace(string(body)))
+			}
+			assertNoLeak(t, tc.method+" "+tc.path, string(body))
+
+			// Every response must still carry the correlation ID on the header,
+			// whether or not it has a body to put it in — that is what a caller
+			// quotes in a bug report about a message that no longer says anything.
+			if resp.Header.Get(requestIDHeader) == "" {
+				t.Errorf("%s %s: no %s header", tc.method, tc.path, requestIDHeader)
+			}
+		})
+	}
+}
+
+// TestReplicate_QueueFullReturns503 covers the classification #110 made
+// load-bearing.  The handler used to search the coordinator's error text for
+// "queue full"; a substring match on another package's message silently
+// reclassifies a 503 as a 400 the moment that text changes, and once the message
+// is no longer echoed to the client the status code is the whole answer.
+func TestReplicate_QueueFullReturns503(t *testing.T) {
+	c, _ := makeSaturatedReplicationCoordinator(t)
+
+	// The worker is parked inside the backup's Put with a depth-1 queue, so
+	// direct Replicate calls are refused once the queue fills.  Loop rather than
+	// assume which call is the first to be refused.
+	var w *httptest.ResponseRecorder
+	for i := 0; i < 10; i++ {
+		body := fmt.Sprintf(`{"key":"data/obj-%02d","from":"primary","to":"backup"}`, i)
+		req := httptest.NewRequest("POST", "/api/v1/replicate", strings.NewReader(body))
+		req = withRequestID(req, "req-repl-1")
+		rec := httptest.NewRecorder()
+		replicateHandler(c)(rec, req)
+		if rec.Code != http.StatusAccepted {
+			w = rec
+			break
+		}
+	}
+	if w == nil {
+		t.Fatal("no Replicate hit a full queue after 10 attempts; the queue is being " +
+			"drained and the test cannot observe the classification")
+	}
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("queue full: got %d, want 503 — a full queue is a retryable "+
+			"transient, not a malformed request (#110): %s", w.Code, w.Body.String())
+	}
+	got := decodeErrorBody(t, w)
+	if !strings.Contains(got.Error, "retry") {
+		t.Errorf("error = %q, want a message telling the caller to retry", got.Error)
+	}
+}
+
+// TestReplicate_UnknownSiteStillReturns400 is the other side of that
+// classification: a request naming a site that does not exist is the caller's
+// fault and must not be reported as a transient.
+func TestReplicate_UnknownSiteStillReturns400(t *testing.T) {
+	t.Parallel()
+	c, _ := makeTestCoordinator(t, nil)
+
+	body := `{"key":"data/x","from":"primary","to":"nonexistent"}`
+	req := httptest.NewRequest("POST", "/api/v1/replicate", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	replicateHandler(c)(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown destination: got %d, want 400: %s", w.Code, w.Body.String())
+	}
+	// The reply must not confirm or deny which of the two names was the unknown
+	// one, since that would answer "is this site registered?" for a caller who
+	// cannot read GET /api/v1/sites.
+	if b := w.Body.String(); strings.Contains(b, "nonexistent") {
+		t.Errorf("400 body echoes the site name from the request: %s", b)
+	}
+}
+
+// TestUpstreamStatus is the unit table for the mapping, including the wrapping
+// depths a real error arrives at.
+func TestUpstreamStatus(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"not found sentinel", coordinator.ErrNotFound, http.StatusNotFound},
+		{"wrapped not found", fmt.Errorf("coordinator: Get %q: %w", "k", coordinator.ErrNotFound),
+			http.StatusNotFound},
+		{"double wrapped not found",
+			fmt.Errorf("outer: %w", fmt.Errorf("coordinator: Head: %w", coordinator.ErrNotFound)),
+			http.StatusNotFound},
+		{"site failure", leakySiteError("GetObject"), http.StatusBadGateway},
+		{"bare error", errors.New("boom"), http.StatusBadGateway},
+	}
+
+	for _, tc := range cases {
+		if got := upstreamStatus(tc.err); got != tc.want {
+			t.Errorf("upstreamStatus(%s) = %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }
