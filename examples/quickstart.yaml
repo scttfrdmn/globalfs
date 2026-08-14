@@ -1,0 +1,43 @@
+# GlobalFS — minimal two-site configuration
+#
+# This is the file the README's Quick Start tells you to copy, and it is the file
+# the README embeds.  It lives here rather than only in Markdown so that CI's
+# config-examples job runs `globalfs config validate` against it: the version that
+# was embedded in the README omitted objectfs.mount_point and so failed validation
+# on the very next documented command, and nothing caught it because no test reads
+# YAML out of a Markdown file (#96).
+#
+# Start the coordinator with:
+#   globalfs-coordinator --config quickstart.yaml
+#
+# AWS credentials come from the standard chain (AWS_PROFILE, environment
+# variables, ~/.aws/credentials, or an instance role).
+
+global:
+  cluster_name: my-cluster
+
+coordinator:
+  listen_addr: ":8090"
+
+  # etcd_endpoints and lease_timeout are accepted and unused: the etcd metadata
+  # store is not wired up, so no connection is ever made.  Neither is required.
+  # Note that the coordinator is single-instance — see the README's "Deployment
+  # topology" section before running more than one.
+
+sites:
+  - name: onprem
+    role: primary
+    objectfs:
+      # Required.  It is the local path where the ObjectFS FUSE mount for this
+      # site lives; GlobalFS itself only records it, but a site without one is
+      # almost always a half-finished config, so validation rejects it.
+      mount_point: /mnt/objectfs-onprem
+      s3_bucket: my-onprem-bucket
+      s3_region: us-west-2
+
+  - name: cloud
+    role: burst
+    objectfs:
+      mount_point: /mnt/objectfs-cloud
+      s3_bucket: my-cloud-bucket
+      s3_region: us-east-1

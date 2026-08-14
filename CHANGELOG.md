@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Work toward v0.3.0, whose theme is truth in reporting: a key, a metric, or a
+documented behaviour must mean what it says. Several entries below are breaking,
+batched into one release on purpose so that operators absorb the breakage once.
+
+### Breaking
+
+- `LoadFromFile` decodes with `KnownFields(true)`: an unknown or misspelled config key is now a startup failure naming the key and line, rather than being silently discarded. `listen_adrr: ":9000"` was previously accepted and the daemon bound the default port (#97)
+- `global.metrics_port` removed. It implied a second listener that never existed; `/metrics` is served on the coordinator's own `listen_addr` (#98)
+- `sites[].cargoship` and its validator removed. The validator *rejected* good-faith configs for a feature this repo never implemented and that objectfs deleted upstream in the version already depended on (#108)
+- `performance.max_concurrent_transfers` renamed to `performance.replication_queue_depth`. It sized a channel buffer, never a worker pool — the replication run loop is a single goroutine. Renamed rather than made true: N consumers can reorder two Puts of one key, and seriality is currently what guarantees per-key ordering (#101)
+- `policies[].sync_mode` removed from `config.example.yaml`. `ReplicationPolicy` never had such a field; it was discarded on every load (#97)
+
+Every removed key above is rejected by name under strict decoding, so an
+un-migrated config fails loudly at startup instead of running with a setting
+that does nothing.
+
+### Fixed
+
+- `coordinator.etcd_endpoints` is no longer required. Nothing reads it, and the shipped example told operators to leave it empty — which produced a config that would not load. Kept in the struct as the surface for the metadata store when it is wired (#106)
+- `global.metrics_enabled: false` now stops `/metrics` from being registered, and `global.log_file` now opens the named file in append mode, falling back to stderr with a warning rather than refusing to start. Both were parsed and read by nothing (#98)
+- `globalfs_sites_current` reported 0 for the entire life of an ordinary coordinator. It was written only by `AddSite`/`RemoveSite`, and sites supplied to `New` — every site in a config-file deployment — never pass through either. `SetMetrics` now publishes the count as it installs the registry (#102)
+- `globalfs_replication_queue_depth` was written only after a job reached a terminal state, making every sample the low-water mark. It now publishes on the enqueue edge as well, including when the enqueue fails, since a full queue is the most important depth there is (#103)
+- `Worker.DroppedTerminalEvents()` had no reader: a dropped terminal event was visible in the log at the moment it happened and nowhere afterwards, though each one is a job whose outcome the coordinator never learned. Now exported as `globalfs_replication_terminal_events_dropped_total`, published from the health-poll loop as well as the event drain so a coordinator that drops events and then goes quiet still reports it (#137)
+
+### Documentation
+
+- Retracted the leader-election and standby-mode claims in the 0.1.0 entry and the `SetLeaseTTL` claim in 0.1.5, in place rather than by deletion. There is no leader election in any released version; `IsLeader()` returns a hardcoded `true`. New README section **Deployment topology: run exactly one coordinator** states the constraint and its consequence (#107)
+- The Quick Start config now lives at `examples/quickstart.yaml` and is covered by CI's `config-examples` job. The version embedded in the README omitted `objectfs.mount_point` and so failed validation on the very next documented command; nothing caught it, because no test reads YAML out of a Markdown file (#96)
+- Configuration Reference rewritten against the struct, with two tables of removed fields and their successors — the five deleted in v0.1.5 were still documented eleven releases later. Two new tests assert the README's field names resolve against `config.Configuration` by reflection, and that the removed names stay absent (#99)
+- Objects API documentation corrected: the `202` partial-replication response and its `X-GlobalFS-Replication` header, the `{prefix, count, objects}` list envelope rather than a bare array, the `207` partial-list status and `X-GlobalFS-Partial`, `HEAD`'s `Content-Type` and `X-GlobalFS-Checksum`, and `DELETE`'s all-sites-confirmed contract (#104)
+- Dropped the README version stamp, which read `v0.1.0` at a repo tagged `v0.2.3`, in favour of pointing at the releases page and this file (#105)
+- Removed the pre-commit hooks section. No `.pre-commit-config.yaml`, git hook, or CI reference to it exists anywhere in the repo — the only occurrence of the word was the README's own claim that the hooks run automatically on `git commit`. Replaced with the commands CI actually runs
+
 ## [0.2.3] - 2026-08-13
 
 **This release contains the v0.2.2 milestone as well as v0.2.3.** Both tranches
@@ -648,7 +681,7 @@ file agrees with the tag list.
 - `CoordinatorConfig.HealthCheckInterval` field removed; use `resilience.health_poll_interval` (already wired since v0.1.0) (#50)
 - `NetworkConfig` type and `SiteConfig.Network` field removed; bandwidth and latency were never consumed by the coordinator daemon (#50)
 - `PerformanceConfig.TransferChunkSize` and `PerformanceConfig.CacheSize` fields removed; they were parsed but had no runtime effect (#50)
-- `CoordinatorConfig.LeaseTimeout` is now consumed: the coordinator daemon calls `SetLeaseTTL` at startup, configuring the distributed leader-lease TTL (#50)
+- `CoordinatorConfig.LeaseTimeout` is now consumed: the coordinator daemon calls `SetLeaseTTL` at startup, configuring the distributed leader-lease TTL (#50) — *correction added in v0.3.0 (#107): the call happens, but the TTL it sets is only read when acquiring the leader lease, and no lease manager is ever registered, so the value has no observable effect. See the 0.1.0 note under "Distributed lease manager".*
 - `PerformanceConfig.MaxConcurrentTransfers` is now consumed: the coordinator daemon calls `SetWorkerQueueDepth` at startup, setting the replication worker queue capacity (#50)
 - `coordinator.Coordinator` gains two new configuration methods: `SetLeaseTTL(time.Duration)` and `SetWorkerQueueDepth(int)`; both must be called before `Start` (#50)
 
@@ -752,10 +785,26 @@ First production-ready release of the GlobalFS coordinator.
 - Worker event drain updates and cleans the store
 
 #### Distributed lease manager (#6)
+
+> **Correction, added in v0.3.0 (#107).** The two entries below describe code that
+> landed in the tree and was never connected. `SetLeaseManager` has no non-test
+> callers, so `c.leaseManager` is always nil and `IsLeader()` returns a hardcoded
+> `true`: **there is no leader election and no standby mode in any released
+> version.** Two coordinators pointed at the same buckets both believe they are
+> leader, both accept writes, and both replicate, with nothing anywhere able to
+> detect the resulting divergence.
+>
+> The lines are annotated rather than deleted, because anyone who has already read
+> them holds a belief that needs correcting, and a silent removal reaches nobody.
+> The same applies to the "etcd v3 implementation for production persistence" entry
+> under **Metadata store** above: the code exists, nothing constructs it. Whether to
+> wire it or remove it is issue #112.
+> The README's "Deployment topology" section is the current statement.
+
 - etcd-backed distributed lease manager (`internal/lease`)
 - `TryAcquire`, `KeepAlive`, `Release` API
-- Coordinator leader election: only the lease holder starts the replication worker
-- Standby coordinator mode when another instance holds the lease
+- ~~Coordinator leader election: only the lease holder starts the replication worker~~ — never wired; see the correction above
+- ~~Standby coordinator mode when another instance holds the lease~~ — never wired; see the correction above
 
 #### Operator CLI (#7)
 - `globalfs` cobra CLI (`cmd/globalfs`)

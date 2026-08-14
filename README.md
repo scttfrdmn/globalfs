@@ -1,8 +1,12 @@
 # GlobalFS — Global Namespace for Hybrid HPC Clouds
 
-**Version**: v0.1.0
-**Status**: Production-ready coordinator for multi-site object routing
+**Status**: Single-instance coordinator for multi-site object routing
 **License**: Apache 2.0
+
+For the current version see the [latest release](https://github.com/scttfrdmn/globalfs/releases/latest)
+and [CHANGELOG.md](CHANGELOG.md). This file deliberately does not carry a version
+number: the one that used to be here said v0.1.0 at a repository tagged v0.2.1,
+because it was hand-maintained and had no consumer that would notice (#105).
 
 GlobalFS is a coordinator daemon and CLI for routing object operations across
 multiple S3-backed sites. It provides a single unified namespace over two or
@@ -40,8 +44,35 @@ code.
 ### What GlobalFS does not do
 
 - It is not a FUSE filesystem — it routes object (key/value) operations, not POSIX calls
-- It does not implement distributed consensus or etcd integration in v0.1.0
+- It does not implement distributed consensus, leader election, or etcd integration
+- It does not detect or repair divergence between sites once it has occurred
 - It does not encrypt data in transit (terminate TLS at a load balancer)
+
+### Deployment topology: run exactly one coordinator
+
+**The coordinator is single-instance. Running two against the same buckets is
+unsupported and silently produces divergent replicas.**
+
+There is no leader election, no standby mode, and no mutual exclusion of any kind.
+`internal/lease` and the etcd metadata store exist in the tree but nothing
+constructs them — `IsLeader()` therefore returns a hardcoded `true`, and
+`/api/v1/info` reports `"is_leader": true` on every coordinator that is running.
+Two coordinators both believe they are leader, both accept writes, both replicate,
+and each dedups only against its own in-memory state.
+
+Nothing anywhere in the system would detect the result. There is no scrub, no
+reconciliation pass, and no version, generation, or vector clock on any object, so
+divergence between two sites is permanent rather than eventually consistent.
+
+Earlier CHANGELOG entries (v0.2.0) list "Coordinator leader election" and "Standby
+coordinator mode" under `### Added`. Those describe scaffolding that landed in the
+tree and was never wired up; they are corrected in place rather than deleted, since
+anyone who already read them holds a belief this note needs to reach (#107). Whether
+to wire the store and the lease manager or remove them is [#112](https://github.com/scttfrdmn/globalfs/issues/112).
+
+For availability, run one coordinator and restart it — it is stateless apart from
+the replication queue, and a restart re-derives everything from the config file. A
+second process is not a failover; it is a second writer.
 
 ---
 
@@ -75,7 +106,7 @@ code.
 |-----------|-----------|
 | **Get / Head** | Tries sites in policy order; promotes healthy sites to front; applies circuit breaker filter; retries per site |
 | **Put** | Writes synchronously to primary-role sites; enqueues async replication to others |
-| **Delete** | Synchronous on primaries (error returned on failure); best-effort on others (logged) |
+| **Delete** | Synchronous on every routed site; an error is returned if any site may still hold the object |
 | **List** | Priority-merge across all sites; highest-priority site wins on key conflicts |
 
 ### Site roles
@@ -106,7 +137,7 @@ make build
 # Edit the generated file or use the example below
 ```
 
-Minimal two-site config:
+Or copy [`examples/quickstart.yaml`](examples/quickstart.yaml), reproduced here:
 
 ```yaml
 global:
@@ -114,22 +145,33 @@ global:
 
 coordinator:
   listen_addr: ":8090"
-  etcd_endpoints:
-    - localhost:2379
 
 sites:
   - name: onprem
     role: primary
     objectfs:
+      mount_point: /mnt/objectfs-onprem
       s3_bucket: my-onprem-bucket
       s3_region: us-west-2
 
   - name: cloud
     role: burst
     objectfs:
+      mount_point: /mnt/objectfs-cloud
       s3_bucket: my-cloud-bucket
       s3_region: us-east-1
 ```
+
+Then check it before starting anything:
+
+```bash
+./bin/globalfs config validate config.yaml
+```
+
+Every key is checked against the schema, and an unrecognised one is an error
+naming the key and its line rather than a value that gets silently discarded. If
+you are upgrading a config written for v0.2.x or earlier, expect this to reject
+fields that used to be accepted and ignored — see [CHANGELOG.md](CHANGELOG.md).
 
 ### 3. Start the coordinator
 
@@ -182,24 +224,57 @@ use the defaults shown below. Generate a starter file with:
 globalfs config init --output config.yaml
 ```
 
+**Unknown keys are rejected.** A key that does not appear in the tables below is a
+startup error naming the key and its line, not a value to be discarded. This
+changed in v0.3.0 (#97): before it, a typo such as `listen_adrr` was accepted and
+the daemon bound the default port, and `config validate` reported success. If a
+config that used to load now fails, the field it names was already having no
+effect — the error is the first honest report of that.
+
+Fields removed in v0.3.0, which will now fail to load rather than being ignored:
+
+| Removed field | What to do |
+|---|---|
+| `global.metrics_port` | Delete it. `/metrics` is a route on the main API listener, not a second port — see [Metrics](#metrics) |
+| `sites[].cargoship.*` | Delete the block. Never read; the upstream feature it named was removed from ObjectFS |
+| `performance.max_concurrent_transfers` | Rename to `performance.replication_queue_depth`; it sizes a queue, not a pool |
+| `policies[].sync_mode` | Delete it. It was never a field on any struct and was silently discarded on every load |
+
+Fields removed earlier, in v0.1.5, which the previous version of this table still
+listed for eleven releases (#99):
+
+| Removed field | Successor |
+|---|---|
+| `coordinator.health_check_interval` | `resilience.health_poll_interval` |
+| `performance.cache_size` | `cache.max_bytes` |
+| `performance.transfer_chunk_size` | none — belonged to a bandwidth-scheduling design that was never built |
+| `network.bandwidth` | none, as above. The `network` section does not exist |
+| `network.latency` | none, as above |
+
 ### `global`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `cluster_name` | string | `globalfs-cluster` | Human-readable cluster identifier |
 | `log_level` | string | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARN`, `ERROR` |
-| `log_file` | string | _(stderr)_ | Path to log file; empty = stderr |
-| `metrics_enabled` | bool | `true` | Enable Prometheus metrics on `/metrics` |
-| `metrics_port` | int | `9090` | Port for the metrics endpoint |
+| `log_file` | string | _(stderr)_ | Path to log file; empty = stderr. Opened in append mode; if it cannot be opened the daemon logs to stderr and says so rather than refusing to start |
+| `metrics_enabled` | bool | `true` | Serve `/metrics`. When false the route is not registered and returns 404 |
 
 ### `coordinator`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `listen_addr` | string | `:8090` | HTTP server bind address |
-| `etcd_endpoints` | []string | `[localhost:2379]` | etcd cluster endpoints (reserved for future use) |
-| `lease_timeout` | duration | `60s` | Distributed lease TTL |
-| `health_check_interval` | duration | `30s` | Per-site health check interval |
+| `etcd_endpoints` | []string | `[localhost:2379]` | Accepted and unused; see below |
+| `lease_timeout` | duration | `60s` | Accepted and unused; see below |
+
+`etcd_endpoints` and `lease_timeout` configure the etcd metadata store and the
+lease manager, and **nothing constructs either one**, so no connection to these
+endpoints is ever attempted. Both fields are optional, and an empty
+`etcd_endpoints: []` is valid — until v0.3.0 the validator required it, which made
+a startup failure out of a value nothing read while the shipped example told
+operators to leave it empty (#106). The fields are kept rather than removed
+because they are the configuration surface for the store if it is ever wired.
 
 ### `sites[]`
 
@@ -209,14 +284,17 @@ Each entry defines one storage site.
 |-------|------|----------|-------------|
 | `name` | string | yes | Unique site identifier |
 | `role` | string | yes | `primary`, `burst`, or `backup` |
+| `objectfs.mount_point` | string | **yes** | Local path of this site's ObjectFS mount |
 | `objectfs.s3_bucket` | string | yes | S3 bucket backing this site |
 | `objectfs.s3_region` | string | yes | AWS region |
 | `objectfs.s3_endpoint` | string | no | Custom endpoint (MinIO, LocalStack, etc.) |
-| `objectfs.mount_point` | string | no | Local filesystem path (informational) |
-| `cargoship.endpoint` | string | no | CargoShip service endpoint |
-| `cargoship.enabled` | bool | no | Enable CargoShip for this site |
-| `network.bandwidth` | int | no | Available bandwidth in bytes/sec |
-| `network.latency` | duration | no | Expected round-trip latency |
+
+`mount_point` is required — this table said otherwise for eleven releases while the
+validator rejected configs that omitted it, including the one in this README's own
+Quick Start (#96). GlobalFS itself only records the value; it routes S3 operations
+and never touches the path. It is required because a site configured without one is
+in practice a half-finished config, and refusing it at startup is better than a
+FUSE mount nobody set up.
 
 ### `policy`
 
@@ -272,9 +350,18 @@ Put and Delete invalidate the affected key so stale data is never returned.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_concurrent_transfers` | int | `8` | Maximum parallel replication jobs |
-| `transfer_chunk_size` | int | `16777216` | Transfer chunk size in bytes (16 MiB) |
-| `cache_size` | string | `1GB` | Passed to ObjectFS (informational) |
+| `replication_queue_depth` | int | `8` | Replication jobs that may wait in the queue before `Put` reports backpressure |
+
+**This is a queue size, not a parallelism setting.** The replication worker is a
+single goroutine draining the queue serially, so raising this buys buffer, not
+throughput. It was called `max_concurrent_transfers` and documented here as
+"maximum parallel replication jobs", which it never was (#101).
+
+Raising it makes `Put` tolerate a longer burst before it starts waiting, and then
+answering `202` with `X-GlobalFS-Replication: pending`. Lowering it surfaces
+backpressure sooner. Serial transfers are what currently guarantees that two `Put`s
+of the same key replicate in order; a worker pool would need per-key affinity or an
+accepted last-writer-wins before it could be added.
 
 ### `security`
 
@@ -547,7 +634,7 @@ counter, which is why it keeps the `_total` suffix.
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.3.0",
   "uptime_seconds": 3600.5,
   "sites": 2,
   "is_leader": true,
@@ -560,6 +647,14 @@ counter, which is why it keeps the `_total` suffix.
   }
 }
 ```
+
+`is_leader` is always `true` and carries no information: there is no election, so
+every running coordinator claims leadership. Do not use it to decide which of two
+coordinators should be writing — see [Deployment
+topology](#deployment-topology-run-exactly-one-coordinator).
+
+`replication_queue_depth` is a live sample of the same value as the
+`globalfs_replication_queue_depth` gauge.
 
 ### Sites
 
@@ -627,36 +722,105 @@ All object endpoints accept an arbitrary key path after `/api/v1/objects/`.
 
 #### `GET /api/v1/objects/{key...}`
 
-Returns object data as `application/octet-stream`.
+Returns object data as `application/octet-stream`. A key that exists at no routed
+site returns `502` today, not `404` — the coordinator distinguishes absence from
+outage internally but the handler does not yet map it, tracked as
+[#110](https://github.com/scttfrdmn/globalfs/issues/110).
 
 #### `PUT /api/v1/objects/{key...}`
 
-Stores the request body. Returns `201 Created` on success.
+Stores the request body. Bodies are capped at 256 MiB; a larger one returns `413`.
+
+| Status | Meaning |
+|--------|---------|
+| `201 Created` | Stored on every primary and replication to all secondaries was queued |
+| `202 Accepted` | **Stored and readable, but replication was not queued for at least one secondary** |
+
+A `202` also carries `X-GlobalFS-Replication: pending` and a body naming the
+destinations that got no job:
+
+```json
+{
+  "key": "datasets/hot/sim.dat",
+  "status": "stored; replication incomplete",
+  "detail": "coordinator: replication not queued for [cloud]: replication: queue full"
+}
+```
+
+The bytes are durable on every primary in the routed set and readable immediately —
+a `202` is not a failed write, and treating it as one leads to retrying a write that
+already committed. What it means is that the object is single-copy for now. Retrying
+the identical PUT is safe and is the right response if you need the replica: the
+primary write is idempotent and the coordinator skips destinations that already hold
+the content hash. Alert on `globalfs_replication_dropped_total` rather than on this
+status, since a client that ignores the distinction will not report it.
 
 #### `DELETE /api/v1/objects/{key...}`
 
-Deletes the object from all sites. Returns `204 No Content`.
+Deletes the object from all routed sites. Returns `204 No Content` only when every
+one of them confirmed the delete; if any site still holds a copy the response is
+`502` and `globalfs_delete_incomplete_total` increments. An object reported deleted
+is not readable from any site.
 
 #### `HEAD /api/v1/objects/{key...}`
 
-Returns object metadata as response headers:
+Returns object metadata as response headers, and never a body — including on error,
+where the status alone carries the result.
 
 ```
+Content-Type: application/octet-stream
 Content-Length: 1048576
 ETag: "abc123"
 Last-Modified: Sat, 22 Feb 2026 10:00:00 GMT
+X-GlobalFS-Checksum: 9f86d081884c7d65...
 ```
+
+`X-GlobalFS-Checksum` is the object's SHA-256 as recorded by ObjectFS, and is the
+only way to obtain a digest without downloading the object. It is absent when the
+backend has no checksum recorded for that object. `Content-Type` falls back to
+`application/octet-stream`.
 
 #### `GET /api/v1/objects?prefix=<p>&limit=<n>`
 
-Lists objects. `prefix` and `limit` are optional. Returns:
+Lists objects across all sites. `prefix` and `limit` are optional; `limit` must be
+a non-negative integer, and `0` or omitted means no limit.
+
+The response is an **object**, not a bare array:
 
 ```json
-[
-  {"key": "datasets/hot/sim.dat", "size": 1048576, "etag": "abc123", "last_modified": "..."},
-  ...
-]
+{
+  "prefix": "datasets/",
+  "count": 2,
+  "objects": [
+    {"key": "datasets/hot/sim.dat", "size": 1048576, "etag": "abc123",
+     "content_type": "application/octet-stream", "checksum": "", "last_modified": "..."}
+  ]
+}
 ```
+
+| Status | Meaning |
+|--------|---------|
+| `200 OK` | Every routed site answered |
+| `207 Multi-Status` | **At least one site answered and at least one failed — the listing may be missing keys** |
+| `502 Bad Gateway` | No site answered |
+
+A `207` also sets `X-GlobalFS-Partial: true`. Read the header rather than the status
+if you are behind a proxy or a client library that treats any 2xx as complete: a
+`207` listing is a subset of the true namespace, and the keys that are absent are
+exactly the ones on the sites that failed. Do not use it to conclude that a key does
+not exist, and do not use it as the input to a deletion or synchronisation pass. The
+error detail naming the failed sites goes to the coordinator log, not the response.
+
+Two caveats apply even to a `200`:
+
+- **`checksum` is always empty from this endpoint.** S3's `ListObjectsV2` returns no
+  user metadata, and the checksum lives there, so only `HEAD` can supply it.
+  Similarly `size` is the stored (possibly compressed) size here and the
+  uncompressed size from `HEAD`.
+- **A `200` is not a guarantee that the listing is complete.** `limit` is passed to
+  each site individually and the merged result is then truncated, so a
+  lexicographically-early key held only on a lower-priority site can be missing at
+  any limit. Tracked as [#109](https://github.com/scttfrdmn/globalfs/issues/109).
 
 ---
 
@@ -685,11 +849,24 @@ Integration tests hit real AWS S3. Set the `aws` named profile:
 AWS_PROFILE=aws AWS_REGION=us-west-2 go test -race -tags=integration ./...
 ```
 
-### Pre-commit hooks
+### Before committing
 
-The project uses pre-commit hooks (gofmt, go build, golangci-lint,
-markdownlint). They run automatically on `git commit` and auto-fix what they
-can. Re-stage and commit again if files are modified.
+There are no git hooks in this repository — a previous version of this section
+described pre-commit hooks that no `.pre-commit-config.yaml` has ever configured.
+Run the checks yourself; CI runs the same ones:
+
+```bash
+gofmt -l .          # must print nothing
+go vet ./...
+make test           # go test -race ./...
+make lint           # golangci-lint
+```
+
+CI additionally runs `go mod tidy` and fails on a diff, cross-compiles for
+linux/darwin on amd64/arm64, builds with the `integration` tag, and validates every
+shipped config example — including `examples/quickstart.yaml`, which is the YAML
+embedded in the Quick Start above, so that block cannot go stale without CI saying
+so.
 
 ### Project layout
 
@@ -720,7 +897,7 @@ pkg/
 ## Related Projects
 
 - **[ObjectFS](https://github.com/scttfrdmn/objectfs)** — POSIX-compliant FUSE filesystem for S3; provides the per-site backend
-- **[CargoShip](https://github.com/scttfrdmn/cargoship)** — streaming archive/upload pipeline for S3 bulk transfers
+- **[CargoShip](https://github.com/scttfrdmn/cargoship)** — streaming archive/upload pipeline for S3 bulk transfers. **Not integrated.** GlobalFS carried a `cargoship:` config block that nothing read; it was removed in v0.3.0 (#108) along with a comment promising a streaming pipeline that ObjectFS had itself deleted upstream
 
 ---
 

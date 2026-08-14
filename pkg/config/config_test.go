@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -809,18 +810,221 @@ func TestLoad_EmptyFileIsNotAnError(t *testing.T) {
 func TestLoad_ShippedConfigsHaveNoUnknownFields(t *testing.T) {
 	t.Parallel()
 
-	for _, path := range []string{
-		"../../config.example.yaml",
-		"../../examples/coordinator-config.yaml",
-	} {
+	paths, err := filepath.Glob("../../examples/*.yaml")
+	if err != nil {
+		t.Fatalf("glob examples: %v", err)
+	}
+	// Globbed rather than listed, so a new example under examples/ is covered the
+	// moment it is added.  config.example.yaml is named explicitly because it is
+	// the only one outside that directory.
+	paths = append(paths, "../../config.example.yaml")
+	if len(paths) < 3 {
+		t.Fatalf("found only %d shipped configs (%v); the glob is probably wrong, "+
+			"and a test that silently checks nothing is worse than no test", len(paths), paths)
+	}
+
+	for _, path := range paths {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			t.Parallel()
 			cfg := config.NewDefault()
 			if err := cfg.LoadFromFile(path); err != nil {
 				t.Fatalf("shipped config has a key the struct lacks: %v", err)
 			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("shipped config does not validate: %v", err)
+			}
 		})
 	}
+}
+
+// ─── README field tables match the struct (#99) ───────────────────────────────
+
+// TestREADME_DocumentsOnlyRealFields is the durable half of #99.
+//
+// Five fields deleted in v0.1.5 stayed in the README's reference tables for
+// eleven releases, and the only thing that would ever have caught it is a human
+// reading both.  Now that decoding is strict (#97), a documented-but-absent field
+// is worse than a no-op: an operator who copies it gets a daemon that refuses to
+// start, so this drift has been promoted from cosmetic to breaking and needs a
+// gate.
+//
+// Matching is by dotted suffix rather than exact path, because the tables are
+// organised by config section while some of them document a nested element — the
+// `policy` table lists the fields of a *rule* (policy.rules[].name), not of
+// PolicyConfig.  A suffix match still catches every real drift: a field that was
+// deleted or renamed appears nowhere in the struct tree under any prefix.
+func TestREADME_DocumentsOnlyRealFields(t *testing.T) {
+	t.Parallel()
+
+	real := yamlPaths(reflect.TypeOf(config.Configuration{}), "")
+	if len(real) < 25 {
+		t.Fatalf("walked only %d yaml paths out of Configuration; the reflection "+
+			"is wrong and this test would pass on anything", len(real))
+	}
+
+	for _, field := range readmeFieldCells(t) {
+		if !hasSuffixPath(real, field) {
+			t.Errorf("README documents %q, which is not a field of config.Configuration "+
+				"under any prefix.\nWith strict decoding an operator who copies it gets a "+
+				"daemon that will not start. Remove it from the table, or name its "+
+				"successor.", field)
+		}
+	}
+}
+
+// TestREADME_RemovedFieldsAreActuallyGone is the inverse assertion, and it is the
+// one that keeps the "fields removed in …" tables honest: those tables tell an
+// operator to delete a key, so a key that quietly came back would make the
+// documentation wrong in the more dangerous direction.
+func TestREADME_RemovedFieldsAreActuallyGone(t *testing.T) {
+	t.Parallel()
+
+	real := yamlPaths(reflect.TypeOf(config.Configuration{}), "")
+	for _, field := range []string{
+		// Removed in v0.3.0 (#98, #101, #108, and the sync_mode found while
+		// cleaning config.example.yaml).
+		"metrics_port",
+		"cargoship",
+		"max_concurrent_transfers",
+		"sync_mode",
+		// Removed in v0.1.5, documented until v0.3.0 (#99).
+		"health_check_interval",
+		"cache_size",
+		"transfer_chunk_size",
+		"network",
+	} {
+		if hasSuffixPath(real, field) {
+			t.Errorf("README's removed-fields table says to delete %q, but it is a "+
+				"field of config.Configuration again. Either the field came back and "+
+				"the table is wrong, or the name was reused for something else — "+
+				"which is worse, because an operator following the table deletes a "+
+				"live setting.", field)
+		}
+	}
+}
+
+// yamlPaths walks a struct type and returns every dotted yaml path in it.
+//
+// Slices are traversed through their element type without an index, so
+// `sites[].objectfs.s3_bucket` appears as "sites.objectfs.s3_bucket": the tables
+// document field names, not positions.
+func yamlPaths(t reflect.Type, prefix string) map[string]bool {
+	out := make(map[string]bool)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return out
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		tag, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		path := tag
+		if prefix != "" {
+			path = prefix + "." + tag
+		}
+		out[path] = true
+
+		ft := f.Type
+		for ft.Kind() == reflect.Pointer || ft.Kind() == reflect.Slice || ft.Kind() == reflect.Array {
+			ft = ft.Elem()
+		}
+		// time.Duration is an int64 and a struct-free leaf; anything else that is
+		// a struct is a nested section worth descending into.
+		if ft.Kind() == reflect.Struct {
+			for k := range yamlPaths(ft, path) {
+				out[k] = true
+			}
+		}
+	}
+	return out
+}
+
+// hasSuffixPath reports whether any known path equals field or ends with
+// "." + field, so a segment boundary is required: "cache_size" must not match
+// "cache.size" or "max_bytes_cache_size".
+func hasSuffixPath(paths map[string]bool, field string) bool {
+	for p := range paths {
+		if p == field || strings.HasSuffix(p, "."+field) {
+			return true
+		}
+	}
+	return false
+}
+
+// readmeFieldCells extracts the first column of every table in the README's
+// Configuration Reference section, which by convention is a backticked field
+// name.
+//
+// It reads only between "## Configuration Reference" and the next "## " heading,
+// and skips the two "fields removed in …" tables — those exist precisely to name
+// keys the struct no longer has, and are asserted in the opposite direction by
+// TestREADME_RemovedFieldsAreActuallyGone.
+func readmeFieldCells(t *testing.T) []string {
+	t.Helper()
+	data, err := os.ReadFile("../../README.md")
+	if err != nil {
+		t.Fatalf("read README: %v", err)
+	}
+
+	var fields []string
+	inSection, skipTable := false, false
+	for _, line := range strings.Split(string(data), "\n") {
+		switch {
+		case strings.HasPrefix(line, "## Configuration Reference"):
+			inSection = true
+			continue
+		case inSection && strings.HasPrefix(line, "## "):
+			inSection = false
+		}
+		if !inSection {
+			continue
+		}
+
+		// The removed-field tables are identified by their header row, which says
+		// "Removed field" where the live tables say "Field".
+		if strings.HasPrefix(line, "|") && strings.Contains(line, "Removed field") {
+			skipTable = true
+			continue
+		}
+		if !strings.HasPrefix(line, "|") {
+			skipTable = false
+			continue
+		}
+		if skipTable {
+			continue
+		}
+
+		cells := strings.Split(strings.Trim(line, "|"), "|")
+		if len(cells) == 0 {
+			continue
+		}
+		cell := strings.TrimSpace(cells[0])
+		// Skip header and separator rows.
+		if !strings.HasPrefix(cell, "`") || !strings.HasSuffix(cell, "`") {
+			continue
+		}
+		name := strings.Trim(cell, "`")
+		// Wildcards in the removed tables ("sites[].cargoship.*") never reach here,
+		// but a `*` anywhere is not a field name.
+		if name == "" || strings.Contains(name, "*") {
+			continue
+		}
+		fields = append(fields, name)
+	}
+
+	if len(fields) < 20 {
+		t.Fatalf("extracted only %d field names from the README's Configuration "+
+			"Reference (%v); the parser is out of step with the document's shape, "+
+			"and a test that reads nothing passes on anything", len(fields), fields)
+	}
+	return fields
 }
 
 // writeTempFile writes content to a temp file and returns its path.
