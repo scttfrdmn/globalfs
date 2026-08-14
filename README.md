@@ -510,10 +510,36 @@ Prometheus metrics. Key metrics:
 | `globalfs_sites_current` | gauge | Number of registered sites |
 | `globalfs_replication_jobs_total` | counter | Replication jobs by `status` |
 | `globalfs_replication_queue_depth` | gauge | Jobs waiting in queue |
+| `globalfs_replication_dropped_total` | counter | Writes whose replication was never queued |
+| `globalfs_replication_terminal_events_dropped_total` | gauge | Replication outcomes the coordinator never received |
+| `globalfs_delete_incomplete_total` | counter | Deletes that left the object readable somewhere |
 | `globalfs_cache_hits_total` | counter | Cache hits |
 | `globalfs_cache_misses_total` | counter | Cache misses |
 | `globalfs_cache_evictions_total` | counter | Cache evictions |
 | `globalfs_cache_bytes` | gauge | Bytes currently stored in cache |
+
+The three middle rows are the ones to alert on, and any increase in any of them is
+worth paging for — each counts an operation that reported success while leaving
+the cluster in a state the caller was not told about:
+
+- **`replication_dropped_total`** — the queue was full, so the write landed on its
+  primary and nowhere else. The caller was told, via `ErrReplicationNotQueued` or
+  a `202` from `PUT /api/v1/objects`, but a client that ignores that distinction
+  now holds single-copy data it believes is replicated.
+- **`replication_terminal_events_dropped_total`** — the transfer ran, and probably
+  succeeded, but the coordinator never learned the outcome. Its job record is
+  replayed on the next restart and its content hash was never written, so the
+  same bytes transfer again. Reaching this requires an event consumer stalled for
+  ten seconds, which is itself worth investigating.
+- **`delete_incomplete_total`** — a `Delete` returned success with the object
+  still present on at least one site, so it is still readable through the same
+  API that just reported it gone.
+
+`replication_terminal_events_dropped_total` is a gauge carrying a monotonic value:
+the count is owned by the replication worker and mirrored into the registry with
+`Set`, rather than incremented here, so it cannot drift from the worker's own
+value across a scrape. `increase()` and `rate()` work on it as they would on a
+counter, which is why it keeps the `_total` suffix.
 
 ### Coordinator info
 

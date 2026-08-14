@@ -477,8 +477,20 @@ func (c *Coordinator) SetLeaseManager(mgr *lease.Manager) error {
 // having changed nothing.  Freezing it at Start is what closes the #86 race:
 // every read now goes through c.metrics() under the lock, and the field stops
 // changing at the moment concurrent readers appear.
+//
+// It publishes the current site count immediately.  Sites supplied to New — which
+// is every site in a config-file deployment — are already present by the time
+// metrics are registered, and they never pass through AddSite.  Since AddSite and
+// RemoveSite were the only writers of the gauge, globalfs_sites_current read 0 for
+// the entire life of an ordinary coordinator while /api/v1/sites listed every
+// site and all of them served traffic (#102).
 func (c *Coordinator) SetMetrics(m *metrics.Metrics) error {
-	return c.setBeforeStart("SetMetrics", func() { c.m = m })
+	return c.setBeforeStart("SetMetrics", func() {
+		c.m = m
+		// setBeforeStart holds c.mu for writing, so this is the Locked variant
+		// for the same reason AddSite's call is.
+		c.metricsSiteCountLocked(len(c.sites))
+	})
 }
 
 // SetHealthPollInterval sets the interval between background site health
@@ -777,16 +789,40 @@ func (c *Coordinator) launch(ctx context.Context, cfg startConfig) {
 // tell them apart from those of other tests running in the same process.
 func (c *Coordinator) runHealthPollLoop(ctx context.Context, interval time.Duration) {
 	c.runHealthPoll(ctx) // immediate first check
+	c.publishWorkerMetrics()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			c.runHealthPoll(ctx)
+			c.publishWorkerMetrics()
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// publishWorkerMetrics samples the worker's own counters into the registry.
+//
+// This runs on the health-poll tick, which is deliberate and is the whole point:
+// handleWorkerEvent also publishes these, but only for events the drain actually
+// received.  A coordinator that drops terminal events and then goes quiet — no
+// further replication traffic, so no further events — would never publish the
+// very drop that matters most.  The health poll ticks regardless of whether
+// anything is replicating, so the count reaches the registry either way (#137).
+//
+// Sampling a monotonic counter repeatedly is harmless: SetDroppedTerminalEvents
+// mirrors the worker's value rather than accumulating, so publishing the same
+// number every 30 s is a no-op until it changes.
+func (c *Coordinator) publishWorkerMetrics() {
+	w := c.workerRef()
+	if w == nil {
+		return
+	}
+	m := c.metrics()
+	m.SetDroppedTerminalEvents(w.DroppedTerminalEvents())
+	m.SetReplicationQueueDepth(w.QueueDepth())
 }
 
 // Stop signals the background replication worker to stop and waits for it to
@@ -1432,12 +1468,25 @@ func (c *Coordinator) Put(ctx context.Context, key string, data []byte) error {
 					continue
 				}
 			}
-			if enqErr := enqueueWithBackpressure(ctx, worker, backpressure, replication.ReplicationJob{
+			enqErr := enqueueWithBackpressure(ctx, worker, backpressure, replication.ReplicationJob{
 				SourceSite: src,
 				DestSite:   s,
 				Key:        key,
 				Size:       int64(len(data)),
-			}); enqErr != nil {
+			})
+
+			// Publish the depth on the enqueue edge as well as the settle edge.
+			// The drain was the only writer, so every sample was taken just after
+			// a job left the queue — the low-water mark.  A burst of 40 enqueues
+			// read 0 until the first completion, which is to say the gauge stood
+			// still through exactly the event it exists to show: the queue filling
+			// toward the point where the drop above starts costing writes (#103).
+			//
+			// Set unconditionally, including on the error path: a failed enqueue
+			// means the queue is full, which is the most important depth there is.
+			m.SetReplicationQueueDepth(worker.QueueDepth())
+
+			if enqErr != nil {
 				// The job stays in the store when one is configured, so a restart
 				// recovers it.  With no store — every shipped deployment today —
 				// the write is simply not replicated, which is why this is an
@@ -2155,6 +2204,8 @@ func (c *Coordinator) handleWorkerEvent(ev replication.ReplicationEvent, store m
 	// under c.mu (#86) and c.worker by SetWorkerQueueDepth under c.mu (#85), and
 	// this runs on the drain goroutine concurrently with both.
 	m := c.metrics()
+	w := c.workerRef()
 	m.RecordReplication(string(ev.Type))
-	m.SetReplicationQueueDepth(c.workerRef().QueueDepth())
+	m.SetReplicationQueueDepth(w.QueueDepth())
+	m.SetDroppedTerminalEvents(w.DroppedTerminalEvents())
 }

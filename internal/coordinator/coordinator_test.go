@@ -1443,6 +1443,279 @@ func counterValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
 	return 0
 }
 
+// gaugeValue reads a single unlabelled gauge out of a registry.
+//
+// Separate from counterValue because GetCounter() on a gauge-typed metric returns
+// a zero-valued struct rather than failing — so reading a gauge with the counter
+// accessor silently reports 0, which is indistinguishable from the bug most of
+// these tests exist to catch.
+func gaugeValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, mtc := range f.GetMetric() {
+			return mtc.GetGauge().GetValue()
+		}
+	}
+	t.Fatalf("metric %q not found in registry", name)
+	return 0
+}
+
+// ─── Metrics derived from state, not from incidental call sites (#102, #103) ──
+//
+// Both gauges below were written at whatever call site happened to be handling a
+// related state change, rather than at every transition that changes the value.
+// The shape of the resulting bug is the same in each: the number is right for the
+// path that was instrumented and wrong for the path that actually occurs.
+
+// TestCoordinator_SitesGauge_CountsConfiguredSites is #102.  metricsSiteCount was
+// called only from AddSite and RemoveSite, and sites supplied to New — which is
+// every site in a config-file deployment — never pass through AddSite.  So
+// globalfs_sites_current read 0 for the whole life of an ordinary coordinator
+// while /api/v1/sites listed every site and all of them served traffic.
+//
+// This is the gauge an operator reaches for first during a site outage, so a
+// permanent 0 makes any alert built on it fire forever and then get silenced.
+func TestCoordinator_SitesGauge_CountsConfiguredSites(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, _ := makeMount("backup", types.SiteRoleBackup, nil)
+	burst, _ := makeMount("burst", types.SiteRoleBurst, nil)
+
+	reg := prometheus.NewRegistry()
+	c := New(primary, backup, burst)
+	mustConfigure(t, c.SetMetrics(metrics.New(reg)))
+
+	// No API call has been made and Start has not been called.  The count must
+	// already be right: these sites exist and are routable.
+	if got := gaugeValue(t, reg, "globalfs_sites_current"); got != 3 {
+		t.Errorf("globalfs_sites_current = %v, want 3 for three configured sites", got)
+	}
+}
+
+// TestCoordinator_SitesGauge_TracksAddAndRemove pins that publishing the count at
+// SetMetrics did not break the incremental path it supplements.
+func TestCoordinator_SitesGauge_TracksAddAndRemove(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	extra, _ := makeMount("extra", types.SiteRoleBurst, nil)
+
+	reg := prometheus.NewRegistry()
+	c := New(primary)
+	mustConfigure(t, c.SetMetrics(metrics.New(reg)))
+
+	if got := gaugeValue(t, reg, "globalfs_sites_current"); got != 1 {
+		t.Fatalf("globalfs_sites_current = %v, want 1 at construction", got)
+	}
+	c.AddSite(extra)
+	if got := gaugeValue(t, reg, "globalfs_sites_current"); got != 2 {
+		t.Errorf("after AddSite: globalfs_sites_current = %v, want 2", got)
+	}
+	if !c.RemoveSite("extra") {
+		t.Fatal("RemoveSite(extra) = false")
+	}
+	if got := gaugeValue(t, reg, "globalfs_sites_current"); got != 1 {
+		t.Errorf("after RemoveSite: globalfs_sites_current = %v, want 1", got)
+	}
+}
+
+// TestCoordinator_QueueDepthGauge_RisesOnEnqueue is #103.  The gauge was written
+// only by the event drain, after a job reached a terminal state — so every sample
+// was the depth just after a completion, the low-water mark.  A burst of enqueues
+// read 0 until the first one finished.
+//
+// The moment the number matters is the queue filling toward the point where a
+// full queue makes Put report ErrReplicationNotQueued, and that is exactly the
+// moment the old gauge did not move.
+func TestCoordinator_QueueDepthGauge_RisesOnEnqueue(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, backupClient := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Wedge the transfer so nothing drains: every enqueued job stays in the queue
+	// and no terminal event is ever emitted.  Under the old code this is precisely
+	// the state in which the gauge reported 0.
+	release := backupClient.blockPuts()
+	defer release()
+
+	reg := prometheus.NewRegistry()
+	c := New(primary, backup)
+	mustConfigure(t, c.SetMetrics(metrics.New(reg)))
+	mustConfigure(t, c.SetWorkerQueueDepth(16))
+	mustStart(t, ctx, c)
+	// LIFO: the release must run before Stop, or Stop parks for its full 30 s
+	// budget on a worker sitting inside a blocked Put (#83).
+	defer c.Stop()
+	defer release()
+
+	const puts = 4
+	for i := 0; i < puts; i++ {
+		if err := c.Put(ctx, fmt.Sprintf("k-%d", i), []byte("v")); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	// The worker picks up one job and blocks in the transfer, so it is out of the
+	// queue while the rest wait.  The assertion is deliberately ">0" rather than
+	// an exact count: the point is that a filling queue is visible at all, and
+	// pinning the exact depth would make this a test of worker scheduling timing.
+	if got := gaugeValue(t, reg, "globalfs_replication_queue_depth"); got <= 0 {
+		t.Errorf("globalfs_replication_queue_depth = %v after %d enqueues with the "+
+			"worker wedged, want > 0; a backlog that reports empty hides the "+
+			"condition that costs writes", got, puts)
+	}
+}
+
+// TestCoordinator_DroppedTerminalEventsGauge_Published is #137.
+//
+// Worker.DroppedTerminalEvents() had no reader: the count was reachable only by
+// calling the accessor, so a drop was visible in the log at the moment it
+// happened and nowhere afterwards.  Each drop is a job whose outcome the
+// coordinator never learned — its persisted record is replayed on the next
+// restart and its dedup hash was never written, so the same bytes transfer again.
+//
+// This asserts the series exists and reads the worker's value.  Forcing a real
+// drop requires wedging the drain past the emit budget, which internal/replication
+// already covers; what was missing is that the coordinator publishes it at all.
+func TestCoordinator_DroppedTerminalEventsGauge_Published(t *testing.T) {
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, _ := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reg := prometheus.NewRegistry()
+	c := New(primary, backup)
+	mustConfigure(t, c.SetMetrics(metrics.New(reg)))
+	// A short poll interval so the health-poll publish point runs promptly.  That
+	// path, not the event drain, is the one that matters here: a coordinator which
+	// drops events and then goes quiet emits no further events, so publishing only
+	// from handleWorkerEvent would never surface the drop.
+	mustConfigure(t, c.SetHealthPollInterval(10*time.Millisecond))
+	mustStart(t, ctx, c)
+	defer c.Stop()
+
+	// The immediate first poll publishes before Start returns, so the series is
+	// present with no replication traffic at all — which is the case the drain
+	// could not cover.
+	if got := gaugeValue(t, reg, "globalfs_replication_terminal_events_dropped_total"); got != 0 {
+		t.Errorf("globalfs_replication_terminal_events_dropped_total = %v, want 0 on a healthy coordinator", got)
+	}
+
+	// And it must be a distinct series from the enqueue-rejection counter, which
+	// counts the opposite failure: transfers that never started.
+	if got := counterValue(t, reg, "globalfs_replication_dropped_total"); got != 0 {
+		t.Errorf("globalfs_replication_dropped_total = %v, want 0", got)
+	}
+}
+
+// blockingDeleteJobStore wedges the event drain.  handleWorkerEvent's first act
+// for a terminal event is store.DeleteJob, under a context this ignores, so the
+// drain parks there until release is called and the worker's events buffer fills
+// behind it — which is the only way to reach a real terminal-event drop.
+type blockingDeleteJobStore struct {
+	*metadata.MemoryStore
+	release chan struct{}
+}
+
+func (s *blockingDeleteJobStore) DeleteJob(_ context.Context, _ string) error {
+	<-s.release
+	return nil
+}
+
+// TestCoordinator_DroppedTerminalEventsGauge_RisesOnRealDrop is the assertion
+// #137 asks for: a wedged drain must surface a non-zero sample in the registry.
+//
+// It drives the whole path rather than poking the counter — a wedged consumer,
+// an events buffer that fills behind it, a worker that waits out its terminal
+// budget and gives up, and the health poll that publishes the result.  That last
+// hop is the one under test: the drain is wedged, so handleWorkerEvent's own
+// publish site can never run, and if the health poll did not also publish then
+// the drop would reach no registry at all.
+//
+// Slow by construction — the worker's terminal budget is 10 s and is not settable
+// from this package — so it is skipped under -short.
+func TestCoordinator_DroppedTerminalEventsGauge_RisesOnRealDrop(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out the worker's 10s terminal emit budget")
+	}
+	t.Parallel()
+
+	primary, _ := makeMount("primary", types.SiteRolePrimary, nil)
+	backup, _ := makeMount("backup", types.SiteRoleBackup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := &blockingDeleteJobStore{
+		MemoryStore: metadata.NewMemoryStore(),
+		release:     make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(store.release) }) }
+	defer release()
+
+	// A small queue depth keeps the events buffer small — eventBufferSize is
+	// depth*2 + 64 — so it fills in tens of jobs rather than hundreds.
+	const depth = 4
+	reg := prometheus.NewRegistry()
+	c := New(primary, backup)
+	mustConfigure(t, c.SetMetrics(metrics.New(reg)))
+	mustConfigure(t, c.SetStore(store))
+	mustConfigure(t, c.SetWorkerQueueDepth(depth))
+	mustConfigure(t, c.SetHealthPollInterval(20*time.Millisecond))
+	// Once the worker parks in emitTerminal the queue backs up, and waiting the
+	// default 2 s per Put would dominate the test.  A rejected enqueue is an
+	// expected outcome here, not a failure.
+	c.SetEnqueueBackpressure(20 * time.Millisecond)
+	mustStart(t, ctx, c)
+	// LIFO: release the drain before Stop, or Stop waits out its full budget on a
+	// drain parked in DeleteJob.
+	defer c.Stop()
+	defer release()
+
+	// Enough writes to fill the events buffer (two events per job) with room to
+	// spare, so at least one terminal event finds it full.
+	for i := 0; i < 120; i++ {
+		err := c.Put(ctx, fmt.Sprintf("obj-%03d", i), []byte("v"))
+		if err != nil && !errors.Is(err, ErrReplicationNotQueued) {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	// The first job to find the buffer full waits one 10 s budget before giving
+	// up, then the next health tick publishes.  Poll rather than sleep so a
+	// faster machine finishes early.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if gaugeValue(t, reg, "globalfs_replication_terminal_events_dropped_total") > 0 {
+			return // published — that is the whole assertion
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	dropped := c.workerRef().DroppedTerminalEvents()
+	t.Fatalf("globalfs_replication_terminal_events_dropped_total stayed 0 after 20s; "+
+		"the worker's own count is %d — %s", dropped, map[bool]string{
+		true:  "so the drop happened and the coordinator never published it",
+		false: "the setup did not manage to fill the events buffer, so this test proved nothing",
+	}[dropped > 0])
+}
+
 // TestCoordinator_Put_NoStore_FullQueueStillReports covers the shipped
 // configuration: no metadata store, so nothing recovers a dropped job and the
 // error to the caller is the only signal that exists.

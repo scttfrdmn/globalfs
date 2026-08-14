@@ -46,6 +46,7 @@ func TestNew_RegistersMetrics(t *testing.T) {
 	for _, want := range []string{
 		"globalfs_sites_current",
 		"globalfs_replication_queue_depth",
+		"globalfs_replication_terminal_events_dropped_total",
 	} {
 		if !names[want] {
 			t.Errorf("metric %q not found in registry after New", want)
@@ -61,6 +62,62 @@ func TestNilSafe(t *testing.T) {
 	m.SetSiteCount(3)
 	m.RecordReplication("completed")
 	m.SetReplicationQueueDepth(5)
+	m.SetDroppedTerminalEvents(7)
+}
+
+// TestSetDroppedTerminalEvents_MirrorsRatherThanAccumulates pins the property
+// that makes a Gauge the right type for a monotonic quantity here (#137): the
+// worker owns the count and this only reflects it, so publishing the same value
+// repeatedly — which the health poll does every interval — must be a no-op.
+//
+// An Inc-based Counter would have turned each poll into another increment, and
+// the metric would climb without a single new drop.
+func TestSetDroppedTerminalEvents_MirrorsRatherThanAccumulates(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+
+	const name = "globalfs_replication_terminal_events_dropped_total"
+	read := func() float64 {
+		t.Helper()
+		families, err := reg.Gather()
+		if err != nil {
+			t.Fatalf("gather: %v", err)
+		}
+		for _, f := range families {
+			if f.GetName() == name {
+				return f.Metric[0].Gauge.GetValue()
+			}
+		}
+		t.Fatalf("%s not found in registry", name)
+		return 0
+	}
+
+	// Present from New at zero, without any drop having occurred: an absent
+	// series is indistinguishable from a scrape failure, so "no drops yet" has
+	// to be expressible.
+	if got := read(); got != 0 {
+		t.Errorf("%s = %v before any publish, want 0", name, got)
+	}
+
+	m.SetDroppedTerminalEvents(3)
+	if got := read(); got != 3 {
+		t.Errorf("%s = %v, want 3", name, got)
+	}
+
+	// Three more polls with the worker's count unchanged.
+	for i := 0; i < 3; i++ {
+		m.SetDroppedTerminalEvents(3)
+	}
+	if got := read(); got != 3 {
+		t.Errorf("%s = %v after re-publishing the same count, want 3; the value "+
+			"must mirror the worker rather than accumulate per poll", name, got)
+	}
+
+	m.SetDroppedTerminalEvents(5)
+	if got := read(); got != 5 {
+		t.Errorf("%s = %v, want 5", name, got)
+	}
 }
 
 func TestSetSiteCount(t *testing.T) {

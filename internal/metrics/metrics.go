@@ -18,6 +18,7 @@ type Metrics struct {
 	replicationTotal      *prometheus.CounterVec
 	replicationQueueDepth prometheus.Gauge
 	replicationDropped    prometheus.Counter
+	terminalEventsDropped prometheus.Gauge
 	deleteIncomplete      prometheus.Counter
 	cacheHits             prometheus.Counter
 	cacheMisses           prometheus.Counter
@@ -65,6 +66,20 @@ func New(reg prometheus.Registerer) *Metrics {
 			Help: "Total number of replication jobs rejected because the queue was full. " +
 				"Non-zero means writes were not replicated; alert on any increase.",
 		}),
+		// A Gauge, despite the _total name and the monotonic quantity, because the
+		// authoritative count lives in the worker's atomic.Uint64 and this mirrors
+		// it with Set.  A Counter would mean Inc-ing here as well, which either
+		// double-counts or drifts from the worker's value across a scrape.  Its
+		// _total suffix is kept because promql treats it as a counter for
+		// increase()/rate() purposes and that is how an operator will query it.
+		terminalEventsDropped: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "globalfs_replication_terminal_events_dropped_total",
+			Help: "Total terminal replication events the coordinator never received. " +
+				"Each one is a job whose outcome was lost: its persisted record is " +
+				"replayed on restart and its content hash is missing, so the same " +
+				"bytes transfer again. Distinct from replication_dropped_total, " +
+				"which counts transfers that never started; alert on any increase.",
+		}),
 		deleteIncomplete: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "globalfs_delete_incomplete_total",
 			Help: "Total number of deletes that left the object present on at least one site. " +
@@ -94,6 +109,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.replicationTotal,
 		m.replicationQueueDepth,
 		m.replicationDropped,
+		m.terminalEventsDropped,
 		m.deleteIncomplete,
 		m.cacheHits,
 		m.cacheMisses,
@@ -151,6 +167,29 @@ func (m *Metrics) RecordReplicationDropped() {
 		return
 	}
 	m.replicationDropped.Inc()
+}
+
+// SetDroppedTerminalEvents publishes the worker's count of terminal replication
+// events that the coordinator never received.
+//
+// This is a Set of a monotonic value rather than an increment, because the worker
+// owns the count (an atomic.Uint64 it increments when the events buffer stays
+// full for the whole emit budget) and this only mirrors it.  Callers should pass
+// Worker.DroppedTerminalEvents() directly.
+//
+// It counts a different failure from RecordReplicationDropped, and the two must
+// not be folded together: that one means the transfer never started and Put told
+// the caller so via ErrReplicationNotQueued.  This one means the transfer ran and
+// probably succeeded, Put already returned success, and only the coordinator's
+// record of the outcome was lost — so the persisted job is replayed on the next
+// restart and the dedup hash was never written.  The two demand opposite
+// responses, shed load versus re-drive reconciliation, which is why one series
+// could not serve both (#137).
+func (m *Metrics) SetDroppedTerminalEvents(n uint64) {
+	if m == nil {
+		return
+	}
+	m.terminalEventsDropped.Set(float64(n))
 }
 
 // RecordDeleteIncomplete increments the count of deletes that could not be
