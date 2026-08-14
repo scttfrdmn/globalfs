@@ -9,9 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Work toward v0.3.0, whose theme is truth in reporting: a key, a metric, or a
-documented behaviour must mean what it says. Several entries below are breaking,
+## [0.3.0] - 2026-08-14
+
+Seventeen issues (#96–#111, #137), themed truth in reporting: a key, a metric, or
+a documented behaviour must mean what it says. Several entries below are breaking,
 batched into one release on purpose so that operators absorb the breakage once.
+
+Where v0.2.3 was about success reported for things that had not succeeded, this
+release is about the layer above that — the parts of the system whose whole job is
+to describe what happened. A config key parsed and never read, a gauge that reads
+zero while the system is busy, a `**` that does not recurse, and a README that
+fails on its own next command are the same defect in four places: something
+authoritative saying something untrue, with nothing to contradict it.
+
+The two gauges are the sharpest case. `globalfs_sites_current` read 0 for the
+entire life of an ordinary coordinator, and `globalfs_replication_queue_depth`
+updated only after a job settled, so every sample was the backlog's low-water
+mark — a metric that is most wrong exactly when you need it. Neither would appear
+in a log, and a dashboard built on them looked healthy by construction.
+
+Upgrading: strict config decoding means an un-migrated config now fails loudly at
+startup naming the key, rather than running with a setting that does nothing. That
+is the intended way to find the removed fields below.
 
 ### Breaking
 
@@ -56,6 +75,8 @@ that does nothing.
 - New Configuration Reference subsection **`key_pattern` syntax**, with a table of every supported form and an explicit statement that a single `*` stops at a `/` while `**` crosses it. `examples/coordinator-config.yaml`'s comment block gained the recursive forms it omitted (#100)
 - API Reference documents the sanitized error shape, `request_id`, and where the withheld detail goes; status tables for `GET`, `PUT`, and `POST /api/v1/replicate`; the `404` on `GET`/`HEAD` and why `DELETE` of an absent key is still `204`; `pending_sites` in place of `detail`; and the fixed `health check failed` on `GET /api/v1/sites`. The `GET` section had been carrying a forward reference to #110 as an open issue (#110)
 - Removed the pre-commit hooks section. No `.pre-commit-config.yaml`, git hook, or CI reference to it exists anywhere in the repo — the only occurrence of the word was the README's own claim that the hooks run automatically on `git commit`. Replaced with the commands CI actually runs
+
+---
 
 ## [0.2.3] - 2026-08-13
 
@@ -914,7 +935,8 @@ First production-ready release of the GlobalFS coordinator.
 
 ---
 
-[Unreleased]: https://github.com/scttfrdmn/globalfs/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/scttfrdmn/globalfs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/scttfrdmn/globalfs/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/scttfrdmn/globalfs/compare/v0.2.1...v0.2.3
 [0.2.1]: https://github.com/scttfrdmn/globalfs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/scttfrdmn/globalfs/compare/v0.1.12...v0.2.0
